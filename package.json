@@ -1,0 +1,50 @@
+{
+  "name": "@bch2/swap-core",
+  "version": "1.0.0",
+  "description": "Non-custodial BCH2 <-> EVM atomic-swap SDK: HTLC crypto, swap state engine, and order-book client for building bots on the BCH2 Swap DEX.",
+  "type": "module",
+  "license": "MIT",
+  "author": "BCH2",
+  "homepage": "https://swap.bch2.org",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BitcoincashII/bch2-swap-core.git"
+  },
+  "keywords": ["bch2", "atomic-swap", "htlc", "dex", "cross-chain", "cashtokens", "evm", "trading-bot"],
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist", "src", "README.md", "LICENSE"],
+  "exports": {
+    ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" },
+    "./swap-engine": { "types": "./dist/swap-engine/index.d.ts", "import": "./dist/swap-engine/index.js" },
+    "./order-book": { "types": "./dist/order-book/index.d.ts", "import": "./dist/order-book/index.js" },
+    "./htlc-builder": { "types": "./dist/htlc-builder.d.ts", "import": "./dist/htlc-builder.js" },
+    "./address-codec": { "types": "./dist/address-codec.d.ts", "import": "./dist/address-codec.js" },
+    "./key-encryption": { "types": "./dist/key-encryption.d.ts", "import": "./dist/key-encryption.js" },
+    "./wallet-core": { "types": "./dist/wallet-core.d.ts", "import": "./dist/wallet-core.js" },
+    "./evm": { "types": "./dist/evm/contracts.d.ts", "import": "./dist/evm/contracts.js" }
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noble/ciphers": "2.2.0",
+    "@noble/curves": "1.9.7",
+    "@noble/hashes": "1.8.0",
+    "@noble/secp256k1": "2.3.0",
+    "@scure/bip32": "1.7.0",
+    "@scure/bip39": "1.6.0",
+    "buffer": "^6.0.3",
+    "viem": "2.52.2"
+  },
+  "devDependencies": {
+    "tsup": "^8.3.5",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
