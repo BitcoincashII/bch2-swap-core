@@ -2,12 +2,12 @@
 
 ## 2.0.0
 
-### Breaking
-- **BCH2 derivation path** changed from coin type `145` to `20145`
-  (`m/44'/20145'/0'/0/0`), matching the BCH2 Swap DEX. Addresses derived under the
-  old `145` path (BCH's coin type) will differ. This aligns SDK-derived BCH2
-  addresses with the DEX and stops BCH2/BCH key reuse. **If you hold funds under an
-  old `145`-derived BCH2 address, sweep them before upgrading.** (BCH stays on 145.)
+### Breaking (semver only — no migration needed)
+- **BCH2 derivation path** corrected from coin type `145` (BCH's) to `20145`
+  (`m/44'/20145'/0'/0/0`), matching the BCH2 Swap DEX, so SDK-derived BCH2 addresses
+  now match the DEX and BCH2/BCH keys no longer collide. Flagged as a major bump for
+  semver correctness; v1.0.0 had no adopters, so there are no old `145`-derived
+  addresses in the wild and nothing to migrate. (BCH stays on 145.)
 
 ### Fixed
 - `buildFundingTx` now enforces a **claimability floor** and validates amounts: it
