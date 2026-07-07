@@ -265,7 +265,7 @@ function deriveEVMKey(mnemonic, index = 0, passphrase) {
 }
 
 // src/wallet-core.ts
-var BCH2_PATH = "m/44'/145'/0'/0/0";
+var BCH2_PATH = "m/44'/20145'/0'/0/0";
 var BCH_PATH = "m/44'/145'/0'/0/0";
 var BC2_PATH = "m/44'/0'/0'/0/0";
 var BTC_PATH = "m/84'/0'/0'/0/0";
@@ -329,6 +329,8 @@ function deriveKeyForSigning(mnemonic, chain, index = 0, passphrase) {
   let basePath;
   switch (chain) {
     case "bch2":
+      basePath = "m/44'/20145'/0'";
+      break;
     case "bch":
       basePath = "m/44'/145'/0'";
       break;
@@ -418,6 +420,8 @@ function deriveMultipleAddresses(mnemonic, chain, count = 20, passphrase) {
   let basePath;
   switch (chain) {
     case "bch2":
+      basePath = "m/44'/20145'/0'";
+      break;
     case "bch":
       basePath = "m/44'/145'/0'";
       break;

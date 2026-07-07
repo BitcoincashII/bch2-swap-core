@@ -89,6 +89,13 @@ async function buildRefundTx(prevTxID, prevVout, htlcSatoshis, redeemScript, sel
   return buildRawTx(prevTxID, prevVout, scriptSig, sequence, outputScript, net, locktime);
 }
 async function buildFundingTx(prevTxID, prevVout, inputSatoshis, funderPrivKey, funderPubKey, htlcRedeemScript, htlcSatoshis, feeSatoshis, sighashType) {
+  for (const [name, v] of [["inputSatoshis", inputSatoshis], ["htlcSatoshis", htlcSatoshis], ["feeSatoshis", feeSatoshis]]) {
+    if (!Number.isInteger(v) || v <= 0) throw new Error(`${name} must be a positive integer, got ${v}`);
+  }
+  const CLAIMABLE_FLOOR = DEFAULT_FEE_SATOSHIS + DUST_SATOSHIS;
+  if (htlcSatoshis < CLAIMABLE_FLOOR) {
+    throw new Error(`htlcSatoshis ${htlcSatoshis} is below the claimable floor ${CLAIMABLE_FLOOR} (fee + dust) \u2014 the funded HTLC would be unspendable by both the claim and refund branches`);
+  }
   const change = inputSatoshis - htlcSatoshis - feeSatoshis;
   if (change < DUST_SATOSHIS) {
     throw new Error(`change ${change} sat is below dust threshold ${DUST_SATOSHIS}`);

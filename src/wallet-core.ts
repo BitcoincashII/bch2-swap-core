@@ -39,7 +39,7 @@ export interface DerivedKey {
 }
 
 // Derivation paths
-const BCH2_PATH = "m/44'/145'/0'/0/0";    // BCH2 uses BCH coin type 145
+const BCH2_PATH = "m/44'/20145'/0'/0/0";   // R322-AUDIT: BCH2-specific coin type 20145 (matches the DEX; NOT 145=BCH) — prevents key reuse and makes SDK-derived addresses match the DEX
 const BCH_PATH  = "m/44'/145'/0'/0/0";    // BCH shares coin type 145 with BCH2; same key, different address prefix
 const BC2_PATH  = "m/44'/0'/0'/0/0";      // BC2 uses coin type 0 (legacy P2PKH)
 const BTC_PATH  = "m/84'/0'/0'/0/0";      // BTC BIP84 native SegWit (bc1q)
@@ -131,8 +131,10 @@ export function deriveKeyForSigning(
   let basePath: string;
   switch (chain) {
     case 'bch2':
+      // R322-AUDIT: BCH2-specific coin type 20145 (matches the DEX chain-config; NOT 145) — a distinct key.
+      basePath = "m/44'/20145'/0'";
+      break;
     case 'bch':
-      // BCH and BCH2 both use coin type 145; same key, different address prefix
       basePath = "m/44'/145'/0'";
       break;
     case 'bc2':
@@ -248,6 +250,8 @@ export function deriveMultipleAddresses(
   let basePath: string;
   switch (chain) {
     case 'bch2':
+      basePath = "m/44'/20145'/0'"; // R322-AUDIT: BCH2-specific coin type (matches the DEX)
+      break;
     case 'bch':
       basePath = "m/44'/145'/0'";
       break;

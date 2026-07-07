@@ -186,6 +186,17 @@ export async function buildFundingTx(
   feeSatoshis: number,
   sighashType: number,
 ): Promise<Uint8Array> {
+  // R322-AUDIT: validate amounts + enforce a claimability floor. buildClaimTx/buildRefundTx both require
+  // htlcSatoshis - DEFAULT_FEE_SATOSHIS >= DUST_SATOSHIS, so an HTLC funded below that floor confirms on-chain
+  // but is spendable by NEITHER branch — funds permanently stranded. Reject it at funding time (mirrors the
+  // DEX's fee-aware minClaimableHtlcAmount floor).
+  for (const [name, v] of [['inputSatoshis', inputSatoshis], ['htlcSatoshis', htlcSatoshis], ['feeSatoshis', feeSatoshis]] as const) {
+    if (!Number.isInteger(v) || v <= 0) throw new Error(`${name} must be a positive integer, got ${v}`);
+  }
+  const CLAIMABLE_FLOOR = DEFAULT_FEE_SATOSHIS + DUST_SATOSHIS;
+  if (htlcSatoshis < CLAIMABLE_FLOOR) {
+    throw new Error(`htlcSatoshis ${htlcSatoshis} is below the claimable floor ${CLAIMABLE_FLOOR} (fee + dust) — the funded HTLC would be unspendable by both the claim and refund branches`);
+  }
   const change = inputSatoshis - htlcSatoshis - feeSatoshis;
   if (change < DUST_SATOSHIS) {
     throw new Error(`change ${change} sat is below dust threshold ${DUST_SATOSHIS}`);
