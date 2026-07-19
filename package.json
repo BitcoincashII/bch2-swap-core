@@ -47,6 +47,14 @@
       "types": "./dist/htlc-builder.d.ts",
       "import": "./dist/htlc-builder.js"
     },
+    "./spv": {
+      "types": "./dist/spv.d.ts",
+      "import": "./dist/spv.js"
+    },
+    "./seed-secret": {
+      "types": "./dist/seed-secret.d.ts",
+      "import": "./dist/seed-secret.js"
+    },
     "./address-codec": {
       "types": "./dist/address-codec.d.ts",
       "import": "./dist/address-codec.js"
@@ -66,7 +74,8 @@
   },
   "scripts": {
     "build": "tsup",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@noble/ciphers": "2.2.0",
@@ -80,7 +89,8 @@
   },
   "devDependencies": {
     "tsup": "^8.3.5",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "vitest": "^2.1.8"
   },
   "engines": {
     "node": ">=18"

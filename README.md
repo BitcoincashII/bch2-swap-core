@@ -75,6 +75,8 @@ See **[API.md](./API.md)** for the full REST/WebSocket reference (endpoints, req
 | `@bch2/swap-core/order-book` | `CentralizedOrderBook`, `MockOrderBook`, order/offer types |
 | `@bch2/swap-core/swap-engine` | `Engine`, swap state, verify, persist, recover — *reference (see Status)* |
 | `@bch2/swap-core/htlc-builder` | `buildRedeemScript`, `buildFundingTx`, `buildClaimTx`, `buildRefundTx`, `extractSecretFromScriptSig` |
+| `@bch2/swap-core/spv` | SPV header-chain + Merkle-inclusion verifier (ASERT/legacy PoW, checkpoints) — the anti-lying-proxy depth gate from [PROTOCOL.md](./PROTOCOL.md) §4 |
+| `@bch2/swap-core/seed-secret` | Seed-derived swap secret (HMAC-v1), maker identity, and API-auth signing preimage — §5/§8 |
 | `@bch2/swap-core/wallet-core` | `generateMnemonic`, `deriveAddresses`, `deriveKeyForSigning` |
 | `@bch2/swap-core/address-codec` | CashAddr / Base58 / Bech32 / WIF encode+decode |
 | `@bch2/swap-core/key-encryption` | `encryptMnemonic`, `decryptMnemonic`, `validatePassword` |

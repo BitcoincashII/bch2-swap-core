@@ -9,6 +9,8 @@ export default defineConfig({
     'src/swap-engine/index.ts',
     'src/order-book/index.ts',
     'src/htlc-builder.ts',
+    'src/spv.ts',
+    'src/seed-secret.ts',
     'src/address-codec.ts',
     'src/key-encryption.ts',
     'src/wallet-core.ts',
