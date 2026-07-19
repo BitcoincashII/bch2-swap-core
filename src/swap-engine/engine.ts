@@ -16,7 +16,7 @@
 import * as secp256k1 from '@noble/secp256k1';
 import { sha256 } from '@noble/hashes/sha256';
 import { hash160 } from '../address-codec';
-import { buildRedeemScript } from '../htlc-builder';
+import { buildRedeemScript } from './legacy-htlc';
 import {
   State, Role,
   isValidTransition, isTerminal,

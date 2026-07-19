@@ -11,7 +11,7 @@
  */
 
 import { hash160 } from '../address-codec';
-import { buildRedeemScript } from '../htlc-builder';
+import { buildRedeemScript } from './legacy-htlc';
 import { SwapParams, validateTimelockOrdering } from './params';
 import { Role } from './state';
 import {
