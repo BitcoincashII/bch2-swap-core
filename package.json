@@ -55,6 +55,18 @@
       "types": "./dist/seed-secret.d.ts",
       "import": "./dist/seed-secret.js"
     },
+    "./chain-config": {
+      "types": "./dist/chain-config.d.ts",
+      "import": "./dist/chain-config.js"
+    },
+    "./timelock-gates": {
+      "types": "./dist/timelock-gates.d.ts",
+      "import": "./dist/timelock-gates.js"
+    },
+    "./fee-rate": {
+      "types": "./dist/fee-rate.d.ts",
+      "import": "./dist/fee-rate.js"
+    },
     "./address-codec": {
       "types": "./dist/address-codec.d.ts",
       "import": "./dist/address-codec.js"
