@@ -14,6 +14,7 @@ export default defineConfig({
     'src/chain-config.ts',
     'src/timelock-gates.ts',
     'src/fee-rate.ts',
+    'src/swap-flow.ts',
     'src/address-codec.ts',
     'src/key-encryption.ts',
     'src/wallet-core.ts',

@@ -80,6 +80,7 @@ See **[API.md](./API.md)** for the full REST/WebSocket reference (endpoints, req
 | `@bch2/swap-core/chain-config` | Per-chain params: required confirmations, timelocks, fee caps, address prefixes, Electrum servers |
 | `@bch2/swap-core/timelock-gates` | Cross-domain (wall-clock) timelock ordering + margin gates — §3 |
 | `@bch2/swap-core/fee-rate` | Deadline-aware fee estimation + affordability clamp for claim/refund — §7 |
+| `@bch2/swap-core/swap-flow` | Swap construction helpers from the live path: `createInitiatorHTLC`/`createResponderHTLC`, `fundHTLC`, `claimHTLC`, `generateSecret`, `extractSecret` |
 | `@bch2/swap-core/wallet-core` | `generateMnemonic`, `deriveAddresses`, `deriveKeyForSigning` |
 | `@bch2/swap-core/address-codec` | CashAddr / Base58 / Bech32 / WIF encode+decode |
 | `@bch2/swap-core/key-encryption` | `encryptMnemonic`, `decryptMnemonic`, `validatePassword` |

@@ -67,6 +67,10 @@
       "types": "./dist/fee-rate.d.ts",
       "import": "./dist/fee-rate.js"
     },
+    "./swap-flow": {
+      "types": "./dist/swap-flow.d.ts",
+      "import": "./dist/swap-flow.js"
+    },
     "./address-codec": {
       "types": "./dist/address-codec.d.ts",
       "import": "./dist/address-codec.js"
