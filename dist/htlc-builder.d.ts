@@ -1,123 +1,124 @@
+export { sha256 } from '@noble/hashes/sha256';
+import { U as Utxo, C as Chain, b as HTLCParams, H as HTLCDetails } from './swap-types-s0IAnIBY.js';
+
 /**
- * HTLC transaction construction for BCH2/BCH/BTC/BC2 atomic swaps (Path A).
+ * HTLC (Hash Time-Locked Contract) Builder
  *
- * Direct port of bch2htlc/htlc.go + funding.go.
- *
- * Signing: ECDSA DER on all four chains — NOT Schnorr.
- * BCH2/BCH: BIP143 sighash + SIGHASH_FORKID (0x41)
- * BTC/BC2:  legacy P2SH sighash + SIGHASH_ALL (0x01)
+ * Constructs HTLC redeem scripts and spending transactions for atomic swaps.
+ * Supports BCH2, BCH (BIP143/FORKID), BTC, BC2 (legacy sighash).
  */
-/** Block-based relative timelock for BCH2↔ERC-20 HTLCs. */
-declare const HTLC_CSV_BLOCKS = 288;
-/** SIGHASH_ALL | SIGHASH_FORKID — BCH/BCH2 replay-protection flag. */
-declare const SIGHASH_ALL_FORKID = 65;
-/** Plain SIGHASH_ALL — BTC/BC2. */
-declare const SIGHASH_ALL = 1;
-declare const DUST_SATOSHIS = 546;
-declare const DEFAULT_FEE_SATOSHIS = 500;
-/** BIP68 bit-22: time-based relative locktime. */
-declare const SEQ_LOCKTIME_TYPE_FLAG = 4194304;
-/** 1 << 9 = 512 seconds per BIP68 time unit. */
-declare const SEQ_LOCKTIME_GRANULARITY = 9;
-declare const BCH_SWAP_BCH2_CSV_NSEQUENCE: number;
-declare const BCH_SWAP_BCH_CSV_NSEQUENCE: number;
-declare const MAINNET_BCH_SWAP_BCH2_CSV: number;
-declare const MAINNET_BCH_SWAP_BCH_CSV: number;
-declare const MAINNET_BTC_SWAP_BCH2_CSV: number;
-declare const MAINNET_BTC_SWAP_BTC_CSV: number;
-declare const MAINNET_BC2_SWAP_BCH2_CSV: number;
-declare const MAINNET_BC2_SWAP_BC2_CSV: number;
-/**
- * Build the HTLC redeem script:
- *   OP_IF OP_SHA256 <hashLock> OP_EQUALVERIFY <buyerPubKey> OP_CHECKSIG
- *   OP_ELSE <csvNSequence> OP_CSV OP_DROP <sellerPubKey> OP_CHECKSIG OP_ENDIF
- *
- * OP_CHECKSIG validates ECDSA (not Schnorr) on all chains.
- * csvNSequence should carry SEQ_LOCKTIME_TYPE_FLAG for time-based locks.
- * The spending tx nSequence must equal this value (BIP112 type-match rule).
- */
-declare function buildRedeemScript(buyerPubKey: Uint8Array, sellerPubKey: Uint8Array, csvNSequence: number, hashLock: Uint8Array): Uint8Array;
-/** OP_HASH160 <hash160(redeemScript)> OP_EQUAL */
-declare function p2shScriptPubKey(redeemScript: Uint8Array): Uint8Array;
-/** OP_DUP OP_HASH160 <hash160(pubKey)> OP_EQUALVERIFY OP_CHECKSIG */
-declare function p2pkhScriptPubKey(pubKey: Uint8Array): Uint8Array;
-/**
- * Build a claim transaction (IF branch) that reveals secret s.
- *   scriptSig: <DER-sig> <secret> OP_1 <redeemScript>
- *   nSequence:  0xFFFFFFFF (no CSV on claim branch)
- *
- * sighashType: SIGHASH_ALL_FORKID (0x41) for BCH/BCH2; SIGHASH_ALL (0x01) for BTC/BC2.
- * Signing uses ECDSA DER on all chains (NOT Schnorr).
- */
-declare function buildClaimTx(prevTxID: Uint8Array, // 32 bytes, internal (natural) byte order
-prevVout: number, htlcSatoshis: number, redeemScript: Uint8Array, buyerPrivKey: Uint8Array, // zeroed after use
-buyerPubKey: Uint8Array, secret: Uint8Array, sighashType: number): Promise<Uint8Array>;
-/**
- * Build a refund transaction (ELSE branch) for the seller.
- *   scriptSig: <DER-sig> OP_0 <redeemScript>
- *   nSequence:  csvNSequence (must equal OP_CSV operand — BIP68/BIP112 enforcement)
- *
- * sighashType: SIGHASH_ALL_FORKID (0x41) for BCH/BCH2; SIGHASH_ALL (0x01) for BTC/BC2.
- */
-declare function buildRefundTx(prevTxID: Uint8Array, prevVout: number, htlcSatoshis: number, redeemScript: Uint8Array, sellerPrivKey: Uint8Array, // zeroed after use
-sellerPubKey: Uint8Array, csvNSequence: number, sighashType: number): Promise<Uint8Array>;
-/**
- * Build a funding transaction: spend one P2PKH UTXO to create the HTLC + change.
- *   Output 0: P2SH HTLC  (htlcSatoshis)
- *   Output 1: P2PKH change (inputSatoshis - htlcSatoshis - feeSatoshis)
- *
- * sighashType: SIGHASH_ALL_FORKID (0x41) for BCH/BCH2; SIGHASH_ALL (0x01) for BTC/BC2.
- */
-declare function buildFundingTx(prevTxID: Uint8Array, prevVout: number, inputSatoshis: number, funderPrivKey: Uint8Array, // zeroed after use
-funderPubKey: Uint8Array, htlcRedeemScript: Uint8Array, htlcSatoshis: number, feeSatoshis: number, sighashType: number): Promise<Uint8Array>;
-/**
- * Extract the 32-byte preimage s from a P2SH claim scriptSig.
- * Layout: <sigLen> <sig> <0x20> <secret(32B)> 0x51 <redeemScript...>
- */
-declare function extractSecretFromScriptSig(scriptSig: Uint8Array): Uint8Array;
-/**
- * Minimal script data push.
- *  len == 0       → [0x00]
- *  len 1-75       → [len, ...data]
- *  len 76-255     → [0x4c, len, ...data]   OP_PUSHDATA1
- *  len 256-65535  → [0x4d, lo, hi, ...data] OP_PUSHDATA2
- */
+
+declare function hexToBytes(hex: string): Uint8Array;
+declare function bytesToHex(bytes: Uint8Array): string;
+declare function hash160(data: Uint8Array): Uint8Array;
+declare function concat(...arrays: Uint8Array[]): Uint8Array;
 declare function pushData(data: Uint8Array): Uint8Array;
 /**
- * Encode a BIP68 nSequence as a minimal script push for OP_CSV.
+ * Create an HTLC redeem script.
  *
- * Block-based values 1-16 → OP_1..OP_16 (MINIMALDATA-compliant; both BCH and BCH2
- * reject non-minimal single-byte integer pushes at mempool accept time).
- * All other values (including time-based: SEQ_LOCKTIME_TYPE_FLAG always set, value > 16)
- * → minimal CScriptNum encoding via pushScriptInt.
+ * Script:
+ *   OP_IF
+ *     OP_SHA256 <secretHash> OP_EQUALVERIFY
+ *     OP_DUP OP_HASH160 <recipientPubkeyHash>
+ *   OP_ELSE
+ *     <locktime> OP_CHECKLOCKTIMEVERIFY OP_DROP
+ *     OP_DUP OP_HASH160 <refundPubkeyHash>
+ *   OP_ENDIF
+ *   OP_EQUALVERIFY OP_CHECKSIG
  */
-declare function encodeCSV(nSequence: number): Uint8Array;
+declare const LOCKTIME_HEIGHT_MAX = 500000000;
+declare const LOCKTIME_TS_MIN = 1500000000;
+declare const LOCKTIME_TS_MAX = 2147483648;
+declare function isTimestampLocktime(locktime: number): boolean;
+declare function isValidLocktime(locktime: number): boolean;
+declare function maxPlausibleBlockHeight(nowSec?: number): number;
+declare function createHTLCRedeemScript(params: HTLCParams): Uint8Array;
 /**
- * Pre-BIP143 ("legacy") sighash for a single-input, single-output P2SH spend.
- * Used for BTC/BC2 HTLC claim/refund inputs.
+ * Compute the P2SH address for an HTLC redeem script.
+ */
+declare function htlcToP2SHAddress(redeemScript: Uint8Array, chain: Chain): string;
+/**
+ * Create full HTLC details including address and scriptPubKey.
+ */
+declare function createHTLC(params: HTLCParams, chain: Chain): HTLCDetails;
+/**
+ * Compute Electrum scripthash for an HTLC P2SH address (for monitoring).
+ */
+declare function htlcScripthash(redeemScript: Uint8Array): string;
+/**
+ * R146-FEE-FLOOR-001: the minimum UTXO-HTLC amount that is guaranteed CLAIMABLE (and therefore also
+ * refundable) after fees on a given chain. The old funding floor was a flat dustThreshold*5, whose comment
+ * assumed 1 sat/B — but a chain like BTC at feePerByte=10 has a claim fee (~3.9k sat) far above that floor,
+ * so amounts in roughly [dustThreshold*5, claimFee+dust] funded successfully yet could NEVER be claimed
+ * (buildHTLCClaimTx throws fee>=value) and partly never refunded — stranding funds / enabling asymmetric
+ * griefing. This computes a fee-aware floor: a worst-case claim tx (representative ~110B HTLC redeemScript,
+ * P2PKH destination) must pay its fee AND leave a non-dust output, mirroring buildHTLCClaimTx's size formula.
+ * Kept >= the historical dustThreshold*5 lower bound. The claim floor exceeds the (smaller) refund floor, so
+ * satisfying it guarantees both legs are recoverable. UTXO chains only — do not call for EVM chains.
+ */
+declare function minClaimableHtlcAmount(chain: Chain): number;
+/**
+ * Build a funding transaction that sends funds to the HTLC P2SH address.
+ * This is a regular P2PKH -> P2SH transaction.
+ */
+declare function buildHTLCFundingTx(inputs: Array<{
+    utxo: Utxo;
+    privateKey: Uint8Array;
+    publicKey: Uint8Array;
+    scriptPubKey: Uint8Array;
+}>, htlcScriptPubKey: Uint8Array, amount: number, changeScriptPubKey: Uint8Array | null, chain: Chain, feeRate?: number): Promise<{
+    txid: string;
+    rawTx: string;
+    fee: number;
+}>;
+/**
+ * Build a P2SH HTLC claim transaction (single input).
  *
- * Preimage: version(4) | vinCount(1) | prevTxID(32) | prevVout(4) |
- *           scriptCode(var) | sequence(4) | voutCount(1) |
- *           outputAmount(8) | outputScript(var) | locktime(4) | sighashType(4)
+ * NOTE: Only one UTXO is claimed per call. If the HTLC address received multiple
+ * funding transactions, call once per UTXO — each uses the same secret.
+ * The swap engine enforces single-UTXO funding (rejecting offers with split UTXOs)
+ * to avoid this scenario. TODO: add multi-input claim support if split-payment
+ * HTLCs are ever needed.
  */
-declare function legacySighashSingle(prevTxID: Uint8Array, prevVout: number, sequence: number, scriptCode: Uint8Array, outputAmount: number, outputScript: Uint8Array, locktime: number, sighashType: number): Uint8Array;
+declare function buildHTLCClaimTx(utxo: Utxo, redeemScript: Uint8Array, secret: Uint8Array, recipientPrivateKey: Uint8Array, recipientPublicKey: Uint8Array, destinationScriptPubKey: Uint8Array, chain: Chain, feeRate?: number): Promise<{
+    txid: string;
+    rawTx: string;
+}>;
 /**
- * Pre-BIP143 legacy sighash for a single-input, multi-output transaction.
- * Used for BTC/BC2 P2PKH funding inputs.
+ * Build a refund transaction: initiator reclaims after timelock expires.
  */
-declare function legacySighashOutputs(prevTxID: Uint8Array, prevVout: number, sequence: number, scriptCode: Uint8Array, outputs: TxOutput[], locktime: number, sighashType: number): Uint8Array;
+declare function buildHTLCRefundTx(utxo: Utxo, redeemScript: Uint8Array, locktime: number, refundPrivateKey: Uint8Array, refundPublicKey: Uint8Array, destinationScriptPubKey: Uint8Array, chain: Chain, feeRate?: number): Promise<{
+    txid: string;
+    rawTx: string;
+}>;
 /**
- * BIP143 sighash for BCH2/BCH (SIGHASH_FORKID) single-output spend.
- * scriptCode is the full redeemScript for P2SH; inputAmount is the HTLC value.
+ * Extract the secret preimage from a claim transaction's scriptSig.
+ * The scriptSig format is: <sig> <pubkey> <secret> <OP_1 (0x51)> <redeemScript>
+ *
+ * Parse order: sig → pubkey → secret (32 bytes). Stop after reading secret;
+ * the next byte is 0x51 (OP_1, claim-branch selector), not consumed here. (R104-HTLC-001)
  */
-declare function bip143Sighash(prevTxID: Uint8Array, prevVout: number, sequence: number, scriptCode: Uint8Array, inputAmount: number, outputScript: Uint8Array, outputAmount: number, locktime: number, sighashType: number): Uint8Array;
+declare function extractSecretFromClaimTx(rawTxHex: string, expectedSecretHash?: Uint8Array | string): Uint8Array | null;
 /**
- * BIP143 sighash for BCH2/BCH multi-output (funding) transaction.
+ * Parse and SELF-AUTHENTICATE a funding transaction, returning the value and
+ * scriptPubKey of a specific output (PROXY-TRUST-UTXO-VALUE-001).
+ *
+ * The proxy/Electrum layer supplies UTXO value+tx_pos via listunspent, but for
+ * legacy (non-BIP143) chains (btc, bc2) the signature does NOT commit the input
+ * value, so a lying/compromised proxy could induce a malformed/under/over-fee
+ * claim/refund, or point tx_pos at the wrong output. We re-derive the txid from
+ * the raw bytes (double-SHA256 + byte-reversal) and require it to equal
+ * expectedTxid — the proxy cannot forge bytes that hash to a txid we already
+ * trust. Returns the AUTHENTICATED { value, scriptPubKey } at index voutIndex.
+ * Throws on any verification failure (caller MUST abort the spend).
+ *
+ * The funding txs in this app are always non-witness (no SegWit on these chains;
+ * the app can only sign legacy P2PKH inputs), so a single linear parse covers all
+ * chains and hash256(rawBytes)===txid holds.
  */
-declare function bip143SighashOutputs(prevTxID: Uint8Array, prevVout: number, sequence: number, scriptCode: Uint8Array, inputAmount: number, outputs: TxOutput[], locktime: number, sighashType: number): Uint8Array;
-interface TxOutput {
-    amount: number;
-    script: Uint8Array;
-}
+declare function parseAuthenticatedOutput(rawTxHex: string, expectedTxid: string, voutIndex: number): {
+    value: number;
+    scriptPubKey: Uint8Array;
+};
 
-export { BCH_SWAP_BCH2_CSV_NSEQUENCE, BCH_SWAP_BCH_CSV_NSEQUENCE, DEFAULT_FEE_SATOSHIS, DUST_SATOSHIS, HTLC_CSV_BLOCKS, MAINNET_BC2_SWAP_BC2_CSV, MAINNET_BC2_SWAP_BCH2_CSV, MAINNET_BCH_SWAP_BCH2_CSV, MAINNET_BCH_SWAP_BCH_CSV, MAINNET_BTC_SWAP_BCH2_CSV, MAINNET_BTC_SWAP_BTC_CSV, SEQ_LOCKTIME_GRANULARITY, SEQ_LOCKTIME_TYPE_FLAG, SIGHASH_ALL, SIGHASH_ALL_FORKID, type TxOutput, bip143Sighash, bip143SighashOutputs, buildClaimTx, buildFundingTx, buildRedeemScript, buildRefundTx, encodeCSV, extractSecretFromScriptSig, legacySighashOutputs, legacySighashSingle, p2pkhScriptPubKey, p2shScriptPubKey, pushData };
+export { LOCKTIME_HEIGHT_MAX, LOCKTIME_TS_MAX, LOCKTIME_TS_MIN, buildHTLCClaimTx, buildHTLCFundingTx, buildHTLCRefundTx, bytesToHex, concat, createHTLC, createHTLCRedeemScript, extractSecretFromClaimTx, hash160, hexToBytes, htlcScripthash, htlcToP2SHAddress, isTimestampLocktime, isValidLocktime, maxPlausibleBlockHeight, minClaimableHtlcAmount, parseAuthenticatedOutput, pushData };

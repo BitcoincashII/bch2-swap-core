@@ -150,6 +150,12 @@ var chainConfigs = {
     // ~48h at 2s/block
   }
 };
+var LOCKTIME_BLOCKS = {
+  initiator: 216,
+  // ~36 hours (R-TIMELOCK-K: raised from 144 so the ÷K responder fund gate still leaves a funding window)
+  responder: 72
+  // ~12 hours (R-TIMELOCK-K: kept at 12h — the initiator's claim window on this leg needs K*margin + confs)
+};
 var MAX_FEE_RATE_SAT_PER_BYTE = {
   bch2: 20,
   bch: 20,
@@ -352,19 +358,11 @@ function encodeBase58(data) {
 var LOCKTIME_HEIGHT_MAX = 5e8;
 var LOCKTIME_TS_MIN = 15e8;
 var LOCKTIME_TS_MAX = 2147483648;
-function isTimestampLocktime(locktime) {
-  return locktime >= LOCKTIME_HEIGHT_MAX;
-}
 function isValidLocktime(locktime) {
   if (!Number.isInteger(locktime)) return false;
   if (locktime > 0 && locktime < LOCKTIME_HEIGHT_MAX) return true;
   if (locktime >= LOCKTIME_TS_MIN && locktime < LOCKTIME_TS_MAX) return true;
   return false;
-}
-var BITCOIN_GENESIS_SEC = 1231006505;
-var MIN_PLAUSIBLE_BLOCK_INTERVAL_SEC = 30;
-function maxPlausibleBlockHeight(nowSec = Math.floor(Date.now() / 1e3)) {
-  return Math.floor((nowSec - BITCOIN_GENESIS_SEC) / MIN_PLAUSIBLE_BLOCK_INTERVAL_SEC);
 }
 function createHTLCRedeemScript(params) {
   const { secretHash, recipientPubkeyHash, refundPubkeyHash, locktime } = params;
@@ -607,75 +605,6 @@ async function buildHTLCClaimTx(utxo, redeemScript, secret, recipientPrivateKey,
     outputs,
     0
     // nLockTime
-  );
-}
-async function buildHTLCRefundTx(utxo, redeemScript, locktime, refundPrivateKey, refundPublicKey, destinationScriptPubKey, chain, feeRate) {
-  if (!isValidLocktime(locktime)) {
-    throw new Error(`locktime must be a block height in (0, ${LOCKTIME_HEIGHT_MAX}) or a Unix timestamp in [${LOCKTIME_TS_MIN}, ${LOCKTIME_TS_MAX}); got ${locktime}`);
-  }
-  if (redeemScript.length === 0 || redeemScript.length > 520) {
-    throw new Error(`redeemScript invalid length (${redeemScript.length}; must be 1\u2013520 bytes)`);
-  }
-  if (!Number.isInteger(utxo.value) || utxo.value <= 0) {
-    throw new Error(`refundUtxo.value must be a positive integer; got ${utxo.value}. Refresh UTXO from Electrum.`);
-  }
-  const config = getChainConfig(chain);
-  const hashType = config.sighashType ?? 1;
-  if ((config.useBip143 ?? false) && !(hashType & 64)) {
-    throw new Error(`SIGHASH_FORKID (0x40) required for ${chain} refund but hashType is 0x${hashType.toString(16)}`);
-  }
-  const useBip143 = config.useBip143 ?? false;
-  const feePerByte = resolveClampedFeeRate(feeRate, config.feePerByte, chain);
-  if (!feePerByte || !Number.isFinite(feePerByte) || feePerByte <= 0) {
-    throw new Error(`feePerByte must be a finite positive number, got ${feePerByte}`);
-  }
-  const dustThreshold = config.dustThreshold ?? 546;
-  if (!destinationScriptPubKey || destinationScriptPubKey.length < 1 || destinationScriptPubKey.length > 520) {
-    throw new Error(`destinationScriptPubKey invalid length (${destinationScriptPubKey?.length ?? 0}); must be 1\u2013520 bytes`);
-  }
-  const rsLen = redeemScript.length;
-  const rsPushOverhead = rsLen < 76 ? 1 : rsLen < 256 ? 2 : 3;
-  const refundScriptSig = 74 + 34 + 1 + rsPushOverhead + rsLen;
-  const refundDestScriptLen = destinationScriptPubKey.length;
-  const refundDestScriptVarIntLen = refundDestScriptLen < 253 ? 1 : 3;
-  const refundOutputSize = 8 + refundDestScriptVarIntLen + refundDestScriptLen;
-  const refundTxSize = useBip143 ? 10 + 41 + refundScriptSig + refundOutputSize : 10 + 41 + refundScriptSig + refundOutputSize + 50;
-  const affordableRefundRate = Math.floor((utxo.value - dustThreshold) / refundTxSize);
-  const effectiveRefundFeePerByte = Math.max(1, Math.min(feePerByte, affordableRefundRate));
-  const fee = refundTxSize * effectiveRefundFeePerByte;
-  if (fee >= utxo.value) {
-    throw new Error(`Refund fee (${fee} sat) would exceed UTXO value (${utxo.value} sat). Swap amount is too small.`);
-  }
-  const outputValue = utxo.value - fee;
-  if (outputValue < dustThreshold) {
-    throw new Error("HTLC value too small to refund after fees");
-  }
-  const outputs = [{ scriptPubKey: destinationScriptPubKey, value: outputValue }];
-  const nSequence = 4294967294;
-  const sighash = computeSighash(
-    [{ utxo, scriptCode: redeemScript }],
-    outputs,
-    0,
-    hashType,
-    useBip143,
-    locktime,
-    // nLockTime must be >= HTLC locktime
-    nSequence
-  );
-  const signature = await secp256k1.signAsync(sighash, refundPrivateKey, { lowS: true });
-  const sigDer = compactToDER(signature.toCompactRawBytes());
-  const sigWithType = concat(sigDer, new Uint8Array([hashType]));
-  const scriptSig = concat(
-    pushData(sigWithType),
-    pushData(refundPublicKey),
-    new Uint8Array([0]),
-    // OP_FALSE (empty push for OP_ELSE branch)
-    pushData(redeemScript)
-  );
-  return serializeTx(
-    [{ utxo, scriptSig, nSequence }],
-    outputs,
-    locktime
   );
 }
 function extractSecretFromClaimTx(rawTxHex, expectedSecretHash) {
@@ -1023,4 +952,114 @@ function serializeTx(inputs, outputs, nLockTime) {
   return { txid, rawTx: bytesToHex(rawTxBytes) };
 }
 
-export { LOCKTIME_HEIGHT_MAX, LOCKTIME_TS_MAX, LOCKTIME_TS_MIN, buildHTLCClaimTx, buildHTLCFundingTx, buildHTLCRefundTx, bytesToHex, concat, createHTLC, createHTLCRedeemScript, extractSecretFromClaimTx, hash160, hexToBytes, htlcScripthash, htlcToP2SHAddress, isTimestampLocktime, isValidLocktime, maxPlausibleBlockHeight, minClaimableHtlcAmount, parseAuthenticatedOutput, pushData };
+// src/swap-flow.ts
+async function verifyAndAuthenticateUtxo(proxyUtxo, redeemScript, fetchRawTx) {
+  if (!proxyUtxo || typeof proxyUtxo.tx_hash !== "string" || !/^[0-9a-f]{64}$/.test(proxyUtxo.tx_hash)) {
+    throw new Error("verifyAndAuthenticateUtxo: malformed UTXO tx_hash from proxy");
+  }
+  if (!Number.isInteger(proxyUtxo.tx_pos) || proxyUtxo.tx_pos < 0) {
+    throw new Error("verifyAndAuthenticateUtxo: malformed UTXO tx_pos from proxy");
+  }
+  const rawTx = await fetchRawTx(proxyUtxo.tx_hash);
+  const { value, scriptPubKey } = parseAuthenticatedOutput(rawTx, proxyUtxo.tx_hash, proxyUtxo.tx_pos);
+  const expectedSpk = new Uint8Array([169, 20, ...hash160(redeemScript), 135]);
+  if (scriptPubKey.length !== expectedSpk.length || !scriptPubKey.every((b, i) => b === expectedSpk[i])) {
+    throw new Error(
+      "verifyAndAuthenticateUtxo: funded output scriptPubKey does not match the HTLC P2SH \u2014 the proxy pointed at the wrong output (possible malicious/compromised proxy)"
+    );
+  }
+  if (Number.isFinite(proxyUtxo.value) && proxyUtxo.value !== value) {
+    console.warn(
+      `[swap-engine] proxy listunspent value ${proxyUtxo.value} != authenticated value ${value} for ${proxyUtxo.tx_hash}:${proxyUtxo.tx_pos} \u2014 using authenticated value`
+    );
+  }
+  return { ...proxyUtxo, value };
+}
+async function verifyAndAuthenticateP2pkhInput(proxyUtxo, expectedPubkeyHash, fetchRawTx) {
+  if (!proxyUtxo || typeof proxyUtxo.tx_hash !== "string" || !/^[0-9a-f]{64}$/.test(proxyUtxo.tx_hash)) {
+    throw new Error("verifyAndAuthenticateP2pkhInput: malformed UTXO tx_hash from proxy");
+  }
+  if (!Number.isInteger(proxyUtxo.tx_pos) || proxyUtxo.tx_pos < 0) {
+    throw new Error("verifyAndAuthenticateP2pkhInput: malformed UTXO tx_pos from proxy");
+  }
+  if (!(expectedPubkeyHash instanceof Uint8Array) || expectedPubkeyHash.length !== 20) {
+    throw new Error("verifyAndAuthenticateP2pkhInput: expectedPubkeyHash must be 20 bytes");
+  }
+  const rawTx = await fetchRawTx(proxyUtxo.tx_hash);
+  const { value, scriptPubKey } = parseAuthenticatedOutput(rawTx, proxyUtxo.tx_hash, proxyUtxo.tx_pos);
+  const expectedSpk = new Uint8Array([118, 169, 20, ...expectedPubkeyHash, 136, 172]);
+  if (scriptPubKey.length !== expectedSpk.length || !scriptPubKey.every((b, i) => b === expectedSpk[i])) {
+    throw new Error(
+      "verifyAndAuthenticateP2pkhInput: input scriptPubKey does not match the expected own-address P2PKH \u2014 the proxy supplied a wrong/foreign input value (possible malicious/compromised proxy)"
+    );
+  }
+  return { ...proxyUtxo, value };
+}
+function assertUtxoChain(chain) {
+  if (chainConfigs[chain].isEvm) {
+    throw new Error(`HTLC UTXO construction not supported for EVM chain '${chain}' \u2014 use evm-client.ts`);
+  }
+}
+function generateSecret() {
+  const secret = new Uint8Array(32);
+  crypto.getRandomValues(secret);
+  return secret;
+}
+function hashSecret(secret) {
+  return sha256(secret);
+}
+function createInitiatorHTLC(state, currentHeight, recipientPubkeyHash, refundPubkeyHash) {
+  assertUtxoChain(state.offer.sendChain);
+  const locktime = currentHeight + LOCKTIME_BLOCKS.initiator;
+  const params = {
+    secretHash: state.secretHash,
+    recipientPubkeyHash,
+    refundPubkeyHash,
+    locktime
+  };
+  return createHTLC(params, state.offer.sendChain);
+}
+function createResponderHTLC(state, currentHeight, initiatorPubkeyHash, refundPubkeyHash, explicitLocktime) {
+  assertUtxoChain(state.offer.receiveChain);
+  const locktime = explicitLocktime ?? currentHeight + LOCKTIME_BLOCKS.responder;
+  const params = {
+    secretHash: state.secretHash,
+    recipientPubkeyHash: initiatorPubkeyHash,
+    refundPubkeyHash,
+    locktime
+  };
+  return createHTLC(params, state.offer.receiveChain);
+}
+function getHTLCScripthash(redeemScript) {
+  return htlcScripthash(redeemScript);
+}
+async function fundHTLC(htlc, utxos, privateKey, publicKey, p2pkhScript, amount, chain, feeRate) {
+  assertUtxoChain(chain);
+  const inputs = utxos.map((utxo) => ({
+    utxo,
+    privateKey,
+    publicKey,
+    scriptPubKey: p2pkhScript
+  }));
+  return buildHTLCFundingTx(
+    inputs,
+    htlc.p2shScriptPubKey,
+    amount,
+    p2pkhScript,
+    // change back to same address
+    chain,
+    feeRate
+  );
+}
+async function claimHTLC(utxo, redeemScript, secret, privateKey, publicKey, destPubkeyHash, chain, feeRate) {
+  assertUtxoChain(chain);
+  if (secret.length !== 32) throw new Error(`HTLC secret must be exactly 32 bytes; got ${secret.length}`);
+  if (destPubkeyHash.length !== 20) throw new Error("destPubkeyHash must be exactly 20 bytes");
+  const destP2PKH = new Uint8Array([118, 169, 20, ...destPubkeyHash, 136, 172]);
+  return buildHTLCClaimTx(utxo, redeemScript, secret, privateKey, publicKey, destP2PKH, chain, feeRate);
+}
+function extractSecret(rawTxHex, expectedSecretHash) {
+  return extractSecretFromClaimTx(rawTxHex, expectedSecretHash);
+}
+
+export { claimHTLC, createInitiatorHTLC, createResponderHTLC, extractSecret, fundHTLC, generateSecret, getHTLCScripthash, hash160, hashSecret, hexToBytes, verifyAndAuthenticateP2pkhInput, verifyAndAuthenticateUtxo };

@@ -16,6 +16,9 @@
 
 import { sha256 } from '@noble/hashes/sha256';
 import { hexToBytes, bytesToHex } from './htlc-builder';
+import { ethers } from 'ethers';
+import { vi } from 'vitest';
+import { HTLC_ABI } from './evm-client';
 
 // ============================================================================
 // Electrum value types (verbatim from src/electrum/proxy-client.ts) — inlined here
@@ -230,4 +233,263 @@ export function p2shScriptPubKeyHex(hash160Hex: string): string {
   const h = hash160Hex.replace(/^0x/, '');
   if (h.length !== 40) throw new Error('p2shScriptPubKeyHex: hash160 must be 20 bytes');
   return 'a914' + h + '87';
+}
+
+// ============================================================================
+// (1) encodeSwap / makeHashLock — ABI-correct getSwap return encoder
+// ============================================================================
+
+/** One ethers.Interface built from the SAME HTLC_ABI the SUT uses (no test/source drift). */
+export const htlcInterface = new ethers.Interface(HTLC_ABI);
+
+/** Selector for getSwap(bytes32) — used by MockEvmProvider.call() to route reads. */
+export const GET_SWAP_SELECTOR = htlcInterface.getFunction('getSwap')!.selector;
+
+export const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+export const ZERO_BYTES32 = '0x' + '0'.repeat(64);
+
+/**
+ * The getSwap struct, in the EXACT tuple order the contract returns
+ * (evm-client.ts:30 / :1143-1165):
+ *   (initiator, recipient, token, amount, hashLock, timeLock, claimed, refunded)
+ */
+export interface SwapStruct {
+  initiator: string;
+  recipient: string;
+  token: string;
+  amount: bigint;
+  hashLock: string;
+  timeLock: bigint;
+  claimed: boolean;
+  refunded: boolean;
+}
+
+/** A zero-initialised struct — getSwap() decodes this to `null` (initiator == ZeroAddress). */
+export const ZERO_SWAP: SwapStruct = {
+  initiator: ZERO_ADDRESS,
+  recipient: ZERO_ADDRESS,
+  token: ZERO_ADDRESS,
+  amount: 0n,
+  hashLock: ZERO_BYTES32,
+  timeLock: 0n,
+  claimed: false,
+  refunded: false,
+};
+
+/**
+ * Encode a getSwap() return value as ABI-correct hex, exactly as a real HTLC node
+ * would return from `eth_call`. Feed this out of MockEvmProvider.call().
+ */
+export function encodeSwap(s: SwapStruct): string {
+  return htlcInterface.encodeFunctionResult('getSwap', [
+    s.initiator,
+    s.recipient,
+    s.token,
+    s.amount,
+    s.hashLock,
+    s.timeLock,
+    s.claimed,
+    s.refunded,
+  ]);
+}
+
+/** Build a well-formed swap struct with sensible defaults, overridable per-field. */
+export function makeSwap(over: Partial<SwapStruct> = {}): SwapStruct {
+  const base: SwapStruct = {
+    initiator: '0x1111111111111111111111111111111111111111',
+    recipient: '0x2222222222222222222222222222222222222222',
+    token: ZERO_ADDRESS,
+    amount: 1_000_000_000_000_000_000n, // 1 ETH
+    hashLock: '0x' + '11'.repeat(32),
+    timeLock: 1_800_000_000n, // plausible unix ts (~2027), passes claimSwap R138b guard
+    claimed: false,
+    refunded: false,
+  };
+  return { ...base, ...over };
+}
+
+/** hashLock = sha256(secretHex) — matches OP_SHA256 on the UTXO side + evm-client hashPreimage. */
+export function makeHashLock(secretHex: string): string {
+  return ethers.sha256(secretHex);
+}
+
+// ============================================================================
+// (2) MockEvmProvider — a valid ethers v6 ContractRunner returning fabricated bytes
+// ============================================================================
+
+export interface MockEvmProviderOpts {
+  /** Struct returned for a `latest` (no blockTag) getSwap call. `null` => encode ZERO_SWAP (getSwap -> null). */
+  swap?: SwapStruct | null;
+  /** Struct returned when the call carries `blockTag === 'safe'` (R143 depth gate). */
+  safeSwap?: SwapStruct | null;
+  /** Struct returned for a NUMERIC blockTag (historical/depth read). Overrides `swap` when set. */
+  numericSwap?: SwapStruct | null;
+  /** Per-tag resolver (highest precedence). Return a struct, `null` (ZERO_SWAP), or `undefined` to fall through. */
+  swapByBlockTag?: (tag: number | string | undefined) => SwapStruct | null | undefined;
+  /** When true, call() throws — simulate an unreachable / erroring RPC. */
+  callThrows?: boolean;
+  /** Result of getBlock(): `{timestamp}` | null (missing) | `{timestamp: NaN}` (stale/garbage). */
+  block?: { timestamp: number } | null;
+  /** getBlockNumber() result. */
+  blockNumber?: number;
+  /** getNetwork().chainId (bigint). */
+  chainId?: bigint;
+  /** getCode() result — '0x' means undeployed; default is deployed bytecode. */
+  code?: string;
+  /** getLogs() result. */
+  logs?: unknown[];
+  /** getTransactionReceipt() result. */
+  receipt?: unknown | null;
+  /** getTransaction() result. */
+  transaction?: unknown | null;
+  /** Leaf providers for the FallbackProvider quorum path (recoverLockFromTx.__leafProviders). */
+  leafProviders?: MockEvmProvider[];
+}
+
+/**
+ * A minimal but valid ethers v6 ContractRunner. `new Contract(addr, HTLC_ABI, provider)`
+ * routes view calls to `runner.call(tx)`; this returns ABI-correct bytes so getSwap()
+ * decodes a struct we control — including an INFLATED timeLock, a stale/missing block,
+ * a blockTag-routed 'safe' vs numeric disagreement, or an unreachable RPC.
+ */
+export class MockEvmProvider {
+  opts: MockEvmProviderOpts;
+  /** Records every call()'s blockTag so a test can assert routing. */
+  public readonly callLog: Array<{ blockTag: number | string | undefined; data: string | undefined }> = [];
+
+  constructor(opts: MockEvmProviderOpts = {}) {
+    this.opts = opts;
+  }
+
+  /** ethers ContractRunner.provider — self-reference so getRunner(runner,'call') resolves. */
+  get provider(): MockEvmProvider {
+    return this;
+  }
+
+  /** Exposed for recoverLockFromTx's `(provider as any).__leafProviders` multi-leaf quorum scan. */
+  get __leafProviders(): MockEvmProvider[] | undefined {
+    return this.opts.leafProviders;
+  }
+
+  setSwap(s: SwapStruct | null): this {
+    this.opts.swap = s;
+    return this;
+  }
+  setSafeSwap(s: SwapStruct | null): this {
+    this.opts.safeSwap = s;
+    return this;
+  }
+  setBlock(b: { timestamp: number } | null): this {
+    this.opts.block = b;
+    return this;
+  }
+  setCallThrows(v: boolean): this {
+    this.opts.callThrows = v;
+    return this;
+  }
+
+  private resolveSwap(blockTag: number | string | undefined): SwapStruct | null {
+    if (this.opts.swapByBlockTag) {
+      const r = this.opts.swapByBlockTag(blockTag);
+      if (r !== undefined) return r;
+    }
+    if (blockTag === 'safe') {
+      return this.opts.safeSwap !== undefined ? this.opts.safeSwap : (this.opts.swap ?? null);
+    }
+    if (typeof blockTag === 'number') {
+      return this.opts.numericSwap !== undefined ? this.opts.numericSwap : (this.opts.swap ?? null);
+    }
+    return this.opts.swap ?? null;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async call(tx: any): Promise<string> {
+    const blockTag = tx?.blockTag;
+    const data: string | undefined = tx?.data;
+    this.callLog.push({ blockTag, data });
+    if (this.opts.callThrows) {
+      throw new Error('MockEvmProvider: RPC unreachable (callThrows)');
+    }
+    // Route getSwap by selector; any other read returns a single zero word (balanceOf/allowance = 0).
+    if (typeof data === 'string' && data.toLowerCase().startsWith(GET_SWAP_SELECTOR.toLowerCase())) {
+      const s = this.resolveSwap(blockTag);
+      return encodeSwap(s ?? ZERO_SWAP);
+    }
+    return ZERO_BYTES32;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async getBlock(_tag?: any): Promise<{ timestamp: number } | null> {
+    return this.opts.block !== undefined ? this.opts.block : { timestamp: 1_700_000_000 };
+  }
+
+  async getBlockNumber(): Promise<number> {
+    return this.opts.blockNumber ?? 1_000;
+  }
+
+  async getNetwork(): Promise<{ chainId: bigint }> {
+    return { chainId: this.opts.chainId ?? 8453n };
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async getCode(_addr?: any): Promise<string> {
+    return this.opts.code ?? '0x60006000';
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async getLogs(_filter?: any): Promise<unknown[]> {
+    return this.opts.logs ?? [];
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async getTransactionReceipt(_hash?: any): Promise<unknown | null> {
+    return this.opts.receipt !== undefined ? this.opts.receipt : null;
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  async getTransaction(_hash?: any): Promise<unknown | null> {
+    return this.opts.transaction !== undefined ? this.opts.transaction : null;
+  }
+
+  /** ethers may call resolveName when encoding an ENS-shaped address arg; pass hex through. */
+  async resolveName(name: string): Promise<string> {
+    return name;
+  }
+}
+
+// ============================================================================
+// (3) MockSigner — wraps a MockEvmProvider; sendTransaction is a zero-broadcast SPY
+// ============================================================================
+
+/** Sentinel thrown by MockSigner.sendTransaction — asserts NO broadcast on a fail-closed path. */
+export const SENDTX_SENTINEL = 'MockSigner.sendTransaction — BROADCAST ATTEMPTED (test fail-closed violation)';
+
+/**
+ * A valid ethers v6 ContractRunner+Signer. `new Contract(addr, HTLC_ABI, signer)` routes
+ * state-changing calls (lock/claim/refund) to `runner.sendTransaction` — here a vi.fn() SPY
+ * that THROWS. The core fund-safety assertion across the suite is `signer.sendTransaction`
+ * has ZERO calls on every fail-closed path (the secret is never revealed, funds never move).
+ */
+export class MockSigner {
+  provider: MockEvmProvider;
+  address: string;
+  /** vi.fn() spy — throws the sentinel so any broadcast attempt both throws AND is recorded. */
+  public readonly sendTransaction: ReturnType<typeof vi.fn>;
+
+  constructor(provider: MockEvmProvider, address = '0x2222222222222222222222222222222222222222') {
+    this.provider = provider;
+    this.address = address;
+    this.sendTransaction = vi.fn(() => {
+      throw new Error(SENDTX_SENTINEL);
+    });
+  }
+
+  async getAddress(): Promise<string> {
+    return this.address;
+  }
+
+  /** Number of broadcast attempts — assert === 0 on fail-closed paths. */
+  get broadcastCount(): number {
+    return this.sendTransaction.mock.calls.length;
+  }
 }
