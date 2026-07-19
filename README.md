@@ -2,10 +2,24 @@
 
 **The SDK for building bots on the [BCH2 Swap DEX](https://swap.bch2.org)** — a non-custodial, cross-chain atomic-swap exchange between BCH2 (and other UTXO chains) and EVM chains.
 
-This package gives you everything the DEX's own UI uses: HTLC construction and signing, the swap state engine, wallet/key derivation, address codecs, and a client for the order-book API. Keys never leave your process — the server only coordinates orders, it never holds funds.
+> ### ⚠️ Status — read this before trading real funds
+>
+> **Stable, production-grade primitives** — build on these with confidence: `htlc-builder`,
+> `wallet-core`, `address-codec`, `key-encryption`, and the `order-book` client.
+>
+> **`swap-engine` (`Engine`) is a reference implementation, *not* the validated production driver.**
+> The live DEX UI does **not** run this engine — the production swap orchestration (SPV depth gates,
+> cross-domain timelock ordering, the secret lifecycle, reorg recovery, deadline-aware fees) currently
+> lives in the app and is being consolidated into this SDK. Until that lands, treat `Engine` as a
+> reference: make **[PROTOCOL.md](./PROTOCOL.md)** — especially its **§9 fund-safety invariants** — the
+> authoritative contract your bot must satisfy, and **test on testnet before risking mainnet funds.**
+
+This package gives you the building blocks for a swap bot: HTLC construction and signing, wallet/key
+derivation, address codecs, a client for the order-book API, and a reference swap-state engine. Keys
+never leave your process — the server only coordinates orders, it never holds funds.
 
 - **Order book** — list, post, take, and cancel resting swap offers
-- **Swap engine** — the state machine that drives a swap from funded → claimed, with verify/persist/recover
+- **Swap engine** — a reference state machine for funded → claimed, with verify/persist/recover *(see Status above — reference, not the validated production driver)*
 - **HTLC builder** — build/sign CashTokens (BCH2/BCH/BC2/BTC) and read EVM HTLC contracts
 - **Wallet core** — BIP39/BIP32 mnemonic + multi-chain key/address derivation (BCH2, BCH, BC2, BTC, EVM)
 - **Address codec** — CashAddr, Base58, Bech32/Bech32m, WIF
@@ -59,7 +73,7 @@ See **[API.md](./API.md)** for the full REST/WebSocket reference (endpoints, req
 | --- | --- |
 | `@bch2/swap-core` | Everything below re-exported (except `wallet-core`, `evm`) |
 | `@bch2/swap-core/order-book` | `CentralizedOrderBook`, `MockOrderBook`, order/offer types |
-| `@bch2/swap-core/swap-engine` | `Engine`, swap state, verify, persist, recover |
+| `@bch2/swap-core/swap-engine` | `Engine`, swap state, verify, persist, recover — *reference (see Status)* |
 | `@bch2/swap-core/htlc-builder` | `buildRedeemScript`, `buildFundingTx`, `buildClaimTx`, `buildRefundTx`, `extractSecretFromScriptSig` |
 | `@bch2/swap-core/wallet-core` | `generateMnemonic`, `deriveAddresses`, `deriveKeyForSigning` |
 | `@bch2/swap-core/address-codec` | CashAddr / Base58 / Bech32 / WIF encode+decode |
