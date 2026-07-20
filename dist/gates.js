@@ -1020,7 +1020,22 @@ async function assertLegBuriedForFunding(client, p) {
     throw new GateFailure("fund: chain block-time configuration is invalid \u2014 cannot verify swap timelock safety", "abort");
   }
   const responderLockSec = myChainIsEvm ? RESPONDER_LOCK_SEC : LOCKTIME_BLOCKS.responder * myBlockSec;
-  const remainingBlocks = counterpartyLocktime - buried.freshHeight;
+  let marginHeight = buried.freshHeight;
+  if (spvSupported(theirChain)) {
+    try {
+      marginHeight = await spvVerifiedTipFresh(client, theirChain, buried.freshHeight);
+    } catch {
+      throw new GateFailure("fund: could not SPV-verify / freshness-bound the counterparty tip (stale / under-report) \u2014 not committing your funds; retry", "rearm");
+    }
+  }
+  const remainingBlocks = counterpartyLocktime - marginHeight;
+  if (remainingBlocks <= 0) {
+    throw new GateFailure("fund: counterparty HTLC locktime has already expired \u2014 not committing your funds", "abort");
+  }
+  const maxLock = (chainConfigs[theirChain]?.maxLockBlocks ?? 2016) * 3;
+  if (remainingBlocks > maxLock) {
+    throw new GateFailure("fund: counterparty HTLC locktime is suspiciously far in the future (possible grief lock) \u2014 not committing your funds", "abort");
+  }
   if (marginTooTight(remainingBlocks, theirBlockSec, responderLockSec + CLAIM_MARGIN_SEC)) {
     throw new GateFailure(
       `fund: counterparty HTLC expires too soon relative to your ~${Math.ceil(responderLockSec / 3600)}h lock plus the ${Math.floor(CLAIM_MARGIN_SEC / 3600)}h claim margin \u2014 unsafe to commit your funds`,
@@ -1105,6 +1120,9 @@ async function readLeafChainSec(lp) {
 }
 async function assertEvmLegBuriedForFunding(provider, p) {
   const leaves = evmLeaves(provider);
+  if (leaves.length < 2) {
+    throw new GateFailure("evm-fund: the EVM read provider is not a quorum>=2 provider \u2014 refusing to mint on single-backend trust", "rearm");
+  }
   const tsList = await Promise.all(leaves.map(readLeafChainSec));
   const chainNow = aggregateChainNow(tsList, leaves.length);
   const minTimeLock = chainNow == null ? BigInt("9999999999999999") : BigInt(Math.ceil(chainNow + RESPONDER_LOCK_SEC + EVM_CLAIM_MARGIN_SEC));
@@ -1142,6 +1160,10 @@ async function assertEvmLegBuriedForFunding(provider, p) {
   });
 }
 async function assertEvmRevealSafe(provider, p) {
+  const leaves = evmLeaves(provider);
+  if (leaves.length < 2) {
+    throw new GateFailure("evm-reveal: the EVM read provider is not a quorum>=2 provider \u2014 refusing to mint on single-backend trust", "rearm");
+  }
   let atSafeDepth = false;
   try {
     atSafeDepth = await isEvmLockAtSafeDepth(p.htlcAddr, p.swapId, provider, p.requiredConfirmations, {
@@ -1156,7 +1178,6 @@ async function assertEvmRevealSafe(provider, p) {
   if (!atSafeDepth) {
     throw new GateFailure("evm-reveal: counterparty EVM lock is not at a reorg-safe depth, or a binding (hashLock/recipient/amount/token) mismatched \u2014 not revealing your secret; retry", "rearm");
   }
-  const leaves = evmLeaves(provider);
   const [tsList, sw] = await Promise.all([
     Promise.all(leaves.map(readLeafChainSec)),
     getSwap(p.htlcAddr, p.swapId, provider).catch(() => null)

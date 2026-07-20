@@ -48,7 +48,13 @@ type FundProof = ProvenLegAnchor & {
     readonly for: 'fundY';
     readonly [FUND_BRAND]: true;
 };
-/** Opaque authorization for the initiator's single irreversible secret reveal on leg Y. NOT a FundProof. */
+/**
+ * Opaque authorization for the initiator's single irreversible secret reveal on leg Y. NOT a FundProof.
+ * CONSUMER OBLIGATION: a RevealAuthorization minted for role:'responder' (marginBasis:'none') deliberately SKIPS
+ * the 4h claim-margin (a responder claims an ALREADY-PUBLIC secret — no double-dip risk). The initiator's
+ * irreversible reveal path (revealAndClaim, step 5) MUST therefore assert `auth.role === 'initiator'` before
+ * broadcasting, so a margin-skipped responder auth can never authorize an initiator secret reveal.
+ */
 type RevealAuthorization = ProvenLegAnchor & {
     readonly leg: 'Y';
     readonly for: 'reveal';
@@ -169,7 +175,9 @@ interface EvmRevealGateParams {
     requiredConfirmations: number;
     hashLock: string;
     recipient: string;
-    minAmount?: bigint;
+    /** REQUIRED (not optional): part of the proven R148 gate#2 binding — omitting it would let the initiator reveal
+     *  S against an under-funded lock (receive less than given, secret now public). isEvmLockAtSafeDepth enforces it. */
+    minAmount: bigint;
     token: string;
 }
 /**

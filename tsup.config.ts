@@ -18,6 +18,7 @@ export default defineConfig({
     'src/gates.ts',
     'src/utxo-reservation.ts',
     'src/storage.ts',
+    'src/swap-controller.ts',
     'src/fee-rate.ts',
     'src/swap-flow.ts',
     'src/address-codec.ts',

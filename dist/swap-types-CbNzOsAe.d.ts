@@ -96,4 +96,4 @@ interface SwapState {
     responderToken?: string;
 }
 
-export type { Chain as C, EvmChainId as E, HTLCDetails as H, SwapState as S, Utxo as U, ChainConfig as a, HTLCParams as b };
+export type { Chain as C, EvmChainId as E, HTLCDetails as H, SwapOffer as S, Utxo as U, ChainConfig as a, SwapState as b, HTLCParams as c };

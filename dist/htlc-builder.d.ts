@@ -1,5 +1,5 @@
 export { sha256 } from '@noble/hashes/sha256';
-import { U as Utxo, C as Chain, b as HTLCParams, H as HTLCDetails } from './swap-types-s0IAnIBY.js';
+import { U as Utxo, C as Chain, c as HTLCParams, H as HTLCDetails } from './swap-types-CbNzOsAe.js';
 
 /**
  * HTLC (Hash Time-Locked Contract) Builder
