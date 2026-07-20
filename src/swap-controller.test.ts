@@ -30,12 +30,17 @@ import {
   InMemoryDurableStore, InMemorySessionStore, InProcessMutex, type DurableStore,
 } from './storage';
 import { UtxoReservationRegistry } from './utxo-reservation';
-import { MockElectrumClient } from './test-mocks';
-import { hexToBytes, bytesToHex, hash160, sha256 } from './htlc-builder';
+import { MockElectrumClient, buildUtxoRawTx } from './test-mocks';
+import { hexToBytes, bytesToHex, hash160, sha256, createHTLCRedeemScript } from './htlc-builder';
+import { claimHTLC } from './swap-flow';
 import { swapSecretFromKss } from './seed-secret';
 import { __setSpvConfigForTests, __resetSpvCacheForTests } from './spv-verifier';
 import { blockHashInternal, checkPoW, hash256, type AsertParams } from './spv';
-import type { SwapOffer } from './swap-types';
+import {
+  assertRevealSafe as gateAssertRevealSafe,
+  type GateChainClient, type FundProof, type RevealAuthorization,
+} from './gates';
+import type { SwapOffer, Chain } from './swap-types';
 
 // ============================================================================
 // Synthetic PoW chain (verbatim technique from gates.test.ts) — a real header chain from the checkpoint so
@@ -316,5 +321,348 @@ describe('SwapController.fundLegX() — single-flight (fix #3)', () => {
     expect(ctrlA.getState().phase).toBe('initiator_funded');
     expect(ctrlB.getState().phase).toBe('initiator_funded');
     expect(ctrlB.getState().myHTLC?.p2shAddress).toBeTruthy(); // adopt path rehydrated myHTLC from durable
+  });
+});
+
+// ============================================================================
+// STEP 5 — counterparty-leg verify minters + the two irreversible actions + the responder claim side.
+//
+// A FUND-BEARING synthetic PoW chain (verbatim gates.test.ts technique): the fund block is single-tx so its
+// merkleRoot == the funding txid and an empty-branch Merkle proof verifies, so the real R175 assertRevealSafe /
+// assertLegBuriedForFunding (SPV depth + tip-freshness + margin) run FULLY OFFLINE. The funding output pays the
+// P2SH of a REAL HTLC redeem script (recipient = hash160(PUB)) so buildSecretClaim can authenticate it + sign a
+// genuine claim. The counterparty leg lives on 'btc' (not suspended; reqConf 2 <= fixture depth 4); the responder's
+// own leg Y is funded on 'bch2' (reusing the headers-only CTX fixture the fundLegX suite already validates).
+// ============================================================================
+function buildFundSynthChain(opts: {
+  anchorHeight: number; count: number; spacing: number; bits: number; fundSpkHex: string; tipAgeSec?: number;
+}) {
+  const { anchorHeight, count, spacing, bits, fundSpkHex, tipAgeSec = 0 } = opts;
+  const powLimit = 1n << 255n;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const anchorParentTime = nowSec - spacing * (count + 1) - tipAgeSec;
+  const T = (h: number) => anchorParentTime + spacing * (h - anchorHeight + 1);
+  const params: AsertParams = { anchorHeight, anchorBits: bits, anchorParentTime, spacing: BigInt(spacing), powLimit, halfLife: () => 172800n };
+  const fundHeight = anchorHeight + 1;
+  const fund = buildUtxoRawTx([{ value: 100000, scriptPubKeyHex: fundSpkHex }]);
+  const fundRootInternal = hash256(hexToBytes(fund.rawTxHex));
+  const checkpointHashInternal = hash256(new Uint8Array([0xc9, ...new Array(31).fill(0)]));
+  const checkpoint = { height: anchorHeight, hashDisplay: toHexRev(checkpointHashInternal), time: T(anchorHeight) };
+  const headersByHeight: Record<number, string> = {};
+  let prevHashInternal = checkpointHashInternal;
+  for (let i = 0; i < count; i++) {
+    const height = fundHeight + i;
+    const merkle = height === fundHeight ? fundRootInternal : hash256(new Uint8Array([height & 0xff, (height >> 8) & 0xff, 0x5a]));
+    const raw = new Uint8Array(80);
+    const dv = new DataView(raw.buffer);
+    dv.setUint32(0, 0x20000000 >>> 0, true);
+    raw.set(prevHashInternal, 4);
+    raw.set(merkle, 36);
+    dv.setUint32(68, T(height) >>> 0, true);
+    dv.setUint32(72, bits >>> 0, true);
+    let mined = false;
+    for (let nonce = 0; nonce < 0xffffffff; nonce++) {
+      dv.setUint32(76, nonce >>> 0, true);
+      if (checkPoW(raw, bits, powLimit)) { mined = true; break; }
+    }
+    if (!mined) throw new Error(`could not mine synthetic header at ${height}`);
+    headersByHeight[height] = bytesToHex(raw);
+    prevHashInternal = blockHashInternal(raw);
+  }
+  return { params, checkpoint, headersByHeight, fundHeight, fundTxid: fund.txid, fundRawHex: fund.rawTxHex, tip: anchorHeight + count };
+}
+
+// A REAL counterparty HTLC redeem script whose secretHash === sha256(S) and whose recipient is hash160(PUB) (the
+// seed vault's key), so the SDK signs a genuine claim of it. Reused for leg X (fund/responder-claim) + leg Y (reveal).
+const RECIP_PKH = hash160(PUB);
+const CP_REDEEM = createHTLCRedeemScript({
+  secretHash: sha256(S), recipientPubkeyHash: RECIP_PKH, refundPubkeyHash: hexToBytes('cc'.repeat(20)), locktime: 200150,
+});
+const CP_REDEEM_HEX = bytesToHex(CP_REDEEM);
+const CP_P2SH_SPK = 'a914' + bytesToHex(hash160(CP_REDEEM)) + '87';
+const FX = buildFundSynthChain({ anchorHeight: 200000, count: 4, spacing: 600, bits: 0x20010000, fundSpkHex: CP_P2SH_SPK });
+const FX_OUTPOINT = { tx_hash: FX.fundTxid, tx_pos: 0 };
+
+/** The btc counterparty-leg client backed by the FX fixture (deep + fresh + Merkle-provable funding of CP_REDEEM). */
+function fxClient(): MockElectrumClient {
+  return new MockElectrumClient({
+    headersByHeight: FX.headersByHeight,
+    merkleProof: { block_height: FX.fundHeight, merkle: [], pos: 0 },
+    utxos: [{ tx_hash: FX.fundTxid, tx_pos: 0, value: 100000, height: FX.fundHeight }],
+    rawTxByTxid: { [FX.fundTxid]: FX.fundRawHex },
+    height: FX.tip,
+    tipHeaderHex: FX.headersByHeight[FX.tip],
+    broadcastTxid: '00'.repeat(31) + 'aa',
+  });
+}
+/** The bch2 own-leg client (P2PKH inputs + CTX headers) the responder funds leg Y on. */
+function bch2FundClient(): MockElectrumClient {
+  return new MockElectrumClient({
+    headersByHeight: CTX.headersByHeight, height: CTX.tip,
+    utxos: [{ tx_hash: '88'.repeat(32), tx_pos: 0, value: 200000, height: CTX.tip - 1 }],
+    broadcastTxid: '99'.repeat(32),
+  });
+}
+
+/** Route each chain to its own client so a controller can read leg X on btc + fund leg Y on bch2 in one flow. */
+function makeMultiDeps(
+  clients: Partial<Record<Chain, MockElectrumClient>>,
+  over?: { durable?: DurableStore; mutex?: InProcessMutex; reservation?: UtxoReservationRegistry },
+): SwapControllerDeps {
+  const durable = over?.durable ?? new InMemoryDurableStore();
+  const mutex = over?.mutex ?? new InProcessMutex({ store: durable, settle: () => Promise.resolve() });
+  const reservation = over?.reservation ?? new UtxoReservationRegistry();
+  return {
+    chainClientFor: (chain: Chain) => {
+      const c = clients[chain];
+      if (!c) throw new Error(`test: no client wired for chain ${chain}`);
+      return c as unknown as SwapChainClient;
+    },
+    seedVault: new MockSeedVault(KSS),
+    durable, session: new InMemorySessionStore(), mutex, reservation,
+    clock: () => 1_700_000_000_000,
+  };
+}
+
+const CP_HTLC = {
+  redeemScript: CP_REDEEM_HEX, p2shAddress: 'p2sh-cp', secretHash: SECRET_HASH_HEX,
+  recipientPkh: bytesToHex(RECIP_PKH), refundPkh: 'cc'.repeat(20), locktime: 0,
+};
+
+function revealRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
+  return {
+    id: over.id ?? 'reveal-1',
+    role: 'initiator',
+    offer: makeOffer({ id: over.id ?? 'reveal-1', sendChain: 'bch2', receiveChain: 'btc' }),
+    phase: 'responder_funded',
+    counterpartyClaimPkh: CLAIM_PKH_HEX,
+    counterpartyHTLC: { ...CP_HTLC, locktime: FX.tip + 100 }, // margin ok for the initiator reveal (÷K 30000s >= 4h)
+    counterpartyFundingOutpoint: FX_OUTPOINT,
+    ...over,
+  };
+}
+
+function fundRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
+  return {
+    id: over.id ?? 'fund-1',
+    role: 'responder',
+    offer: makeOffer({ id: over.id ?? 'fund-1', sendChain: 'btc', receiveChain: 'bch2' }),
+    phase: 'taken',
+    counterpartyClaimPkh: CLAIM_PKH_HEX,
+    counterpartyHTLC: { ...CP_HTLC, locktime: FX.tip + 200 }, // margin ok for the responder fund gate (÷K 60000s)
+    counterpartyFundingOutpoint: FX_OUTPOINT,
+    ...over,
+  };
+}
+
+// A genuine "initiator claim of leg Y" spend that reveals `secret` in its scriptSig; the responder watcher extracts it.
+async function makeLegYClaimSpend(secret: Uint8Array): Promise<{ txid: string; rawTx: string }> {
+  return claimHTLC({ tx_hash: 'ee'.repeat(32), tx_pos: 0, value: 100000, height: 10 }, CP_REDEEM, secret, PRIV, PUB, RECIP_PKH, 'bch2');
+}
+
+function watchRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
+  return {
+    id: over.id ?? 'watch-1',
+    role: 'responder',
+    offer: makeOffer({ id: over.id ?? 'watch-1', sendChain: 'btc', receiveChain: 'bch2' }),
+    phase: 'responder_funded',
+    counterpartyClaimPkh: CLAIM_PKH_HEX,
+    myHTLC: { ...CP_HTLC, p2shAddress: 'p2sh-legy', locktime: 100076 },        // responder's own leg Y (watched)
+    counterpartyHTLC: { ...CP_HTLC, p2shAddress: 'p2sh-legx', locktime: FX.tip + 200 }, // initiator leg X (claimed)
+    counterpartyFundingOutpoint: FX_OUTPOINT,
+    ...over,
+  };
+}
+
+// Compile-time proof that fundLegY STRUCTURALLY requires a FundProof (validated by `tsc --noEmit`, not the runtime).
+// If either directive becomes UNUSED (fundLegY drops the required proof / accepts the wrong brand) tsc FAILS.
+async function _fundLegYCompileCheck(ctrl: SwapController, ra: RevealAuthorization): Promise<void> {
+  // @ts-expect-error fundLegY requires a FundProof — a no-arg call must NOT compile (safe-by-default, design §4).
+  await ctrl.fundLegY();
+  // @ts-expect-error a RevealAuthorization is NOT a FundProof — the two brands are non-interchangeable (fix #1).
+  await ctrl.fundLegY(ra);
+}
+
+// Compile-time proof that revealAndClaim STRUCTURALLY requires a RevealAuthorization (validated by `tsc --noEmit`).
+// If either directive becomes UNUSED (revealAndClaim drops the required auth / accepts the wrong brand) tsc FAILS.
+async function _revealAndClaimCompileCheck(ctrl: SwapController, fp: FundProof): Promise<void> {
+  // @ts-expect-error revealAndClaim requires a RevealAuthorization — a no-arg call must NOT compile (fix #3 / §4).
+  await ctrl.revealAndClaim();
+  // @ts-expect-error a FundProof is NOT a RevealAuthorization — the two brands are non-interchangeable (fix #1).
+  await ctrl.revealAndClaim(fp);
+}
+
+// ============================================================================
+// (f) verifyCounterpartyLegForReveal + revealAndClaim — the initiator's single irreversible secret reveal
+// ============================================================================
+describe('SwapController.revealAndClaim() — the initiator secret reveal (fix #2/#3/#8)', () => {
+  beforeEach(() => {
+    __setSpvConfigForTests('btc', FX.params, FX.checkpoint);
+    __resetSpvCacheForTests();
+  });
+
+  it('HAPPY: verifyCounterpartyLegForReveal mints an initiator auth; revealAndClaim broadcasts the secret-bearing claim ONCE', async () => {
+    const btc = fxClient();
+    const ctrl = new SwapController(revealRecord(), makeMultiDeps({ btc }));
+    const auth = await ctrl.verifyCounterpartyLegForReveal();
+    expect(auth.leg).toBe('Y');
+    expect(auth.for).toBe('reveal');
+    expect(auth.role).toBe('initiator');
+    expect(auth.outpoint).toEqual(FX_OUTPOINT);
+    const { txid } = await ctrl.revealAndClaim(auth);
+    expect(btc.broadcasts.length).toBe(1);            // secret revealed exactly once
+    expect(ctrl.getState().phase).toBe('claimed');
+    expect(txid).toBeTruthy();
+  });
+
+  it('(fix #3) revealAndClaim with a RESPONDER-role authorization THROWS and broadcasts NOTHING', async () => {
+    const btc = fxClient();
+    const ctrl = new SwapController(revealRecord(), makeMultiDeps({ btc }));
+    // A responder auth (marginBasis 'none' — SKIPS the 4h margin) minted via the gate directly: must NEVER drive the reveal.
+    const responderAuth = await gateAssertRevealSafe(btc as unknown as GateChainClient, {
+      role: 'responder', theirChain: 'btc', counterpartyRedeemScript: CP_REDEEM,
+      recordedOutpoint: FX_OUTPOINT, counterpartyLocktime: FX.tip + 1, // far too tight for an initiator, allowed for a responder
+    });
+    expect(responderAuth.role).toBe('responder');
+    await expect(ctrl.revealAndClaim(responderAuth)).rejects.toThrow(/fix #3|initiator/i);
+    expect(btc.broadcasts.length).toBe(0);
+  });
+
+  it('(fix #8) revealAndClaim where the built claim spends a DIFFERENT outpoint than the auth THROWS + no broadcast', async () => {
+    const btc = fxClient();
+    const ctrl = new SwapController(revealRecord(), makeMultiDeps({ btc }));
+    const auth = await ctrl.verifyCounterpartyLegForReveal(); // bound to FX_OUTPOINT (A)
+    // A reorg re-mined the funding at a NEW outpoint B; the live UTXO set now shows ONLY B (still a valid HTLC output).
+    const B = buildUtxoRawTx([{ value: 90000, scriptPubKeyHex: CP_P2SH_SPK }]);
+    btc.opts.rawTxByTxid = { ...(btc.opts.rawTxByTxid ?? {}), [B.txid]: B.rawTxHex };
+    btc.setUtxos([{ tx_hash: B.txid, tx_pos: 0, value: 90000, height: FX.fundHeight }]);
+    await expect(ctrl.revealAndClaim(auth)).rejects.toThrow(/fix #8|different outpoint|reorg/i);
+    expect(btc.broadcasts.length).toBe(0);
+  });
+
+  it('(R-REVEAL-FAILCLOSE) a cached claim tx LACKING .spent fails closed + no secret-bearing broadcast; the cache is discarded', async () => {
+    const btc = fxClient();
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(revealRecord(), makeMultiDeps({ btc }, { durable }));
+    const auth = await ctrl.verifyCounterpartyLegForReveal();
+    await durable.set('bch2swap:claimtx:reveal-1', JSON.stringify({ txid: 'ab'.repeat(32), rawTx: '00' })); // no `.spent`
+    await expect(ctrl.revealAndClaim(auth)).rejects.toThrow(/R-REVEAL-FAILCLOSE|lacks|spent/i);
+    expect(btc.broadcasts.length).toBe(0);
+    expect(await durable.get('bch2swap:claimtx:reveal-1')).toBeNull(); // discarded before any reveal
+  });
+
+  it('(fix #2) a now-STALE / inflated tip at the broadcast choke point re-mint FAILS -> revealAndClaim throws + broadcasts.length===0', async () => {
+    const btc = fxClient();
+    const ctrl = new SwapController(revealRecord(), makeMultiDeps({ btc }));
+    const auth = await ctrl.verifyCounterpartyLegForReveal(); // minted against the fresh, deep tip
+    // Between verify and reveal the proxy now reports an INFLATED tip with no PoW headers to back it (SPV over-report).
+    // The claim BUILDS fine (no depth check), but the choke-point re-mint SPV-fails -> abort before revealing S.
+    btc.setHeight(FX.tip + 10);
+    await expect(ctrl.revealAndClaim(auth)).rejects.toMatchObject({ name: 'GateFailure' });
+    expect(btc.broadcasts.length).toBe(0);
+    expect(ctrl.getState().phase).toBe('responder_funded'); // never advanced
+  });
+});
+
+// ============================================================================
+// (g) verifyCounterpartyLegForFunding + fundLegY — the responder funds leg Y (fix #2)
+// ============================================================================
+describe('SwapController.fundLegY() — the responder funds leg Y (fix #2)', () => {
+  beforeEach(() => {
+    __setSpvConfigForTests('btc', FX.params, FX.checkpoint); // leg X (counterparty) SPV fixture; bch2 == CTX (top-level)
+    __resetSpvCacheForTests();
+  });
+
+  it('HAPPY: verifyCounterpartyLegForFunding mints a FundProof; fundLegY funds leg Y + re-mints, broadcasts ONCE', async () => {
+    const btc = fxClient();
+    const bch2 = bch2FundClient();
+    const ctrl = new SwapController(fundRecord(), makeMultiDeps({ btc, bch2 }));
+    const proof = await ctrl.verifyCounterpartyLegForFunding();
+    expect(proof.leg).toBe('X');
+    expect(proof.for).toBe('fundY');
+    expect(proof.role).toBe('responder');
+    const { txid } = await ctrl.fundLegY(proof);
+    expect(bch2.broadcasts.length).toBe(1);           // the responder's own leg funded once
+    expect(btc.broadcasts.length).toBe(0);            // leg X is READ-ONLY (never written)
+    const snap = ctrl.getState();
+    expect(snap.phase).toBe('responder_funded');
+    expect(snap.myFundingTxid).toBe(txid);
+    expect(snap.fundLocktime).toBe(CTX.tip + 72);     // buildHeight + LOCKTIME_BLOCKS.responder (~12h)
+    expect(snap.myHTLC?.p2shAddress).toBeTruthy();
+  });
+
+  it('(fix #2) fundLegY re-mint FAILS (leg X vanished at the choke point) -> no broadcast, phase unchanged', async () => {
+    const btc = fxClient();
+    const bch2 = bch2FundClient();
+    const ctrl = new SwapController(fundRecord(), makeMultiDeps({ btc, bch2 }));
+    const proof = await ctrl.verifyCounterpartyLegForFunding(); // minted against the fresh leg X
+    btc.setUtxos([]); // leg X double-spent / reorged away between the proof mint and the fund broadcast choke point
+    await expect(ctrl.fundLegY(proof)).rejects.toMatchObject({ name: 'GateFailure' });
+    expect(bch2.broadcasts.length).toBe(0);           // fix #2: the fresh re-mint throw ABORTS before broadcasting
+    expect(ctrl.getState().phase).toBe('taken');
+  });
+
+  it('(fix #1 compile) fundLegY STRUCTURALLY requires a FundProof — the no-arg / wrong-brand calls do not compile', () => {
+    expect(typeof _fundLegYCompileCheck).toBe('function');
+  });
+
+  it('(fix #1/#3 compile) revealAndClaim STRUCTURALLY requires a RevealAuthorization — no-arg / FundProof do not compile', () => {
+    expect(typeof _revealAndClaimCompileCheck).toBe('function');
+  });
+});
+
+// ============================================================================
+// (h) watchForSecret + claimWithKnownSecret — the responder claim side
+// ============================================================================
+describe('SwapController.watchForSecret() + claimWithKnownSecret() — the responder claim side', () => {
+  it('watchForSecret returns the secret + advances to claimed when the initiator reveals a VALID preimage', async () => {
+    const spend = await makeLegYClaimSpend(S);
+    const bch2 = new MockElectrumClient({ history: [{ tx_hash: spend.txid, height: 12 }], rawTxByTxid: { [spend.txid]: spend.rawTx } });
+    const ctrl = new SwapController(watchRecord(), makeMultiDeps({ bch2 }));
+    const { secret } = await ctrl.watchForSecret();
+    expect(secret).not.toBeNull();
+    expect(bytesToHex(secret!)).toBe(bytesToHex(S));
+    expect(ctrl.getState().phase).toBe('claimed');
+  });
+
+  it('watchForSecret REJECTS a forged preimage (sha256(S) !== hashLock) and does NOT advance', async () => {
+    const forged = await makeLegYClaimSpend(hexToBytes('ab'.repeat(32))); // a 32-byte value that is NOT the preimage
+    const bch2 = new MockElectrumClient({ history: [{ tx_hash: forged.txid, height: 12 }], rawTxByTxid: { [forged.txid]: forged.rawTx } });
+    const ctrl = new SwapController(watchRecord(), makeMultiDeps({ bch2 }));
+    const { secret } = await ctrl.watchForSecret();
+    expect(secret).toBeNull();
+    expect(ctrl.getState().phase).toBe('responder_funded'); // never advanced on a forged reveal
+  });
+
+  it('watchForSecret does NOT throw on absence (empty history) — returns {secret:null}', async () => {
+    const bch2 = new MockElectrumClient({ history: [] });
+    const ctrl = new SwapController(watchRecord(), makeMultiDeps({ bch2 }));
+    await expect(ctrl.watchForSecret()).resolves.toEqual({ secret: null });
+  });
+
+  it('claimWithKnownSecret claims leg X with the public secret (margin gate skipped), broadcasts ONCE -> completed', async () => {
+    const spend = await makeLegYClaimSpend(S);
+    const bch2 = new MockElectrumClient({ history: [{ tx_hash: spend.txid, height: 12 }], rawTxByTxid: { [spend.txid]: spend.rawTx } });
+    const btc = fxClient();
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(watchRecord(), makeMultiDeps({ bch2, btc }, { durable }));
+    await ctrl.watchForSecret();                       // learn S from the on-chain reveal (sets the in-memory public secret)
+    expect(ctrl.getState().phase).toBe('claimed');
+    const { txid } = await ctrl.claimWithKnownSecret();
+    expect(btc.broadcasts.length).toBe(1);
+    expect(ctrl.getState().phase).toBe('completed');
+    expect(txid).toBeTruthy();
+  });
+
+  it('claimWithKnownSecret REFUSES while a refund of the same HTLC is in flight (no broadcast)', async () => {
+    const spend = await makeLegYClaimSpend(S);
+    const bch2 = new MockElectrumClient({ history: [{ tx_hash: spend.txid, height: 12 }], rawTxByTxid: { [spend.txid]: spend.rawTx } });
+    const btc = fxClient();
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(watchRecord(), makeMultiDeps({ bch2, btc }, { durable }));
+    await ctrl.watchForSecret();
+    await durable.set('bch2swap:refundbroadcast:watch-1', '1'); // a refund of our own leg is in flight
+    await expect(ctrl.claimWithKnownSecret()).rejects.toThrow(/refund/i);
+    expect(btc.broadcasts.length).toBe(0);
   });
 });

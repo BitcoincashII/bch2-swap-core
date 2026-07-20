@@ -146,6 +146,11 @@ export class MockElectrumClient {
     return this.opts.history ?? [];
   }
 
+  /** ElectrumProxyClient.getHistory — the camelCase alias the SwapController's secret-watcher calls. */
+  async getHistory(_scripthash: string, _scriptHex?: string, _timeoutMs?: number): Promise<HistoryEntry[]> {
+    return this.opts.history ?? [];
+  }
+
   /**
    * R175-SPV: blockchain.block.headers — a batch of contiguous 80-byte headers (concatenated hex). Serves the
    * CONTIGUOUS run from `start` out of opts.headersByHeight; a missing height ends the run (short batch), which

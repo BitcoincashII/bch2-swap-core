@@ -31,16 +31,23 @@ import type { GateChainClient, GateUtxo } from './gates';
 export interface SwapChainClient extends GateChainClient {
   /** Broadcast a signed raw tx; resolves the node's ack txid, THROWS on a node reject (so a fund failure aborts). */
   broadcastTx(rawTx: string): Promise<string>;
+  /** blockchain.scripthash.get_history — the spend/confirm history the responder's secret-watcher scans (leg Y).
+   *  Matches ElectrumProxyClient.getHistory verbatim so the app client + the test mock satisfy it with no adapter. */
+  getHistory(scripthash: string, scriptHex?: string, timeoutMs?: number): Promise<Array<{ tx_hash: string; height: number }>>;
 }
 import type { DurableStore, SessionStore, Mutex } from './storage';
 import { UtxoReservationRegistry, type ResUtxo } from './utxo-reservation';
 import { deriveSwapKss, swapSecretFromKss, SWAP_SECRET_SCHEME, SWAP_NONCE_BYTES } from './seed-secret';
-import { createInitiatorHTLC, fundHTLC, verifyAndAuthenticateP2pkhInput } from './swap-flow';
+import {
+  createInitiatorHTLC, createResponderHTLC, fundHTLC, claimHTLC, extractSecret,
+  verifyAndAuthenticateP2pkhInput, verifyAndAuthenticateUtxo, getHTLCScripthash,
+} from './swap-flow';
 import { hexToBytes, bytesToHex, hash160, sha256, maxPlausibleBlockHeight } from './htlc-builder';
 import { p2pkhScripthash } from './address-codec';
 import { chainConfigs, isSwapPairSuspended } from './chain-config';
 import { spvSupported, verifyFundingHeight } from './spv-verifier';
-import type { HTLCDetails } from './swap-types';
+import { assertLegBuriedForFunding, assertRevealSafe, type FundProof, type RevealAuthorization } from './gates';
+import type { HTLCDetails, Utxo } from './swap-types';
 
 // ============================================================================
 // Phase enum + durable record (design §3)
@@ -97,6 +104,9 @@ export interface DurableSwapRecord {
 
   // ── counterparty leg (steps 5-7 populate these) ──────────────────────────────────────────────────────
   counterpartyHTLC?: DurableHTLC;
+  /** The counterparty's funding OUTPOINT the host recorded when it observed the counterparty HTLC confirm — the
+   *  exact output the fund/reveal gates re-verify + bind their proof to (design §3). UTXO topologies only. */
+  counterpartyFundingOutpoint?: Outpoint;
   counterpartyEvmSwapId?: string;
   counterpartyEvmTimeLock?: number; // R167 trusted EVM-leg expiry (absolute unix seconds)
 
@@ -107,6 +117,7 @@ export interface DurableSwapRecord {
 
   // ── irreversible-tx caches (steps 5-6 populate these) ────────────────────────────────────────────────
   claimTx?: { txid: string; rawTx: string; spent?: Outpoint };
+  myClaimTxid?: string; // the broadcast (or adopted) claim txid, once revealAndClaim / claimWithKnownSecret settles
   refundTx?: { txid: string; rawTx: string };
 
   // ── durable sentinels ────────────────────────────────────────────────────────────────────────────────
@@ -235,6 +246,15 @@ const fundedTxKey = (id: string): string => `bch2swap:fundedtx:${id}`;
 const recordKey = (id: string): string => `bch2swap:record:${id}`;
 /** Optional encrypted-at-rest durable S (fix #5): a non-hmac-v1 offer may only be prepared/funded if this exists. */
 const durableSecretKey = (id: string): string => `bch2swap:encsecret:${id}`;
+/** The secret-bearing claim tx (design §3 — `.spent` is load-bearing for the pre-reveal double-spend re-check +
+ *  the fix #8 outpoint triangulation). It is public material once broadcast (durable-before-broadcast). */
+const claimTxKey = (id: string): string => `bch2swap:claimtx:${id}`;
+/** The winning-claim sentinel — set atomically WITH the claim tx inside the claim mutex, BEFORE the secret-bearing
+ *  broadcast, so a second call (or a crash-resume) ADOPTS the prior claim txid instead of re-revealing. */
+const claimBroadcastKey = (id: string): string => `bch2swap:claimbroadcast:${id}`;
+/** A refund of our own HTLC is in flight (set by the step-6 refund path). The responder's public-secret claim
+ *  refuses to run while this is set so a claim + refund cannot race the same outpoint. */
+const refundBroadcastKey = (id: string): string => `bch2swap:refundbroadcast:${id}`;
 
 function durableHtlc(h: HTLCDetails): DurableHTLC {
   return {
@@ -392,6 +412,25 @@ export class SwapController {
     await this.persistRecord();
   }
 
+  /**
+   * The INITIATOR's re-derivable secret for the reveal path (mirrors buildClaimTx's `state.secret ?? recoverSecret()`
+   * ~7204-7207): return the in-memory S if present, else RE-DERIVE it (hmac-v1 from K_ss+nonce, or a durable S) and
+   * RE-AUTHENTICATE sha256(S) === offer.secretHash before caching it. Returns null (fail closed) on any miss/mismatch.
+   */
+  private async loadInitiatorSecret(): Promise<Uint8Array | null> {
+    if (this.secret && this.secret.length === 32) return this.secret;
+    const secretHashHex = (this.record.offer.secretHash ?? '').toLowerCase().replace(/^0x/, '');
+    if (!HEX64.test(secretHashHex)) return null;
+    const isHmacV1 = this.record.offer.secretScheme === SWAP_SECRET_SCHEME;
+    const durableSecretHex = await this.deps.durable.get(durableSecretKey(this.record.id));
+    const S = await this.recoverSecret(secretHashHex, isHmacV1, durableSecretHex);
+    if (!S || S.length !== 32) return null;
+    if (bytesToHex(sha256(S)) !== secretHashHex) { S.fill(0); return null; } // fail closed on a tampered nonce/scheme
+    if (this.secret) this.secret.fill(0);
+    this.secret = S;
+    return S;
+  }
+
   /** Recover the 32-byte preimage: hmac-v1 -> derive from K_ss + nonce; else -> decode a durable S. Returns null on miss. */
   private async recoverSecret(secretHashHex: string, isHmacV1: boolean, durableSecretHex: string | null): Promise<Uint8Array | null> {
     if (isHmacV1 && this.role === 'initiator') {
@@ -434,34 +473,101 @@ export class SwapController {
    */
   async fundLegX(): Promise<{ txid: string }> {
     this.assertLive();
+    if (this.record.role !== 'initiator') {
+      throw new Error('fundLegX: only the initiator funds leg X (the responder funds leg Y via fundLegY)');
+    }
+    return this.fundOwnLeg({
+      label: 'fundLegX',
+      expectRole: 'initiator',
+      targetPhase: 'initiator_funded',
+      amountSats: this.legXAmountSats(),
+      buildHtlc: (state, buildHeight, recipientPkh, refundPkh) =>
+        createInitiatorHTLC(state, buildHeight, recipientPkh, refundPkh),
+    });
+  }
+
+  // ── fundLegY(proof) — the RESPONDER funds its OWN UTXO leg Y ────────────────────────────────────────────────
+
+  /**
+   * Fund the RESPONDER's own UTXO leg Y (receiveChain), reusing fundLegX's proven select/reserve/build/
+   * durable-commit/broadcast machinery but with the RESPONDER HTLC (createResponderHTLC — LOCKTIME_BLOCKS.responder,
+   * ~12h, well under the initiator's ~36h) and the leg-Y amount (offer.receiveAmount). It STRUCTURALLY requires a
+   * `FundProof` (compile-time) — the only minter is verifyCounterpartyLegForFunding — so a bot cannot fund leg Y
+   * without first proving leg X is buried + the timelock margin is safe.
+   *
+   * FIX #2 (zero proof-reuse window, R175): the passed `proof`'s captured values are NEVER trusted to authorize the
+   * broadcast. Inside the fund mutex, at the broadcast choke point, we RE-MINT from a FRESH read of the counterparty
+   * (initiator) leg X (verifyCounterpartyLegForFunding -> assertLegBuriedForFunding). A fresh throw ABORTS without
+   * broadcasting — funds never move against a leg X that reorged / double-spent / drifted past the margin since the
+   * proof was minted. Transitions `taken|prepared -> responder_funded`. Grounds in handleCounterpartyFunded + the
+   * responder fund path (~5230-5281).
+   */
+  async fundLegY(proof: FundProof): Promise<{ txid: string }> {
+    this.assertLive();
+    if (this.record.role !== 'responder') {
+      throw new Error('fundLegY: only the responder funds leg Y (the initiator funds leg X via fundLegX)');
+    }
+    // `proof` is required at the TYPE level (safe-by-default, design §4). Its captured facts may only ever FAIL a
+    // funding (staleness), never license skipping the fresh re-mint below (fix #2) — so we intentionally do not read
+    // it to authorize anything; a structural discriminant touch keeps the param load-bearing without trusting it.
+    if (proof.leg !== 'X' || proof.for !== 'fundY') {
+      throw new Error('fundLegY: the supplied FundProof is not a leg-X fund authorization — refusing to fund');
+    }
+    return this.fundOwnLeg({
+      label: 'fundLegY',
+      expectRole: 'responder',
+      targetPhase: 'responder_funded',
+      amountSats: this.legYAmountSats(),
+      // Height-based responder CLTV (buildHeight + LOCKTIME_BLOCKS.responder). The EVM-anchored TIMESTAMP CLTV (R167)
+      // is a step-7 topology; this UTXO<->UTXO path uses the default height locktime.
+      buildHtlc: (state, buildHeight, recipientPkh, refundPkh) =>
+        createResponderHTLC(state, buildHeight, recipientPkh, refundPkh),
+      // FIX #2: re-mint the counterparty-leg-X burial proof FRESH at the broadcast choke point (throws -> abort).
+      preBroadcastReverify: async () => { await this.verifyCounterpartyLegForFunding(); },
+    });
+  }
+
+  /**
+   * Shared own-leg funding machinery for fundLegX (initiator) + fundLegY (responder). Faithfully ports the proven
+   * handleBroadcastFunding path — see the fundLegX doc block for the (1)-(5) sequence. The only per-role differences
+   * are the HTLC factory, the leg amount, the target phase, and the optional `preBroadcastReverify` (fix #2, leg Y).
+   */
+  private async fundOwnLeg(opts: {
+    label: 'fundLegX' | 'fundLegY';
+    expectRole: 'initiator' | 'responder';
+    targetPhase: 'initiator_funded' | 'responder_funded';
+    amountSats: number;
+    buildHtlc: (state: SwapState, buildHeight: number, recipientPkh: Uint8Array, refundPkh: Uint8Array) => HTLCDetails;
+    preBroadcastReverify?: () => Promise<void>;
+  }): Promise<{ txid: string }> {
+    const { label, expectRole, targetPhase, amountSats, buildHtlc, preBroadcastReverify } = opts;
     const rec = this.record;
-    if (rec.role !== 'initiator') {
-      throw new Error('fundLegX: only the initiator funds leg X (responder/EVM funding is step 7)');
+    if (rec.role !== expectRole) {
+      throw new Error(`${label}: wrong role '${rec.role}' — refusing to fund`);
     }
     if (rec.phase !== 'taken' && rec.phase !== 'prepared') {
-      throw new Error(`fundLegX: unexpected phase '${rec.phase}' — fund runs from 'taken' or 'prepared'`);
+      throw new Error(`${label}: unexpected phase '${rec.phase}' — fund runs from 'taken' or 'prepared'`);
     }
     if (isSwapPairSuspended(this.myChain, this.theirChain)) {
-      throw new Error(`fundLegX: swap pair ${this.myChain}/${this.theirChain} is suspended — refusing to fund`);
+      throw new Error(`${label}: swap pair ${this.myChain}/${this.theirChain} is suspended — refusing to fund`);
     }
     const cfg = chainConfigs[this.myChain];
     if (!cfg || (cfg as { isEvm?: boolean }).isEvm) {
-      throw new Error(`fundLegX: leg X (${this.myChain}) is not a UTXO chain — EVM funding is step 7`);
+      throw new Error(`${label}: own leg (${this.myChain}) is not a UTXO chain — EVM funding is step 7`);
     }
     const claimPkhHex = (rec.counterpartyClaimPkh ?? '').toLowerCase().replace(/^0x/, '');
     if (!HEX20.test(claimPkhHex)) {
-      throw new Error('fundLegX: counterpartyClaimPkh (the taker receive pkh on leg X) is missing — cannot build the HTLC');
+      throw new Error(`${label}: counterpartyClaimPkh (the counterparty receive pkh on the own leg) is missing — cannot build the HTLC`);
     }
-    const amountSats = this.legXAmountSats();
 
     const client = this.deps.chainClientFor(this.myChain);
 
     // (1) H1-LOCKTIME-PROXY-001: SPV-verify the build height is a REAL PoW block before it becomes the refund CLTV
     // base. Fail closed on an implausible or unverifiable/inflated height (would strand the coins we are about to fund).
-    this.status('fundLegX:verifying-height');
+    this.status(`${label}:verifying-height`);
     const [buildHeight] = await client.getBlockHeight();
     if (!Number.isInteger(buildHeight) || buildHeight <= 0 || buildHeight > maxPlausibleBlockHeight()) {
-      throw new Error(`fundLegX: proxy-reported ${this.myChain} height ${buildHeight} is implausible — refusing to set an unrecoverable refund timelock`);
+      throw new Error(`${label}: proxy-reported ${this.myChain} height ${buildHeight} is implausible — refusing to set an unrecoverable refund timelock`);
     }
     if (spvSupported(this.myChain)) {
       await verifyFundingHeight(client, this.myChain, buildHeight); // THROWS (fail closed) on an inflated/unverifiable height
@@ -474,7 +580,7 @@ export class SwapController {
     const claimPkh = hexToBytes(claimPkhHex);
 
     const lockName = `bch2swap:fund:${rec.id}`;
-    // (5) single-flight (fix #3): the ENTIRE select+reserve+build+commit+broadcast runs under one lock.
+    // (5) single-flight (fix #3): the ENTIRE select+reserve+build+re-mint+commit+broadcast runs under one lock.
     const outcome = await this.deps.mutex.withLock(lockName, async (): Promise<{ txid: string; htlc?: HTLCDetails; adopted: boolean }> => {
       // Re-check the durable `funded` sentinel INSIDE the lock — a peer/tab that already funded means we must NOT
       // broadcast our (divergent) tx; ADOPT its txid instead (mirrors handleBroadcastFunding's prior-key adopt).
@@ -484,7 +590,7 @@ export class SwapController {
       }
 
       // (2) select + reserve inside the reservation lock (candidateUtxos -> greedy FIFO -> reserveInputs).
-      this.status('fundLegX:selecting-inputs');
+      this.status(`${label}:selecting-inputs`);
       const scripthash = p2pkhScripthash(myPkh);
       const chainUtxos = (await client.getUTXOs(scripthash, bytesToHex(p2pkhScript))) as GateUtxo[];
       const now = this.deps.clock();
@@ -501,18 +607,16 @@ export class SwapController {
       });
       if (!picked || picked.length === 0) {
         this.deps.reservation.releaseSwap(rec.id);
-        throw new Error('fundLegX: insufficient spendable UTXOs to fund the HTLC');
+        throw new Error(`${label}: insufficient spendable UTXOs to fund the HTLC`);
       }
 
       try {
-        // R260-INPUT-VALUE-AUTH-001 (~5479-5509): on LEGACY non-BIP143 chains (btc) the sighash does NOT commit the
-        // input value, so a lying/MITM proxy's inflated listunspent `value` would yield a VALID sig -> too little
-        // change -> the user silently burns the difference to fees. Authenticate each selected input's value against
-        // its self-derived raw tx and drive the build from the AUTHENTICATED value. BIP143 chains (bch2/bch) commit
-        // the value -> a lie -> invalid sig -> node reject (DoS only), so the extra getTx is skipped.
+        // R260-INPUT-VALUE-AUTH-001: on LEGACY non-BIP143 chains the sighash does NOT commit the input value, so a
+        // lying proxy's inflated listunspent `value` would yield a VALID sig -> too little change -> silent fee burn.
+        // Authenticate each selected input against its self-derived raw tx and drive the build from that value.
         let selected: ResUtxo[] = picked;
         if (!(cfg.useBip143 ?? false)) {
-          this.status('fundLegX:authenticating-inputs');
+          this.status(`${label}:authenticating-inputs`);
           const fetchRawTx = (txid: string) => client.getTx(txid);
           const authed: ResUtxo[] = [];
           for (const u of picked) {
@@ -521,27 +625,33 @@ export class SwapController {
           }
           const authTotal = authed.reduce((s, x) => s + x.value, 0);
           if (authTotal < amountSats) {
-            throw new Error('fundLegX: authenticated input total is below the funding amount (possible proxy value inflation) — not signing');
+            throw new Error(`${label}: authenticated input total is below the funding amount (possible proxy value inflation) — not signing`);
           }
           selected = authed;
         }
 
-        // (3) build: createInitiatorHTLC(buildHeight) -> fundHTLC (= buildHTLCFundingTx). Deterministic, so two
-        // concurrent callers produce the SAME txid/locktime — the sentinel re-check keeps it single-broadcast.
-        const htlc = createInitiatorHTLC(this.buildSwapState(), buildHeight, claimPkh, myPkh);
-        this.status('fundLegX:building-tx');
+        // (3) build the own-leg HTLC (initiator or responder) + the funding tx. Deterministic, so two concurrent
+        // callers produce the SAME txid/locktime — the sentinel re-check keeps it single-broadcast.
+        const htlc = buildHtlc(this.buildSwapState(expectRole), buildHeight, claimPkh, myPkh);
+        this.status(`${label}:building-tx`);
         const tx = await fundHTLC(htlc, selected, sk.privateKey, sk.publicKey, p2pkhScript, amountSats, this.myChain);
-        // Record 0-conf change so a concurrent funding may chain from it (no-op for a single swap).
         const totalIn = selected.reduce((s, u) => s + u.value, 0);
         const changeVal = totalIn - amountSats - tx.fee;
         if (changeVal > 0) this.deps.reservation.recordChange(rec.id, { tx_hash: tx.txid, tx_pos: 1, value: changeVal, height: 0 }, now);
 
         const canonical = tx.txid.toLowerCase();
 
+        // FIX #2 (leg Y): re-mint the counterparty-leg-X burial proof from a FRESH read at the broadcast choke point.
+        // A throw ABORTS before the durable commit + broadcast — the responder never commits funds against a leg X
+        // that reorged / double-spent / drifted below the margin since the passed proof was minted.
+        if (preBroadcastReverify) {
+          this.status(`${label}:reverifying-counterparty`);
+          await preBroadcastReverify();
+        }
+
         // (4) durable-before-broadcast (fix #4): ATOMIC write-set, read-back-verified, THROWS on partial. If it
-        // throws we ABORT here — the broadcast below never runs, so funds never move without a durable record. The
-        // raw tx is committed too so a crash between (4) and (5) is resolvable by an idempotent rebroadcast (step 6).
-        this.status('fundLegX:committing');
+        // throws we ABORT here — the broadcast below never runs, so funds never move without a durable record.
+        this.status(`${label}:committing`);
         await this.deps.durable.commit([
           [fundedKey(rec.id), canonical],
           [fundLocktimeKey(rec.id), String(htlc.params.locktime)],
@@ -551,12 +661,12 @@ export class SwapController {
         ]);
 
         // (5) broadcast — only AFTER the durable write-set has landed.
-        this.status('fundLegX:broadcasting');
+        this.status(`${label}:broadcasting`);
         await client.broadcastTx(tx.rawTx);
         return { txid: canonical, htlc, adopted: false };
       } catch (e) {
-        // Build / commit / broadcast failed: release the reserved inputs so a retry can reselect (the durable
-        // sentinel, if the commit succeeded, keeps a later call from double-broadcasting the same tx).
+        // Build / re-mint / commit / broadcast failed: release the reserved inputs so a retry can reselect (the
+        // durable sentinel, if the commit succeeded, keeps a later call from double-broadcasting the same tx).
         this.deps.reservation.releaseSwap(rec.id);
         throw e;
       }
@@ -577,34 +687,420 @@ export class SwapController {
       fundLocktime: fundLocktime ?? this.record.fundLocktime,
       funded: true,
     };
-    this.setPhase('initiator_funded');
-    this.status('fundLegX:funded');
+    this.setPhase(targetPhase);
+    this.status(`${label}:funded`);
     await this.persistRecord();
     return { txid: outcome.txid };
   }
 
+  // ── counterparty-leg proof minters (the ONLY controller-side minters) ──────────────────────────────────────
+
+  /**
+   * RESPONDER-ONLY. Mint a `FundProof` by SPV-verifying the counterparty (initiator) leg X is buried at the required
+   * depth + the responder timelock margin is safe (gates.assertLegBuriedForFunding over leg X). Returns the branded
+   * proof or THROWS a GateFailure (mints nothing) on any failure/uncertainty — fail closed, no funds move. This is
+   * the only way to obtain the `FundProof` that fundLegY requires (design §4).
+   */
+  async verifyCounterpartyLegForFunding(): Promise<FundProof> {
+    this.assertLive();
+    if (this.record.role !== 'responder') {
+      throw new Error('verifyCounterpartyLegForFunding: responder-only (the initiator does not fund against a FundProof)');
+    }
+    const { redeemScript, locktime, outpoint } = this.counterpartyLeg('verifyCounterpartyLegForFunding');
+    const client = this.deps.chainClientFor(this.theirChain); // leg X lives on theirChain (the initiator's sendChain)
+    const myChainIsEvm = !!(chainConfigs[this.myChain] as { isEvm?: boolean } | undefined)?.isEvm;
+    return assertLegBuriedForFunding(client, {
+      theirChain: this.theirChain,
+      myChain: this.myChain,
+      myChainIsEvm,
+      counterpartyRedeemScript: redeemScript,
+      recordedOutpoint: outpoint,
+      counterpartyLocktime: locktime,
+    });
+  }
+
+  /**
+   * INITIATOR-ONLY. Mint a `RevealAuthorization` by SPV-verifying the counterparty (responder) leg Y is buried +
+   * the 4h claim-margin runway on leg Y holds (gates.assertRevealSafe with role:'initiator' over leg Y). Returns the
+   * branded authorization or THROWS a GateFailure (mints nothing) — the secret NEVER leaks on any failure. This is
+   * the only way to obtain the `RevealAuthorization` that revealAndClaim requires (design §4).
+   */
+  async verifyCounterpartyLegForReveal(): Promise<RevealAuthorization> {
+    this.assertLive();
+    if (this.record.role !== 'initiator') {
+      throw new Error('verifyCounterpartyLegForReveal: initiator-only (only the initiator makes the irreversible secret reveal)');
+    }
+    const { redeemScript, locktime, outpoint } = this.counterpartyLeg('verifyCounterpartyLegForReveal');
+    const client = this.deps.chainClientFor(this.theirChain); // leg Y lives on theirChain (the responder's receiveChain)
+    return assertRevealSafe(client, {
+      role: 'initiator',
+      theirChain: this.theirChain,
+      counterpartyRedeemScript: redeemScript,
+      recordedOutpoint: outpoint,
+      counterpartyLocktime: locktime,
+    });
+  }
+
+  // ── revealAndClaim(auth) — the INITIATOR's single irreversible secret reveal (claim of leg Y) ────────────────
+
+  /**
+   * The initiator's ONE irreversible action: reveal S by broadcasting the secret-bearing claim of the counterparty
+   * (responder) leg Y. STRUCTURALLY requires a `RevealAuthorization` (compile-time). Ports handleBroadcastClaim
+   * (~7787-8075). Fund-safety corrections baked in:
+   *   FIX #3: throw unless `auth.role === 'initiator'` — a margin-skipped responder authorization (marginBasis:'none')
+   *     must NEVER drive the initiator's reveal (it deliberately skips the 4h double-dip margin).
+   *   FIX #8 (triangulation): the built claim carries the exact funding outpoint it spends (`.spent`). Require
+   *     `auth.outpoint === claimTx.spent`, and — via the fresh re-mint below — that this same outpoint is STILL
+   *     confirmed at >= reqConf. A cached claim tx LACKING `.spent` fails closed (R-REVEAL-FAILCLOSE ~7980): discard
+   *     it + rebuild rather than broadcast the secret against an unverifiable outpoint.
+   *   FIX #2 (zero reuse window): inside the claim mutex at the broadcast choke point, RE-MINT assertRevealSafe from
+   *     a FRESH read (never the passed auth's captured values). A fresh throw ABORTS — S is never emitted.
+   * The claim tx {txid,rawTx,spent} is committed durably (durable-before-broadcast) BEFORE the broadcast, under a
+   * single-flight mutex ('bch2swap:claim:'+id) with a `claimbroadcast` sentinel so a second call / crash-resume
+   * ADOPTS the prior claim instead of re-revealing. S is NEVER emitted on any throw. Transitions
+   * `responder_funded -> claimed`.
+   */
+  async revealAndClaim(auth: RevealAuthorization): Promise<{ txid: string }> {
+    this.assertLive();
+    const rec = this.record;
+    if (rec.role !== 'initiator') {
+      throw new Error('revealAndClaim: only the initiator reveals the secret (the responder uses claimWithKnownSecret)');
+    }
+    // FIX #3: a responder-role authorization (which SKIPS the 4h claim margin — already-public secret) must never
+    // authorize the initiator's irreversible reveal. Fail closed BEFORE touching the secret or the chain.
+    if (auth.role !== 'initiator' || auth.leg !== 'Y' || auth.for !== 'reveal') {
+      throw new Error('revealAndClaim: the supplied authorization is not an initiator leg-Y reveal authorization — refusing to reveal the secret (fix #3)');
+    }
+    if (rec.phase !== 'responder_funded' && rec.phase !== 'claimed') {
+      throw new Error(`revealAndClaim: unexpected phase '${rec.phase}' — reveal runs from 'responder_funded'`);
+    }
+    if (isSwapPairSuspended(this.myChain, this.theirChain)) {
+      throw new Error(`revealAndClaim: swap pair ${this.myChain}/${this.theirChain} is suspended — refusing to reveal`);
+    }
+    const cfg = chainConfigs[this.theirChain];
+    if (!cfg || (cfg as { isEvm?: boolean }).isEvm) {
+      throw new Error('revealAndClaim: leg Y is not a UTXO chain — EVM reveal is step 7');
+    }
+    if (!auth.outpoint) {
+      throw new Error('revealAndClaim: the reveal authorization carries no outpoint — cannot bind the claim (fix #8)');
+    }
+    const secret = await this.loadInitiatorSecret();
+    if (!secret || secret.length !== 32) {
+      throw new Error('revealAndClaim: the swap secret is not available (vault locked / not re-derivable) — cannot reveal');
+    }
+    const { redeemScript, locktime } = this.counterpartyLeg('revealAndClaim');
+    const client = this.deps.chainClientFor(this.theirChain);
+
+    // R-REVEAL-FAILCLOSE (~7980): a cached claim tx LACKING `.spent` would skip the outpoint triangulation + SPV
+    // re-verify below and reveal the secret against an unverifiable outpoint. Discard it + rebuild (fail closed).
+    const cachedRaw = await this.deps.durable.get(claimTxKey(rec.id));
+    if (cachedRaw) {
+      let cached: { txid?: string; rawTx?: string; spent?: Outpoint } | null = null;
+      try { cached = JSON.parse(cachedRaw) as { txid?: string; rawTx?: string; spent?: Outpoint }; } catch { cached = null; }
+      if (cached && (!cached.spent || !this.isOutpoint(cached.spent))) {
+        await this.deps.durable.remove(claimTxKey(rec.id)); // discard the spent-less cache; a rebuild regenerates it
+        throw new Error('revealAndClaim: cached claim tx lacks a `.spent` outpoint — discarding + failing closed before revealing the secret (R-REVEAL-FAILCLOSE)');
+      }
+    }
+
+    // Build the secret-bearing claim FRESH, preferring the exact authorized outpoint. It carries `.spent`.
+    this.status('revealAndClaim:building-claim');
+    const claimTx = await this.buildSecretClaim(this.theirChain, redeemScript, secret, auth.outpoint);
+
+    // FIX #8 (triangulation, part 1 — equality): the claim MUST spend exactly the outpoint the authorization is
+    // bound to. A divergence (a reorg re-mined the funding at a new outpoint between verify + reveal) fails closed.
+    if (!claimTx.spent || !this.isOutpoint(claimTx.spent)) {
+      throw new Error('revealAndClaim: built claim has no spent outpoint — failing closed before revealing the secret (fix #8)');
+    }
+    if (claimTx.spent.tx_hash !== auth.outpoint.tx_hash || claimTx.spent.tx_pos !== auth.outpoint.tx_pos) {
+      await this.deps.durable.remove(claimTxKey(rec.id));
+      throw new Error('revealAndClaim: built claim spends a different outpoint than the authorization is bound to (possible reorg) — discarding + rebuilding, not revealing the secret (fix #8)');
+    }
+
+    const lockName = `bch2swap:claim:${rec.id}`;
+    const finalTxid = await this.deps.mutex.withLock(lockName, async (): Promise<string> => {
+      // Single-flight adopt: a sibling call / crash-resume that already committed+broadcast the claim set the
+      // sentinel WITH the durable claim tx — ADOPT its txid rather than re-revealing the (already-public) secret.
+      const sentinel = await this.deps.durable.get(claimBroadcastKey(rec.id));
+      if (sentinel) {
+        const priorRaw = await this.deps.durable.get(claimTxKey(rec.id));
+        if (priorRaw) {
+          try {
+            const prior = JSON.parse(priorRaw) as { txid?: string };
+            if (prior?.txid && HEX64.test(prior.txid.toLowerCase())) return prior.txid.toLowerCase();
+          } catch { /* fall through to a fresh, gated broadcast */ }
+        }
+      }
+
+      // FIX #2: RE-MINT the reveal authorization from a FRESH read at the broadcast choke point, bound to the EXACT
+      // outpoint the claim spends (part 2 of the fix #8 triangulation: still-confirmed-at >= reqConf via SPV). The
+      // passed `auth`'s captured values are NEVER reused. A throw ABORTS here — S is never broadcast.
+      this.status('revealAndClaim:reverifying');
+      await assertRevealSafe(client, {
+        role: 'initiator',
+        theirChain: this.theirChain,
+        counterpartyRedeemScript: redeemScript,
+        recordedOutpoint: claimTx.spent as Outpoint,
+        counterpartyLocktime: locktime,
+      });
+
+      // Durable-before-broadcast (fix #4): persist the claim tx + the winning-claim sentinel ATOMICALLY BEFORE the
+      // irreversible secret-bearing broadcast. A commit throw ABORTS the broadcast — S is never emitted.
+      this.status('revealAndClaim:committing');
+      await this.deps.durable.commit([
+        [claimTxKey(rec.id), JSON.stringify(claimTx)],
+        [claimBroadcastKey(rec.id), '1'],
+      ]);
+
+      this.status('revealAndClaim:broadcasting');
+      await client.broadcastTx(claimTx.rawTx);
+      return claimTx.txid.toLowerCase();
+    });
+
+    // Keep record.claimTx consistent with myClaimTxid: on the ADOPT path finalTxid is a prior (possibly divergent)
+    // txid, so rehydrate claimTx from the durable prior claim rather than storing the freshly-built (never-broadcast)
+    // one — else a step-6 resume would read a claimTx.txid that disagrees with myClaimTxid.
+    let effectiveClaimTx = claimTx;
+    if (finalTxid !== claimTx.txid.toLowerCase()) {
+      const priorRaw = await this.deps.durable.get(claimTxKey(rec.id));
+      if (priorRaw) {
+        try {
+          const p = JSON.parse(priorRaw) as { txid?: string; rawTx?: string; spent?: Outpoint };
+          if (p?.txid && p?.rawTx && p?.spent) effectiveClaimTx = { txid: p.txid, rawTx: p.rawTx, spent: p.spent };
+        } catch { /* keep the freshly-built claimTx as a best-effort fallback */ }
+      }
+    }
+    this.record = { ...this.record, claimTx: effectiveClaimTx, myClaimTxid: finalTxid } as DurableSwapRecord;
+    this.setPhase('claimed');
+    this.status('revealAndClaim:claimed');
+    await this.persistRecord();
+    return { txid: finalTxid };
+  }
+
+  // ── watchForSecret() — the RESPONDER learns S from the initiator's on-chain claim of its OWN leg ─────────────
+
+  /**
+   * RESPONDER-ONLY. Poll the responder's OWN funded leg (leg Y, myChain) history for the initiator's spend, which
+   * reveals S in its scriptSig. `extractSecret` parses the preimage and we RE-VERIFY `sha256(S) === hashLock` (the
+   * hash COMMITTED in the funded redeemScript — §9.4) before saving; a forged/mismatched preimage is REJECTED.
+   * Ports watchForSecret (~7499-7766) as a single scheduler-driven poll: it NEVER throws on absence (returns
+   * `{secret:null}`) and, on discovery, transitions `responder_funded -> claimed`. Grounds the extract hash in
+   * myHTLC.params.secretHash (R263 on-chain binding).
+   */
+  async watchForSecret(): Promise<{ secret: Uint8Array | null }> {
+    this.assertLive();
+    const rec = this.record;
+    if (rec.role !== 'responder') {
+      throw new Error('watchForSecret: responder-only (the initiator holds S from prepare())');
+    }
+    // Watch OUR OWN funded leg (leg Y on myChain). The secret hash we validate against is the one committed in the
+    // funded redeemScript at the polled address (R263), i.e. our own HTLC's secretHash — never the tamperable offer.
+    const myHtlc = rec.myHTLC;
+    if (!myHtlc) return { secret: null }; // not funded yet — nothing to watch; do not throw (design: never on absence)
+    const hashLockHex = (myHtlc.secretHash ?? '').toLowerCase();
+    if (!HEX64.test(hashLockHex)) return { secret: null };
+    const redeemScript = hexToBytes((myHtlc.redeemScript ?? '').toLowerCase());
+    const client = this.deps.chainClientFor(this.myChain);
+
+    let history: Array<{ tx_hash: string; height: number }>;
+    try {
+      history = await client.getHistory(getHTLCScripthash(redeemScript), 'a914' + bytesToHex(hash160(redeemScript)) + '87');
+    } catch { return { secret: null }; } // transient poll error — do NOT throw on absence; the scheduler re-polls
+
+    for (const item of history) {
+      if (typeof item?.tx_hash !== 'string' || !HEX64.test(item.tx_hash.toLowerCase())) continue;
+      let rawTx: string;
+      try { rawTx = await client.getTx(item.tx_hash); } catch { continue; }
+      // R22/R53: pass the committed hash INTO extractSecret so it scans EVERY input for the preimage that hashes to
+      // our hashLock and skips decoy inputs — a malicious claim tx that puts a non-matching 32-byte push on an
+      // EARLIER input must not make us extract the wrong value and give up, missing the real secret in a later input
+      // (§9.4, SwapExecute.tsx:7653). The external sha256 re-check below stays as belt-and-suspenders.
+      let candidate: Uint8Array | null;
+      try { candidate = extractSecret(rawTx, hashLockHex); } catch { candidate = null; }
+      if (!candidate || candidate.length !== 32) continue;
+      if (bytesToHex(sha256(candidate)) !== hashLockHex) continue; // forged / mismatched preimage — REJECT
+      // Found + verified. Save it in memory (the responder's now-public secret) and advance to 'claimed'.
+      if (this.secret) this.secret.fill(0);
+      this.secret = candidate;
+      if (rec.phase === 'responder_funded') this.setPhase('claimed');
+      this.status('watchForSecret:secret-found');
+      await this.persistRecord();
+      return { secret: candidate };
+    }
+    return { secret: null };
+  }
+
+  // ── claimWithKnownSecret() — the RESPONDER claims leg X with the now-PUBLIC secret ──────────────────────────
+
+  /**
+   * RESPONDER-ONLY. Claim the counterparty (initiator) leg X (theirChain) with the now-PUBLIC secret learned via
+   * watchForSecret. The reveal margin gate is DELIBERATELY SKIPPED (the secret is already public — no double-dip
+   * risk, design §1), but single-flight + durable-before-broadcast still apply, and it REFUSES if a refund of the
+   * same HTLC is in flight (a claim + refund must not race the same outpoint). Transitions `claimed -> completed`.
+   */
+  async claimWithKnownSecret(): Promise<{ txid: string }> {
+    this.assertLive();
+    const rec = this.record;
+    if (rec.role !== 'responder') {
+      throw new Error('claimWithKnownSecret: responder-only (the initiator reveals via revealAndClaim)');
+    }
+    if (rec.phase !== 'claimed' && rec.phase !== 'responder_funded') {
+      throw new Error(`claimWithKnownSecret: unexpected phase '${rec.phase}' — the responder claim runs after the secret is public`);
+    }
+    const cfg = chainConfigs[this.theirChain];
+    if (!cfg || (cfg as { isEvm?: boolean }).isEvm) {
+      throw new Error('claimWithKnownSecret: leg X is not a UTXO chain — EVM claim is step 7');
+    }
+    // Refuse if a refund of our own HTLC is in flight (mirrors the R181 claim<->refund cross-guard). A public-secret
+    // claim of leg X and a refund of leg Y are on different legs, but this keeps the single terminal-action invariant.
+    const refundInFlight = await this.deps.durable.get(refundBroadcastKey(rec.id));
+    if (refundInFlight) {
+      throw new Error('claimWithKnownSecret: a refund is already in flight — refusing to claim while a refund is active');
+    }
+    const secret = this.secret;
+    if (!secret || secret.length !== 32) {
+      throw new Error('claimWithKnownSecret: the public secret is not available — run watchForSecret first');
+    }
+    const { redeemScript } = this.counterpartyLeg('claimWithKnownSecret');
+    const client = this.deps.chainClientFor(this.theirChain);
+
+    // Build the claim FRESH (no margin gate — the secret is public). Reveal-gate is skipped by design.
+    this.status('claimWithKnownSecret:building-claim');
+    const claimTx = await this.buildSecretClaim(this.theirChain, redeemScript, secret);
+
+    const lockName = `bch2swap:claim:${rec.id}`;
+    const finalTxid = await this.deps.mutex.withLock(lockName, async (): Promise<string> => {
+      // Single-flight adopt (a sibling / crash-resume already broadcast this claim).
+      const sentinel = await this.deps.durable.get(claimBroadcastKey(rec.id));
+      if (sentinel) {
+        const priorRaw = await this.deps.durable.get(claimTxKey(rec.id));
+        if (priorRaw) {
+          try {
+            const prior = JSON.parse(priorRaw) as { txid?: string };
+            if (prior?.txid && HEX64.test(prior.txid.toLowerCase())) return prior.txid.toLowerCase();
+          } catch { /* fall through */ }
+        }
+      }
+      // Re-check the refund sentinel INSIDE the lock (a refund could have raced in since the pre-check).
+      if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
+        throw new Error('claimWithKnownSecret: a refund became active — refusing to claim');
+      }
+      // Durable-before-broadcast (fix #4): persist the claim + sentinel ATOMICALLY BEFORE broadcasting.
+      this.status('claimWithKnownSecret:committing');
+      await this.deps.durable.commit([
+        [claimTxKey(rec.id), JSON.stringify(claimTx)],
+        [claimBroadcastKey(rec.id), '1'],
+      ]);
+      this.status('claimWithKnownSecret:broadcasting');
+      await client.broadcastTx(claimTx.rawTx);
+      return claimTx.txid.toLowerCase();
+    });
+
+    this.record = { ...this.record, claimTx, myClaimTxid: finalTxid } as DurableSwapRecord;
+    this.setPhase('completed');
+    this.status('claimWithKnownSecret:completed');
+    await this.persistRecord();
+    return { txid: finalTxid };
+  }
+
   // ── helpers ──────────────────────────────────────────────────────────────────────────────────────────────
 
-  /** leg X amount in sats (offer.sendAmount is base-unit sats < 2^53 for a UTXO leg). Fail closed on garbage. */
+  /** leg X amount in sats (offer.sendAmount = the initiator's locked amount, base-unit sats < 2^53). Fail closed. */
   private legXAmountSats(): number {
-    const raw = this.record.offer.sendAmount;
+    return this.amountSats(this.record.offer.sendAmount, 'fundLegX', 'leg X');
+  }
+
+  /** leg Y amount in sats (offer.receiveAmount = the RESPONDER's locked amount on receiveChain). Fail closed. */
+  private legYAmountSats(): number {
+    return this.amountSats(this.record.offer.receiveAmount, 'fundLegY', 'leg Y');
+  }
+
+  private amountSats(raw: string | number, label: string, leg: string): number {
     const n = typeof raw === 'number' ? raw : Number(raw);
     if (!Number.isInteger(n) || !Number.isFinite(n) || n <= 0) {
-      throw new Error(`fundLegX: invalid leg X amount '${String(raw)}' — refusing to build the funding tx`);
+      throw new Error(`${label}: invalid ${leg} amount '${String(raw)}' — refusing to build the funding tx`);
     }
     return n;
   }
 
-  /** A minimal SwapState for createInitiatorHTLC (it reads only offer.sendChain + secretHash). */
-  private buildSwapState(): SwapState {
+  /** A minimal SwapState for createInitiatorHTLC/createResponderHTLC (they read only offer.{send,receive}Chain +
+   *  secretHash). `role` selects which leg-chain the builder reads; the address fields are UI-only here. */
+  private buildSwapState(role: 'initiator' | 'responder' = 'initiator'): SwapState {
     const secretHashHex = (this.record.offer.secretHash ?? '').toLowerCase().replace(/^0x/, '');
     return {
       offer: this.record.offer,
-      role: 'initiator',
+      role,
       secretHash: hexToBytes(secretHashHex),
       claimAddress: this.record.offer.initiatorReceiveAddress ?? '',
       refundAddress: this.record.offer.initiatorSendAddress ?? '',
     };
+  }
+
+  /** True iff `o` is a structurally-valid funding outpoint {tx_hash:64-hex, tx_pos:non-negative int}. */
+  private isOutpoint(o: Outpoint | undefined | null): o is Outpoint {
+    return !!o && typeof o.tx_hash === 'string' && HEX64.test(o.tx_hash.toLowerCase())
+      && Number.isInteger(o.tx_pos) && o.tx_pos >= 0;
+  }
+
+  /**
+   * Resolve the counterparty HTLC (redeemScript + locktime) and its recorded funding outpoint — the leg the
+   * fund/reveal gates re-verify + the claim spends. Fail closed if the host has not recorded a valid HTLC/outpoint.
+   */
+  private counterpartyLeg(label: string): { redeemScript: Uint8Array; locktime: number; outpoint: Outpoint } {
+    const c = this.record.counterpartyHTLC;
+    if (!c || typeof c.redeemScript !== 'string' || !/^[0-9a-f]+$/i.test(c.redeemScript) || !Number.isInteger(c.locktime)) {
+      throw new Error(`${label}: no valid counterparty HTLC recorded — cannot verify / claim the counterparty leg`);
+    }
+    const outpoint = this.record.counterpartyFundingOutpoint;
+    if (!this.isOutpoint(outpoint)) {
+      throw new Error(`${label}: no valid counterparty funding outpoint recorded — cannot bind the gate / claim`);
+    }
+    return { redeemScript: hexToBytes(c.redeemScript.toLowerCase()), locktime: c.locktime, outpoint };
+  }
+
+  /**
+   * Build a signed secret-bearing claim of the counterparty HTLC on `chain`, carrying the exact funding outpoint it
+   * spends (`.spent` — load-bearing for the fix #8 triangulation + the pre-reveal double-spend re-check). Prefers the
+   * `preferOutpoint` (the authorized one) when it is in the fresh UTXO set, else the largest valid output (mirrors
+   * buildClaimTx ~7244/7690). Authenticates the chosen output's VALUE + P2SH scriptPubKey against its self-derived
+   * raw tx before signing (never trusts the proxy listunspent value). Signs with the seed-derived key on `chain`
+   * (whose hash160 is the HTLC recipient pkh) and sweeps to that same pkh. THROWS on no claimable/authenticatable UTXO.
+   */
+  private async buildSecretClaim(
+    chain: Chain,
+    redeemScript: Uint8Array,
+    secret: Uint8Array,
+    preferOutpoint?: Outpoint,
+  ): Promise<{ txid: string; rawTx: string; spent: Outpoint }> {
+    const client = this.deps.chainClientFor(chain);
+    const scripthash = getHTLCScripthash(redeemScript);
+    const scriptHex = 'a914' + bytesToHex(hash160(redeemScript)) + '87';
+    const raw = (await client.getUTXOs(scripthash, scriptHex)) as GateUtxo[];
+    const valid = raw.filter((u) => u && typeof u.tx_hash === 'string' && Number.isInteger(u.tx_pos) && Number.isFinite(u.value) && u.value > 0);
+    if (valid.length === 0) {
+      throw new Error('buildSecretClaim: counterparty HTLC has no claimable UTXO (spent / not yet visible) — cannot build the claim');
+    }
+    // Prefer the exact authorized outpoint; else the largest valid output.
+    let chosen: GateUtxo | undefined = preferOutpoint
+      ? valid.find((u) => u.tx_hash === preferOutpoint.tx_hash && u.tx_pos === preferOutpoint.tx_pos)
+      : undefined;
+    if (!chosen) chosen = [...valid].sort((a, b) => b.value - a.value)[0];
+
+    // PROXY-TRUST-UTXO-VALUE-001: re-derive the value + verify the funded output's P2SH from the self-authenticated
+    // raw tx before signing (never trust the proxy listunspent value/script).
+    const authed = (await verifyAndAuthenticateUtxo(
+      { tx_hash: chosen.tx_hash, tx_pos: chosen.tx_pos, value: chosen.value, height: chosen.height },
+      redeemScript,
+      (txid: string) => client.getTx(txid),
+    )) as Utxo;
+    if (!(authed.value > 0)) {
+      throw new Error('buildSecretClaim: counterparty HTLC funding output failed re-authentication — not signing the claim');
+    }
+
+    const sk = await this.deps.seedVault.signingKey(chain);
+    const destPkh = hash160(sk.publicKey); // sweep to the recipient pkh committed in the HTLC (our own claim key)
+    const tx = await claimHTLC(authed, redeemScript, secret, sk.privateKey, sk.publicKey, destPkh, chain);
+    return { txid: tx.txid, rawTx: tx.rawTx, spent: { tx_hash: chosen.tx_hash, tx_pos: chosen.tx_pos } };
   }
 
   /**
