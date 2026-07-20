@@ -1,8 +1,8 @@
 # BCH2 Atomic Swap — Protocol Specification
 
 > Status: **DRAFT / normative-intent.** This is the canonical description of the safe cross-chain
-> atomic-swap protocol implemented by the bch2-swap frontend and encapsulated (in progress) by
-> `@bch2/swap-core`. Any client — wallet, market-maker bot, or pool server — that posts, takes, funds,
+> atomic-swap protocol implemented by the bch2-swap frontend and encapsulated by the `@bch2/swap-core`
+> `SwapController`. Any client — wallet, market-maker bot, or pool server — that posts, takes, funds,
 > claims, or refunds a swap **MUST** satisfy every invariant in [§9](#9-fund-safety-invariants-must-not-violate).
 > Violating one is a **fund-loss** bug, not a style issue.
 
@@ -195,8 +195,11 @@ A conforming client — **including any bot, wallet, or pool integration** — M
 
 ## 10. Reference
 
-Canonical implementation: `bch2-swap/src/components/SwapExecute.tsx` (orchestration),
-`src/core/{htlc-builder,swap-engine,timelock-gates,fee-rate,seed-secret}.ts`,
-`src/core/evm-client.ts`, and the SPV verifier. The `@bch2/swap-core` SDK is being refactored so this
-proven path is the *only* path — see the production-readiness plan. Until then, integrating against the
-SDK's older `swap-engine` is **not** safe; integrate against this spec + the proven modules.
+The `@bch2/swap-core` `SwapController` (`src/swap-controller.ts`) is the SDK's encapsulation of this
+protocol: it sequences the irreversible-action gates (`src/gates.ts` + the SPV verifier) so that the
+safe path is the only path — the branded `FundProof` / `RevealAuthorization` cannot be produced except
+by a verified-depth check. It is extracted from the DEX frontend's proven orchestration
+(`bch2-swap/src/components/SwapExecute.tsx`) and its supporting modules — `swap-flow`, `timelock-gates`,
+`fee-rate`, `seed-secret`, `spv-verifier`, and `evm-client`. Integrate against this spec via the
+`SwapController`; if you drive the lower-level primitives yourself instead, this spec — especially
+§9 — is the contract you MUST satisfy.

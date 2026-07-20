@@ -1,13 +1,19 @@
 import { S as SwapOffer, C as Chain } from './swap-types-CbNzOsAe.js';
-import { GateChainClient } from './gates.js';
+import { GateChainClient, FundProof, RevealAuthorization } from './gates.js';
 import { DurableStore, SessionStore, Mutex } from './storage.js';
 import { UtxoReservationRegistry } from './utxo-reservation.js';
+import { Provider, Signer } from 'ethers';
 import './chain-client.js';
-import 'ethers';
 
 interface SwapChainClient extends GateChainClient {
     /** Broadcast a signed raw tx; resolves the node's ack txid, THROWS on a node reject (so a fund failure aborts). */
     broadcastTx(rawTx: string): Promise<string>;
+    /** blockchain.scripthash.get_history — the spend/confirm history the responder's secret-watcher scans (leg Y).
+     *  Matches ElectrumProxyClient.getHistory verbatim so the app client + the test mock satisfy it with no adapter. */
+    getHistory(scripthash: string, scriptHex?: string, timeoutMs?: number): Promise<Array<{
+        tx_hash: string;
+        height: number;
+    }>>;
 }
 
 /** The controller's fund-safety phase enum (design §1/§3). */
@@ -49,8 +55,24 @@ interface DurableSwapRecord {
     /** THIS side's funded HTLC (set once fundLegX builds + broadcasts). */
     myHTLC?: DurableHTLC;
     counterpartyHTLC?: DurableHTLC;
+    /** The counterparty's funding OUTPOINT the host recorded when it observed the counterparty HTLC confirm — the
+     *  exact output the fund/reveal gates re-verify + bind their proof to (design §3). UTXO topologies only. */
+    counterpartyFundingOutpoint?: Outpoint;
     counterpartyEvmSwapId?: string;
     counterpartyEvmTimeLock?: number;
+    /** OUR own EVM lock's swapId (bytes32 hex), set by lockEvm; watched by watchForClaimEvm, refunded by refundEvm. */
+    myEvmSwapId?: string;
+    /** OUR EVM address — the recipient when WE claim the counterparty EVM leg (revealAndClaimEvm), and the initiator of
+     *  our own lock (the address refundSwap authenticates against). */
+    myEvmAddress?: string;
+    /** The counterparty's EVM address — the recipient of the lock WE create (lockEvm), i.e. who may claim our EVM leg. */
+    counterpartyEvmAddress?: string;
+    /** The token WE lock on our EVM leg (native => NATIVE_ETH_ADDRESS). Defaults to offer.evmInfo.tokenAddress. */
+    myEvmToken?: string;
+    /** The token the COUNTERPARTY locked on their EVM leg (the gate binds it). Defaults to offer.evmInfo.tokenAddress. */
+    counterpartyEvmToken?: string;
+    /** The block our own EVM lock mined at — a lower bound for the getLogs Claimed-event scan (watch / refund-race). */
+    evmLockBlock?: number;
     myFundingTxid?: string;
     fundLocktime?: number;
     respLocktime?: number;
@@ -59,6 +81,7 @@ interface DurableSwapRecord {
         rawTx: string;
         spent?: Outpoint;
     };
+    myClaimTxid?: string;
     refundTx?: {
         txid: string;
         rawTx: string;
@@ -113,8 +136,8 @@ interface SwapControllerDeps {
     /** Liveness/UX only — anti-theft margins anchor to CHAIN time, never this clock (fix #9). */
     clock: () => number;
     scheduler?: Scheduler;
-    evmProviderFor?: (chain: Chain) => unknown;
-    evmSignerFor?: (chain: Chain) => unknown;
+    evmProviderFor?: (chain: Chain) => Provider;
+    evmSignerFor?: (chain: Chain) => Signer;
 }
 type SwapControllerEvent = {
     type: 'phase';
@@ -138,6 +161,12 @@ interface SwapSnapshot {
     fundLocktime?: number;
     myHTLC?: DurableHTLC;
     disposed: boolean;
+    /** True iff an in-memory re-derivable 32-byte secret is currently loaded. */
+    hasSecret: boolean;
+    /** Set by resume(): the myHTLC on-chain authentication disposition (fix #10 — only 'ok' authorizes irreversibility). */
+    resumeAuth?: 'ok' | 'mismatch' | 'indeterminate' | 'skip';
+    /** Set by resume(): which gate the swap re-entered, computed from CHAIN truth (isResumableSwapState), not status. */
+    resumeGate?: string;
 }
 declare class SwapController {
     private record;
@@ -150,6 +179,14 @@ declare class SwapController {
     /** In-memory only. The re-derivable HTLC preimage — NEVER written durably in plaintext (design §3, fix #5). */
     private secret;
     private disposed;
+    /** FIX #10 (resume): set true when resume()'s myHTLC on-chain authentication was NOT a DEFINITIVE 'ok' (a
+     *  DEFINITIVE 'mismatch' or a network-blip 'indeterminate'). While set, refund()/revealAndClaim()/
+     *  claimWithKnownSecret() refuse any NEW irreversible broadcast — an idempotent ADOPT of an already-broadcast tx is
+     *  still allowed (it reveals nothing new). Cleared only by a DEFINITIVE re-authentication to 'ok'. */
+    private irreversibleBlocked;
+    /** resume() diagnostics (snapshot-exposed): the myHTLC auth disposition + the gate re-entered from CHAIN truth. */
+    private resumeAuthValue?;
+    private resumeGateValue?;
     constructor(record: DurableSwapRecord, deps: SwapControllerDeps);
     /** Subscribe to a structured event. Returns an unsubscribe fn. */
     on(type: SwapEventType, cb: (e: SwapControllerEvent) => void): () => void;
@@ -169,6 +206,12 @@ declare class SwapController {
      * secret a crash would strand. Also refuses a suspended pair. Transitions `taken -> prepared`.
      */
     prepare(): Promise<void>;
+    /**
+     * The INITIATOR's re-derivable secret for the reveal path (mirrors buildClaimTx's `state.secret ?? recoverSecret()`
+     * ~7204-7207): return the in-memory S if present, else RE-DERIVE it (hmac-v1 from K_ss+nonce, or a durable S) and
+     * RE-AUTHENTICATE sha256(S) === offer.secretHash before caching it. Returns null (fail closed) on any miss/mismatch.
+     */
+    private loadInitiatorSecret;
     /** Recover the 32-byte preimage: hmac-v1 -> derive from K_ss + nonce; else -> decode a durable S. Returns null on miss. */
     private recoverSecret;
     /**
@@ -189,10 +232,219 @@ declare class SwapController {
     fundLegX(): Promise<{
         txid: string;
     }>;
-    /** leg X amount in sats (offer.sendAmount is base-unit sats < 2^53 for a UTXO leg). Fail closed on garbage. */
+    /**
+     * Fund the RESPONDER's own UTXO leg Y (receiveChain), reusing fundLegX's proven select/reserve/build/
+     * durable-commit/broadcast machinery but with the RESPONDER HTLC (createResponderHTLC — LOCKTIME_BLOCKS.responder,
+     * ~12h, well under the initiator's ~36h) and the leg-Y amount (offer.receiveAmount). It STRUCTURALLY requires a
+     * `FundProof` (compile-time) — the only minter is verifyCounterpartyLegForFunding — so a bot cannot fund leg Y
+     * without first proving leg X is buried + the timelock margin is safe.
+     *
+     * FIX #2 (zero proof-reuse window, R175): the passed `proof`'s captured values are NEVER trusted to authorize the
+     * broadcast. Inside the fund mutex, at the broadcast choke point, we RE-MINT from a FRESH read of the counterparty
+     * (initiator) leg X (verifyCounterpartyLegForFunding -> assertLegBuriedForFunding). A fresh throw ABORTS without
+     * broadcasting — funds never move against a leg X that reorged / double-spent / drifted past the margin since the
+     * proof was minted. Transitions `taken|prepared -> responder_funded`. Grounds in handleCounterpartyFunded + the
+     * responder fund path (~5230-5281).
+     */
+    fundLegY(proof: FundProof): Promise<{
+        txid: string;
+    }>;
+    /**
+     * Shared own-leg funding machinery for fundLegX (initiator) + fundLegY (responder). Faithfully ports the proven
+     * handleBroadcastFunding path — see the fundLegX doc block for the (1)-(5) sequence. The only per-role differences
+     * are the HTLC factory, the leg amount, the target phase, and the optional `preBroadcastReverify` (fix #2, leg Y).
+     */
+    private fundOwnLeg;
+    /**
+     * RESPONDER-ONLY. Mint a `FundProof` by SPV-verifying the counterparty (initiator) leg X is buried at the required
+     * depth + the responder timelock margin is safe (gates.assertLegBuriedForFunding over leg X). Returns the branded
+     * proof or THROWS a GateFailure (mints nothing) on any failure/uncertainty — fail closed, no funds move. This is
+     * the only way to obtain the `FundProof` that fundLegY requires (design §4).
+     */
+    verifyCounterpartyLegForFunding(): Promise<FundProof>;
+    /**
+     * INITIATOR-ONLY. Mint a `RevealAuthorization` by SPV-verifying the counterparty (responder) leg Y is buried +
+     * the 4h claim-margin runway on leg Y holds (gates.assertRevealSafe with role:'initiator' over leg Y). Returns the
+     * branded authorization or THROWS a GateFailure (mints nothing) — the secret NEVER leaks on any failure. This is
+     * the only way to obtain the `RevealAuthorization` that revealAndClaim requires (design §4).
+     */
+    verifyCounterpartyLegForReveal(): Promise<RevealAuthorization>;
+    /**
+     * The initiator's ONE irreversible action: reveal S by broadcasting the secret-bearing claim of the counterparty
+     * (responder) leg Y. STRUCTURALLY requires a `RevealAuthorization` (compile-time). Ports handleBroadcastClaim
+     * (~7787-8075). Fund-safety corrections baked in:
+     *   FIX #3: throw unless `auth.role === 'initiator'` — a margin-skipped responder authorization (marginBasis:'none')
+     *     must NEVER drive the initiator's reveal (it deliberately skips the 4h double-dip margin).
+     *   FIX #8 (triangulation): the built claim carries the exact funding outpoint it spends (`.spent`). Require
+     *     `auth.outpoint === claimTx.spent`, and — via the fresh re-mint below — that this same outpoint is STILL
+     *     confirmed at >= reqConf. A cached claim tx LACKING `.spent` fails closed (R-REVEAL-FAILCLOSE ~7980): discard
+     *     it + rebuild rather than broadcast the secret against an unverifiable outpoint.
+     *   FIX #2 (zero reuse window): inside the claim mutex at the broadcast choke point, RE-MINT assertRevealSafe from
+     *     a FRESH read (never the passed auth's captured values). A fresh throw ABORTS — S is never emitted.
+     * The claim tx {txid,rawTx,spent} is committed durably (durable-before-broadcast) BEFORE the broadcast, under a
+     * single-flight mutex ('bch2swap:claim:'+id) with a `claimbroadcast` sentinel so a second call / crash-resume
+     * ADOPTS the prior claim instead of re-revealing. S is NEVER emitted on any throw. Transitions
+     * `responder_funded -> claimed`.
+     */
+    revealAndClaim(auth: RevealAuthorization): Promise<{
+        txid: string;
+    }>;
+    /**
+     * RESPONDER-ONLY. Poll the responder's OWN funded leg (leg Y, myChain) history for the initiator's spend, which
+     * reveals S in its scriptSig. `extractSecret` parses the preimage and we RE-VERIFY `sha256(S) === hashLock` (the
+     * hash COMMITTED in the funded redeemScript — §9.4) before saving; a forged/mismatched preimage is REJECTED.
+     * Ports watchForSecret (~7499-7766) as a single scheduler-driven poll: it NEVER throws on absence (returns
+     * `{secret:null}`) and, on discovery, transitions `responder_funded -> claimed`. Grounds the extract hash in
+     * myHTLC.params.secretHash (R263 on-chain binding).
+     */
+    watchForSecret(): Promise<{
+        secret: Uint8Array | null;
+    }>;
+    /**
+     * RESPONDER-ONLY. Claim the counterparty (initiator) leg X (theirChain) with the now-PUBLIC secret learned via
+     * watchForSecret. The reveal margin gate is DELIBERATELY SKIPPED (the secret is already public — no double-dip
+     * risk, design §1), but single-flight + durable-before-broadcast still apply, and it REFUSES if a refund of the
+     * same HTLC is in flight (a claim + refund must not race the same outpoint). Transitions `claimed -> completed`.
+     */
+    claimWithKnownSecret(): Promise<{
+        txid: string;
+    }>;
+    /**
+     * PURE predicate (no side effects, no network): is OUR funded HTLC refundable at the host-supplied `currentHeight`?
+     * Exposes the ported isHtlcRefundAvailable(myHTLC.locktime, tip) for the host to render an affordance. This is only
+     * an availability HINT — the REAL enforcer is the on-chain CLTV plus the FRESH-tip re-check inside refund() (§9.7).
+     * Returns false when there is no funded own HTLC.
+     */
+    canRefund(currentHeight: number | null): boolean;
+    /**
+     * Recover OUR OWN funded leg after its timelock. Grounds in SwapExecute.tsx handleBroadcastRefund (~8349-8641):
+     *   - §9.7: RE-CHECK isHtlcRefundAvailable against a FRESH tip immediately before build (the on-chain CLTV is the
+     *     real enforcer, but never build/broadcast a premature refund the node will reject).
+     *   - build buildHTLCRefundTx (nSequence 0xfffffffe + nLockTime=locktime are set INSIDE the builder). Carries NO secret.
+     *   - R280-H1 / fix #4 durable-before-broadcast: PERSIST the raw refund tx + a `refundbroadcast` sentinel via
+     *     durable.commit BEFORE the broadcast; a commit throw ABORTS the broadcast.
+     *   - broadcast under a SINGLE-FLIGHT mutex.
+     *   - arm the reorg-safe confirmRefund finalizer.
+     * FIX (deferred from step 5 — R181 claim<->refund cross-guard): take the SAME 'bch2swap:claim:'+id lock the claim
+     * paths use (and refuse if a `claimbroadcast` sentinel is set) so a claim and a refund never race the same outpoint.
+     * FIX #10: refuse if resume left the myHTLC authentication non-definitive (see assertIrreversibleAllowed).
+     * Transitions -> 'refunded' at broadcast; the recovery material is KEPT until confirmRefund reaches reorg-safe depth.
+     */
+    refund(): Promise<{
+        txid: string;
+    }>;
+    /**
+     * CLAIM finalizer (§9.6). Ground: SwapExecute.tsx confirmClaim (~8019-8112). Polls the counterparty leg (theirChain)
+     * for OUR claim txid; ONLY once it is buried at >= requiredConfirmations VERIFIED BY SPV (verifyConfirmations,
+     * provenTxid-bound) does it delete the non-recoverable secret + claim cache + record. On 0-conf / absent / short
+     * depth / inconclusive-or-pruned SPV read it KEEPS everything (fail closed). Single poll — the host re-drives it.
+     */
+    confirmClaim(): Promise<{
+        finalized: boolean;
+    }>;
+    /**
+     * REFUND finalizer (§9.6). Ground: SwapExecute.tsx confirmRefund (~8466-8531). Polls OUR OWN leg (myChain) for OUR
+     * refund txid; ONLY once buried at >= requiredConfirmations VERIFIED BY SPV does it wipe the recovery material. On
+     * 0-conf / dropped / short depth / inconclusive-or-pruned read it KEEPS refundtx/refundbroadcast/state — "give up
+     * POLLING after 4h but KEEP everything" maps to a single non-finalizing poll (SwapExecute.tsx:8468). The secret/state
+     * are wiped ONLY if no claim is in flight (a co-running winning claim needs the shared preimage); the refundtx +
+     * sentinel are always cleared at reorg-safe depth. Fail-closed = keep material.
+     */
+    confirmRefund(): Promise<{
+        finalized: boolean;
+    }>;
+    /**
+     * Pruned-safe SETTLE for a tangled completed swap (§9.6 / SwapExecute.tsx trySettleIfBothLegsSpent ~6809). Only when
+     * the `claimbroadcast` sentinel is set AND BOTH legs are spent on the LIVE UTXO set is the swap terminal (their claim
+     * of our leg used our revealed secret, or both refunded) — nothing left to recover — so wipe + finalize. If OUR leg
+     * is still funded (refundable) it returns false + KEEPS the recovery material (fail closed). Any inconclusive read
+     * returns false. Returns true iff it settled.
+     */
+    trySettleIfBothLegsSpent(): Promise<boolean>;
+    /**
+     * Rehydrate a swap from a durable record: re-derive S, RECONSTRUCT + on-chain-AUTHENTICATE myHTLC, run the
+     * FINALIZERS-FIRST (refund-first short-circuit), rebroadcast a funded-but-missing funding tx idempotently, and
+     * re-enter the correct gate from CHAIN truth (isResumableSwapState), NOT the persisted status. FIX #10 (critical): a
+     * DEFINITIVE myHTLC 'mismatch' fails closed; an INDETERMINATE (network-blip) auth may WAIT / re-poll ONLY — neither
+     * authorizes any irreversible broadcast (refund/claim) until authentication is DEFINITIVE 'ok'. Returns the controller.
+     */
+    static resume(record: DurableSwapRecord, deps: SwapControllerDeps): Promise<SwapController>;
+    private rehydrate;
+    private setResumeGate;
+    /**
+     * Authenticate our recorded myHTLC against the LIVE on-chain funding output (faithful port of SwapExecute.tsx:4699
+     * authenticateMyHtlcAgainstFunding; the React mountedRef guards + Promise.race timeouts are dropped — the SDK client
+     * owns transport timeouts). Returns:
+     *   'ok'            — the funding output[0] byte-matches our HTLC P2SH (unspent set OR self-authenticated raw tx),
+     *   'mismatch'      — a DEFINITIVE tamper (non-bare-hex funding txid, or output[0] present but not our P2SH),
+     *   'indeterminate' — an AMBIGUOUS read (network/cold-proxy getTx failure) BUT the funding txid is in our own HTLC
+     *                     scripthash history (a genuine, possibly-already-spent funding) — caller may WAIT / re-poll,
+     *   'skip'          — no UTXO myHTLC / funding txid to check (an EVM leg, or not funded yet).
+     * FIX #10: only 'ok' authorizes an irreversible action; 'mismatch' fails closed; 'indeterminate' waits.
+     */
+    private authenticateMyHtlcAgainstFunding;
+    /**
+     * RECONSTRUCT myHTLC on resume from the durable side-channels when the states-map copy is gone (R170 fundedhtlc, then
+     * R277 fundlocktime + funding-txid rebuild). The single trust anchor is the on-chain P2SH byte-match
+     * (verifyAndAuthenticateUtxo): a lying/tampered source can only DENY a rebuild (fail-closed skip), never install a
+     * bad refund/watch target. No-op if myHTLC already present, or on an EVM leg.
+     */
+    private reconstructMyHtlc;
+    /**
+     * If the durable 'funded' sentinel/txid is set but the funding tx is NOT on-chain, rebroadcast the EXACT durable raw
+     * funding tx (bch2swap:fundedtx, step 4) IDEMPOTENTLY (same txid — the node dedups) rather than re-selecting inputs
+     * (which would pick different inputs -> a divergent txid than the durable sentinel). Fail-closed: if we cannot tell
+     * whether the funding is on-chain (read error), we do NOT rebroadcast blindly.
+     */
+    private rebroadcastFundingIfMissing;
+    /**
+     * §9.7 refund-reachability is not one-shot: if a refund was broadcast (durable refundtx + refundbroadcast sentinel)
+     * but its txid is NOT in the HTLC history AND the funding output is STILL unspent, the refund DROPPED — resubmit the
+     * EXACT durable refund tx (idempotent, same txid). Resume-driven (NOT the immediate post-broadcast poll, where a
+     * 0-conf refund is indistinguishable from a dropped one). Fail-closed: a read error / an already-spent funding output
+     * does NOT rebroadcast, and this NEVER wipes.
+     */
+    private rebroadcastRefundIfDropped;
+    /** Step-5 deferred idempotent-adopt source: the PRIOR winning claim txid iff the `claimbroadcast` sentinel is set and
+     *  a durable claim tx (or record.myClaimTxid) supplies a bare-hex txid; else null. */
+    private priorClaimTxid;
+    /** Read + validate the durable refund tx cache (R280-H1). */
+    private readDurableRefundTx;
+    /**
+     * §9.6 reorg-safe depth check for a terminal tx (claim/refund) at `height` on `chain`. Requires BOTH a proxy depth
+     * >= reqConf AND — on spvSupported mainnets — verifyConfirmations (SPV, provenTxid-bound) >= reqConf. FAIL CLOSED:
+     * any unknown tip, SPV throw (pruned/short/tampered header/Merkle proof), or below-required depth returns false
+     * (the caller KEEPS all recovery material). Regtest / non-SPV chains fall back to the proxy depth (test-only).
+     */
+    private spvReorgSafe;
+    /** Fail-closed = keep material: refuse a NEW irreversible broadcast while a resume's myHTLC auth is not definitive (fix #10). */
+    private assertIrreversibleAllowed;
+    /** Best-effort delete of a set of durable keys (§9.6 wipe — reached only at reorg-safe depth). */
+    private wipeDurable;
+    /** leg X amount in sats (offer.sendAmount = the initiator's locked amount, base-unit sats < 2^53). Fail closed. */
     private legXAmountSats;
-    /** A minimal SwapState for createInitiatorHTLC (it reads only offer.sendChain + secretHash). */
+    /** leg Y amount in sats (offer.receiveAmount = the RESPONDER's locked amount on receiveChain). Fail closed. */
+    private legYAmountSats;
+    private amountSats;
+    /** A minimal SwapState for createInitiatorHTLC/createResponderHTLC (they read only offer.{send,receive}Chain +
+     *  secretHash). `role` selects which leg-chain the builder reads; the address fields are UI-only here. */
     private buildSwapState;
+    /** True iff `o` is a structurally-valid funding outpoint {tx_hash:64-hex, tx_pos:non-negative int}. */
+    private isOutpoint;
+    /**
+     * Resolve the counterparty HTLC (redeemScript + locktime) and its recorded funding outpoint — the leg the
+     * fund/reveal gates re-verify + the claim spends. Fail closed if the host has not recorded a valid HTLC/outpoint.
+     */
+    private counterpartyLeg;
+    /**
+     * Build a signed secret-bearing claim of the counterparty HTLC on `chain`, carrying the exact funding outpoint it
+     * spends (`.spent` — load-bearing for the fix #8 triangulation + the pre-reveal double-spend re-check). Prefers the
+     * `preferOutpoint` (the authorized one) when it is in the fresh UTXO set, else the largest valid output (mirrors
+     * buildClaimTx ~7244/7690). Authenticates the chosen output's VALUE + P2SH scriptPubKey against its self-derived
+     * raw tx before signing (never trusts the proxy listunspent value). Signs with the seed-derived key on `chain`
+     * (whose hash160 is the HTLC recipient pkh) and sweeps to that same pkh. THROWS on no claimable/authenticatable UTXO.
+     */
+    private buildSecretClaim;
     /**
      * Greedy FIFO UTXO selection — ported from prepareFundingTx (~5431-5457): oldest-confirmed-first (immature
      * coinbase is newest, so it is spent last), tie-break by value desc, accumulate until amount + estimated fee is
@@ -202,6 +454,139 @@ declare class SwapController {
     private greedySelect;
     /** Read + validate the durable funded-HTLC side-channel (R170) for the adopt path. */
     private readDurableFundedHtlc;
+    /** The injected quorum>=2 EVM read Provider for `chain` (the EVM GATE surface). Fail closed if not injected. */
+    private evmProvider;
+    /** The injected EVM Signer (a Node ethers.Wallet from the seed) for `chain`. Fail closed if not injected. */
+    private evmSigner;
+    /** Resolve `chain` -> its numeric EvmChainId + the canonical EVM config (htlcAddress, requiredConfirmations, lock
+     *  bounds). Fail closed if `chain` is not an EVM chain or has no deployed config. */
+    private evmCfgFor;
+    /** FIX #10 §5(#10): carry EVM amounts as base-unit strings — never `Number()` an 18-dec (wei) value. Accept a
+     *  decimal-integer base-unit string (canonical) or a legacy safe-integer number; throw on anything else. */
+    private evmAmountBaseUnits;
+    /** The offer secretHash as a 0x-prefixed bytes32 (the on-chain hashLock). Fail closed if malformed. */
+    private hashLock0x;
+    /** Resolve the COUNTERPARTY EVM leg (the leg WE verify/claim on theirChain): htlc addr, swapId, requiredConfirmations,
+     *  hashLock, the recipient (= OUR EVM address, who may claim it), minAmount (what we receive), and its token. */
+    private counterpartyEvmLeg;
+    /**
+     * RESPONDER-ONLY. Mint a `FundProof` by proving the counterparty (initiator) EVM leg is locked at a reorg-safe
+     * depth with all invariants bound (gates.assertEvmLegBuriedForFunding over the injected quorum>=2 provider). The
+     * ONLY controller-side minter of an EVM `FundProof`. Grounds in verifyEvmCounterpartyHTLC (SwapExecute.tsx
+     * ~3055-3460): the responder-fund gate re-asserts DEPTH + {hashLock, recipient, minAmount, minTimeLock, token} and
+     * fails closed (quorum>=2) before the responder commits its own leg. Returns the branded proof or THROWS
+     * (mints nothing) — including refusing a single-leaf provider (fix #7/#1, done inside the gate).
+     */
+    verifyEvmCounterpartyLegForFunding(): Promise<FundProof>;
+    /**
+     * INITIATOR-ONLY. Mint a `RevealAuthorization` by proving the counterparty (responder) EVM leg is at a reorg-safe
+     * depth AND keeps >= 4h (EVM_CLAIM_MARGIN_SEC) runway on its FRESH on-chain timeLock (gates.assertEvmRevealSafe,
+     * quorum>=2). The ONLY controller-side minter of an EVM `RevealAuthorization`. Grounds in handleEvmClaim gate #2 +
+     * the R258/R260/R261/R278 margin re-check (SwapExecute.tsx ~2128-2258). Returns the branded auth or THROWS — the
+     * secret NEVER leaks on any failure (this only READS the chain; it does not touch the secret).
+     */
+    verifyEvmCounterpartyLegForReveal(): Promise<RevealAuthorization>;
+    /** FIX #2 re-mint used by lockEvm at the broadcast choke point: re-prove the counterparty leg is buried FRESH. Uses
+     *  the EVM gate when the counterparty leg is EVM, else the UTXO gate — either throws (aborting the lock) on any doubt. */
+    private reverifyCounterpartyLegForFunding;
+    /**
+     * Lock OUR OWN EVM leg (lockETH or lockTokens per isNativeToken) with the injected Node signer. STRUCTURALLY
+     * requires a `FundProof` (compile-time — the two brands are non-interchangeable, fix #1). Grounds in handleEvmFund
+     * (SwapExecute.tsx ~1089-1360).
+     *   FIX #2 (zero proof-reuse window): inside the fund mutex, at the choke point, RE-MINT the counterparty-leg burial
+     *     FRESH (assertEvmLegBuriedForFunding) — never the passed proof's captured values. A fresh throw ABORTS before
+     *     any lock tx is broadcast.
+     *   FIX #4 (durable-before-broadcast): the lockpending + evmlocktx recovery markers are committed durably in the
+     *     lock's onBroadcast callback — the instant the tx is broadcast (before it mines) — because the EVM lock is
+     *     irreversible once mined; the funded=swapId sentinel is committed the moment the lock resolves with its id.
+     *   FIX #10: gated by assertIrreversibleAllowed. Single-flight (fix #3) under mutex.withLock; a prior funded swapId
+     *     is ADOPTED rather than re-locked (a second on-chain lock would strand a fresh per-nonce swapId). Handles the
+     *     onBroadcast-replacement hash (a MetaMask speed-up; a Node signer typically won't) by capturing the final hash.
+     */
+    lockEvm(proof: FundProof): Promise<{
+        swapId: string;
+        txHash: string;
+    }>;
+    /**
+     * The initiator's ONE irreversible EVM action: reveal S by claiming the counterparty (responder) EVM leg with S in
+     * the claim calldata (evmClaimSwap = claimSwap). STRUCTURALLY requires a `RevealAuthorization` (compile-time).
+     * Grounds in handleEvmClaim (SwapExecute.tsx ~2128-2430).
+     *   FIX #3: throw unless `auth.role === 'initiator'` — a margin-skipped responder authorization must NEVER drive the
+     *     initiator's reveal.
+     *   FIX #2: inside the claim mutex at the broadcast choke point, RE-MINT assertEvmRevealSafe FRESH (quorum>=2 depth +
+     *     the 4h margin re-derived from the FRESH on-chain timeLock) — never the passed auth's captured values. A throw
+     *     ABORTS; S is never sent. (claimSwap itself also re-checks sha256(S)===hashLock + expiry + recipient before it
+     *     broadcasts, so S never reaches calldata on a bad claim — defense in depth.)
+     *   FIX #4: a durable `claimbroadcast` sentinel is committed BEFORE the secret-revealing claim; a second call /
+     *     crash-resume ADOPTS instead of re-revealing. FIX #10: gated by assertIrreversibleAllowed. R181 cross-guard:
+     *     refuses to reveal while a refund is in flight. Transitions `responder_funded -> claimed`.
+     */
+    revealAndClaimEvm(auth: RevealAuthorization): Promise<{
+        txHash: string;
+    }>;
+    /**
+     * Refund OUR OWN EVM lock (evmRefundSwap = refundSwap) after its timelock. §9.7: reachable after expiry (suspension
+     * never gates a refund). A durable `refundbroadcast` sentinel is committed BEFORE the send (durable-before-broadcast)
+     * under the shared claim/refund single-flight lock, so a claim and a refund can never race.
+     *
+     * THE REFUND-RACE PIVOT (fund-loss-critical, fix #7): if refundSwap REVERTS because the counterparty ALREADY CLAIMED
+     * our lock (took it with S), we do NOT treat that as a plain error. S is now PUBLIC in the on-chain `Claimed` event,
+     * so we RECOVER it — corroborated across quorum>=2 leaves (never conclude "safe to abandon" while an honest leaf may
+     * still yield S), verify sha256(S)===hashLock (the authenticator), and use S to CLAIM the OTHER (counterparty) leg so
+     * we are made whole. Grounds in the 'already claimed' branch (SwapExecute.tsx:2423) + watchForClaim/watchAndRefund.
+     */
+    refundEvm(): Promise<{
+        txHash: string;
+    }>;
+    /** Best-effort on-chain check used by refundEvm's adopt path (fix #4): is OUR own EVM swap actually REFUNDED? Reads
+     *  getSwap over the given provider and returns `!!swap.refunded`; fail-closed to `false` on any read error / missing
+     *  provider (a not-yet-confirmed / dropped refund must never be finalized as a completed 'refunded'). */
+    private evmSwapIsRefunded;
+    /** Broadcast an EVM claim, clearing the durable claimbroadcast sentinel ONLY on a PRE-broadcast throw (claimSwap tags
+     *  pre-flight failures `preBroadcast:true` — no secret revealed), so a later call re-arms instead of adopting a
+     *  never-broadcast claim (fix #3). A POST-broadcast / ambiguous failure LEAVES the sentinel set (R201 fail-safe). */
+    private claimEvmWithSentinelGuard;
+    /**
+     * THE REFUND-RACE PIVOT body (fix #7). Recover S from OUR OWN EVM lock's on-chain `Claimed` event, corroborated
+     * across quorum>=2 leaves, verify sha256(S)===hashLock, then claim the OTHER (counterparty) leg with the now-public
+     * S so we are made whole. If S is not YET extractable (a lagging/pruned leaf), we KEEP the refund sentinel and throw
+     * a RETRYABLE error — never conclude "safe to abandon" while S may still be extractable from an honest leaf.
+     */
+    private recoverFromRefundRace;
+    /** Claim the COUNTERPARTY EVM leg with the now-PUBLIC secret (the refund-race pivot's EVM<->EVM branch). No reveal
+     *  margin gate (the secret is already public — no double-dip race), but the durable claimbroadcast sentinel + the
+     *  single-flight lock still apply. Uses claimSwap (which re-checks sha256(S)===hashLock + recipient on-chain). */
+    private claimEvmCounterpartyWithPublicSecret;
+    /**
+     * RESPONDER-ONLY. Watch OUR OWN EVM lock (myEvmSwapId) for the initiator's `Claimed` event, EXTRACT + VERIFY S
+     * (sha256(S)===hashLock — the authenticator, so a quorum>=1 hash-verified liveness read is acceptable here per
+     * R-POLYHIST), and SAVE it. Grounds in handleEvmFund's responder watch (watchForClaim, SwapExecute.tsx ~1250-1310).
+     * A single scheduler-driven scan: NEVER throws on absence (returns `{secret:null}`); a forged/mismatched preimage is
+     * REJECTED (the hash check). On discovery, transitions `responder_funded -> claimed`.
+     */
+    watchForClaimEvm(): Promise<{
+        secret: Uint8Array | null;
+    }>;
+    /**
+     * Read + hash-VERIFY the preimage S from a `Claimed` event on the given EVM swapId, corroborated across the
+     * provider's quorum leaves. Returns the FIRST S from ANY leaf whose sha256 equals `hashLockHex` (the authenticator —
+     * so a single honest leaf is sufficient to TRUST the value), else null. The hash check makes a forged/foreign
+     * Claimed log unusable (fund-safe), and reading every leaf means a lagging/pruned leaf never falsely hides an S that
+     * an honest leaf still holds (the fix #7 "never abandon while S may be extractable" property). Never throws on a
+     * per-leaf read error (a leaf that errors just doesn't contribute an S).
+     */
+    private readEvmClaimedSecret;
+    /**
+     * FIX #1 (fund-loss): scan ONE leaf for the hash-verified Claimed preimage with a BOUNDED, WINDOWED getLogs — the
+     * SDK's proven watchForClaim windowing (evm-client.ts ~L1486) ported into a single, non-blocking sweep. The old code
+     * issued one UNBOUNDED `getLogs({fromBlock: evmLockBlock, toBlock:'latest'})`; a real public RPC rejects a wide range
+     * ('range too large'), so S was never recovered and the refund-race loser could not be made whole. Here each query is
+     * capped to CLAIMED_LOG_WINDOW blocks, fromBlock slides forward window-by-window, and a range-too-large / transient
+     * rejection SHRINK-and-retries the SAME window (halving to a floor) before the leaf is abandoned. Returns the FIRST S
+     * whose sha256 equals `hashLockHex` (the authenticator — a single honest leaf suffices to TRUST it), else null.
+     */
+    private static readonly CLAIMED_LOG_WINDOW;
+    private scanLeafForClaimedSecret;
     /** Best-effort persist of the full record (rehydration source for resume in step 6). Not fund-critical — the
      *  fund-critical write-set is committed atomically inside fundLegX BEFORE the broadcast. */
     private persistRecord;

@@ -1,5 +1,5 @@
 /**
- * swap-engine.ts — Local swap engine helpers.
+ * swap-flow.ts — swap construction helpers (createHTLC, fund, claim, extract-secret).
  *
  * Provides HTLC construction, funding, claiming, and secret utilities
  * used by SwapCreate and SwapExecute. Delegates to htlc-builder.ts for
@@ -53,7 +53,7 @@ export async function verifyAndAuthenticateUtxo(
   }
   if (Number.isFinite(proxyUtxo.value) && proxyUtxo.value !== value) {
     console.warn(
-      `[swap-engine] proxy listunspent value ${proxyUtxo.value} != authenticated value ${value} ` +
+      `[swap-flow] proxy listunspent value ${proxyUtxo.value} != authenticated value ${value} ` +
       `for ${proxyUtxo.tx_hash}:${proxyUtxo.tx_pos} — using authenticated value`,
     );
   }

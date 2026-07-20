@@ -1,5 +1,3 @@
-import { j as SwapProposal } from '../params-B0_XTQP-.js';
-
 /**
  * OrderBook interface — the swappable seam between client and discovery layer.
  *
@@ -12,19 +10,30 @@ import { j as SwapProposal } from '../params-B0_XTQP-.js';
  * through to the caller. A DecentralizedOrderBook implementing this interface
  * is a drop-in replacement — the client would not change.
  *
- * How matching works with the swap engine:
- *   1. Maker calls engine.prepare() → gets SwapProposal (hashLock + makerPubKey)
- *   2. Maker calls postOrder(proposal, chains) → order ID
- *   3. Taker browses via queryOrders / subscribeToOrders
- *   4. Taker calls takeOrder(id, takerPubKey) → TakeOrderResult
- *   5a. Taker constructs Responder engine from result.proposal + takerPubKey
- *   5b. Maker receives takerPubKey (via subscribeToOrders polling), calls
- *       engine.setCounterPubKey(takerPubKey) on their existing engine
- *   6. Both parties proceed through the standard verify→fund→claim flow.
- *      The verification gate runs identically — the order book feeds params
- *      into the gate, never around it.
+ * How matching works with the swap:
+ *   1. Maker posts an offer → postOrder(proposal, chains) → order ID.
+ *   2. Taker browses via queryOrders / subscribeToOrders.
+ *   3. Taker calls takeOrder(id, takerPubKey) → TakeOrderResult.
+ *   4. Both parties drive settlement with a `SwapController` (see swap-controller.ts + PROTOCOL.md):
+ *      prepare → fund → verifyCounterpartyLeg → reveal/claim → refund/resume. The order book only
+ *      COORDINATES discovery + params; the fund-safety gates run INSIDE the controller, fed by these
+ *      params, never around them.
  */
-
+/**
+ * A maker's swap proposal — the public parameters an order advertises. Defined here (relocated from the removed
+ * stale swap-engine in v3) so the order-book client owns its own transport contract. The SwapController +
+ * SwapOffer (swap-types) are the swap-EXECUTION model; this is the order-book's discovery/transport shape.
+ */
+interface SwapProposal {
+    swapID: string;
+    hashLock: string;
+    initiatorPubKey: string;
+    initiatorCSV: number;
+    initiatorAmountSat: number;
+    responderAmountSat: number;
+    minConfirmations: number;
+    feeSatoshis: number;
+}
 type Chain = 'BCH2' | 'BCH' | 'BTC' | 'BC2';
 type OrderStatus = 'open' | 'taken' | 'completed' | 'cancelled' | 'expired';
 /**
@@ -163,4 +172,4 @@ declare class CentralizedOrderBook implements OrderBook {
     takeOrder(orderId: string, takerPubKey: string): Promise<TakeOrderResult>;
 }
 
-export { CentralizedOrderBook, type Chain, MockOrderBook, type OrderBook, type OrderFilter, type OrderStatus, type PostOrderRequest, type SwapOrder, type TakeOrderResult };
+export { CentralizedOrderBook, type Chain, MockOrderBook, type OrderBook, type OrderFilter, type OrderStatus, type PostOrderRequest, type SwapOrder, type SwapProposal, type TakeOrderResult };

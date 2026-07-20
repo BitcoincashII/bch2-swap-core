@@ -26,7 +26,7 @@ DRY_RUN=1 node examples/market-maker.mjs     # log only, posts nothing (default)
 
 Shows the maker coordination loop: prepare a proposal, post resting offers, keep them fresh, cancel on exit.
 
-> ⚠️ **Settlement is not automated in this file.** When an offer is taken you must complete the swap (fund your HTLC, watch the counterparty, claim, or refund) with `@bch2/swap-core/swap-engine` + `/htlc-builder` — see [§6 of API.md](../API.md#6-the-full-swap-lifecycle-mapped-to-the-sdk). Running the maker without a settlement loop will strand takers and risk your funds.
+> ⚠️ **Settlement is not automated in this file.** When an offer is taken you must complete the swap safely. The SDK's validated driver for that is the **`SwapController`** (from `@bch2/swap-core`), which gates every irreversible action (fund the second leg, reveal the secret) behind an SPV-verified branded proof. The canonical, runnable end-to-end reference is [`../src/e2e-lifecycle.test.ts`](../src/e2e-lifecycle.test.ts) (two controllers, one shared chain, UTXO↔UTXO + UTXO↔EVM + refund + resume), and the fund-safety contract is [PROTOCOL.md](../PROTOCOL.md) (esp. §9). Running the maker without a `SwapController`-driven settlement loop will strand takers and risk your funds.
 
 ## Safety
 

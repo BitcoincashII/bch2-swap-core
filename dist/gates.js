@@ -752,7 +752,7 @@ async function verifyAndAuthenticateUtxo(proxyUtxo, redeemScript, fetchRawTx) {
   }
   if (Number.isFinite(proxyUtxo.value) && proxyUtxo.value !== value) {
     console.warn(
-      `[swap-engine] proxy listunspent value ${proxyUtxo.value} != authenticated value ${value} for ${proxyUtxo.tx_hash}:${proxyUtxo.tx_pos} \u2014 using authenticated value`
+      `[swap-flow] proxy listunspent value ${proxyUtxo.value} != authenticated value ${value} for ${proxyUtxo.tx_hash}:${proxyUtxo.tx_pos} \u2014 using authenticated value`
     );
   }
   return { ...proxyUtxo, value };

@@ -6,7 +6,6 @@ import { defineConfig } from 'tsup';
 export default defineConfig({
   entry: [
     'src/index.ts',
-    'src/swap-engine/index.ts',
     'src/order-book/index.ts',
     'src/htlc-builder.ts',
     'src/spv.ts',

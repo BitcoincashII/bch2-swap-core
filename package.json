@@ -1,6 +1,6 @@
 {
   "name": "@bch2/swap-core",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Non-custodial BCH2 <-> EVM atomic-swap SDK: HTLC crypto, swap state engine, and order-book client for building bots on the BCH2 Swap DEX.",
   "type": "module",
   "license": "MIT",
@@ -34,10 +34,6 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
-    },
-    "./swap-engine": {
-      "types": "./dist/swap-engine/index.d.ts",
-      "import": "./dist/swap-engine/index.js"
     },
     "./order-book": {
       "types": "./dist/order-book/index.d.ts",

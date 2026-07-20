@@ -43,7 +43,7 @@ List orders. Query params (all optional): `offerChain`, `wantChain`, `status`.
 One order by id. → `data: SwapOrder`.
 
 ### `POST /api/orders`
-Post an offer. Body = `PostOrderRequest` (`{ proposal, offerChain, wantChain, ttlSeconds? }`) — `proposal` comes from `engine.prepare()` (establishes the hashlock + makerPubKey without broadcasting). → `data: string` (the new order id). **SDK:** `book.postOrder(req)`.
+Post an offer. Body = `PostOrderRequest` (`{ proposal, offerChain, wantChain, ttlSeconds? }`) — `proposal` is the maker's `SwapProposal` (hashlock + makerPubKey + terms, established without broadcasting). → `data: string` (the new order id). **SDK:** `book.postOrder(req)`.
 
 ### `POST /api/orders/:id/take`
 Take an open order. Body `{ takerPubKey }` (66 hex chars). Atomically locks the order so exactly one taker wins. → `data: TakeOrderResult` (`{ orderId, proposal, takerPubKey, offerChain, wantChain }`). **SDK:** `book.takeOrder(id, takerPubKey)`. Throws if not open.
@@ -87,26 +87,27 @@ For watching funding/claims and block height in real time, connect to the Electr
 wss://swap.bch2.org/ws?chain=BCH2
 ```
 
-JSON-RPC methods relayed: `blockchain.headers.subscribe` (block height), `blockchain.script.register` (register a script/HTLC to watch by scripthash), `blockchain.scripthash.get_history` / `get_balance`, `blockchain.transaction.broadcast`, `blockchain.transaction.get`. The SDK's swap engine (`@bch2/swap-core/swap-engine`, `electrum-chain`) drives this for you — you supply the WS URL.
+JSON-RPC methods relayed: `blockchain.headers.subscribe` (block height), `blockchain.script.register` (register a script/HTLC to watch by scripthash), `blockchain.scripthash.get_history` / `get_balance`, `blockchain.transaction.broadcast`, `blockchain.transaction.get`. The `SwapController` (`@bch2/swap-core`) drives this for you through the chain client you inject — you supply the WS URL.
 
 ---
 
 ## 6. The full swap lifecycle (mapped to the SDK)
 
-A swap between a UTXO leg and an EVM leg, non-custodially:
+Drive settlement with the **`SwapController`** (`@bch2/swap-core`) — the validated swap driver. It gates
+every irreversible action behind an SPV-verified branded proof, so this REST/WS API is only its transport.
+Each step below maps to a controller call; see the [README quickstart](./README.md) and
+[`src/e2e-lifecycle.test.ts`](./src/e2e-lifecycle.test.ts) for the full two-party flow, and
+[`PROTOCOL.md`](./PROTOCOL.md) §9 for the fund-safety contract.
 
-1. **Prepare (maker).** `engine.prepare()` for the Initiator role → a `SwapProposal` (hashlock + makerPubKey + terms). Nothing is broadcast.
-2. **Post.** `book.postOrder({ proposal, offerChain, wantChain, ttlSeconds })` → order id (+ admin token). It's now a resting offer.
-3. **Discover / take.** A taker finds it (`queryOrders`/`subscribeToOrders`) and calls `book.takeOrder(id, takerPubKey)` → `TakeOrderResult`. The maker reads `takerPubKey` and sets it as their counterparty (`engine.setCounterPubKey`).
-4. **Fund both legs.** Each side locks their asset to the shared hashlock + a timelock:
-   - **UTXO leg:** `buildRedeemScript(...)` → `buildFundingTx(...)`, sign, `POST /api/broadcast/utxo`.
-   - **EVM leg:** call the HTLC contract (`@bch2/swap-core/evm`: address, ABI) via `viem`, `POST /api/broadcast/evm`.
-   - `PATCH /status` after each fund so the other side can follow.
-5. **Watch.** The `Engine` (with an `electrum-chain` bound to the WS URL, and a `SwapStorage` — use `MemorySwapStorage` or your own file-backed impl in Node) advances state as it sees each leg funded.
-6. **Claim.** The initiator claims first, revealing the secret. The responder reads it off-chain (`extractSecretFromScriptSig` for UTXO, or the EVM claim event) and claims their leg (`buildClaimTx` / EVM claim). `PATCH /status` → `completed`.
-7. **Refund (safety).** If a counterparty goes dark and your timelock elapses, reclaim your own funds: `buildRefundTx(...)` (UTXO) or the EVM contract's refund. **Always keep a fee buffer to broadcast a refund.**
+1. **Prepare + post (maker).** Build a `SwapProposal` (hashlock + makerPubKey + terms — the hashlock commits to a seed-derived secret; nothing is broadcast), then `book.postOrder({ proposal, offerChain, wantChain, ttlSeconds })` → order id (+ admin token). Construct an initiator `SwapController` and call `swap.prepare()`.
+2. **Discover / take.** A taker finds the offer (`queryOrders` / `subscribeToOrders`) and calls `book.takeOrder(id, takerPubKey)` → `TakeOrderResult`. Both sides build their `SwapController` from the offer + counterparty params.
+3. **Fund leg X (initiator).** `swap.fundLegX()` (SPV funding-height gate → single-flight build → durable-before-broadcast); the raw tx broadcasts via `POST /api/broadcast/utxo`. `PATCH /status` so the taker can follow.
+4. **Verify X + fund leg Y (responder).** `const proof = await swap.verifyCounterpartyLegForFunding()` (mints a `FundProof` only if leg X is SPV-buried + ordering safe) → `swap.fundLegY(proof)` (UTXO: `POST /api/broadcast/utxo`) or `swap.lockEvm(proof)` (EVM: `POST /api/broadcast/evm`). `PATCH /status`.
+5. **Reveal (initiator).** `const auth = await swap.verifyCounterpartyLegForReveal()` (mints a `RevealAuthorization` only if leg Y is SPV-buried + the margin is safe) → `swap.revealAndClaim(auth)` (or `swap.revealAndClaimEvm(auth)`), which reveals the secret on-chain. `PATCH /status`.
+6. **Claim (responder).** `swap.watchForSecret()` (UTXO) / `swap.watchForClaimEvm()` (EVM) EXTRACTS the secret from the initiator's on-chain claim (verifying `sha256(S) == hashLock`), then `swap.claimWithKnownSecret()` claims leg X. `PATCH /status` → `completed`.
+7. **Refund (safety).** If a counterparty goes dark and your timelock elapses, `swap.canRefund(height)` → `swap.refund()` (UTXO) / `swap.refundEvm()` (EVM) recovers 100% of your principal. **Always keep a fee buffer to broadcast a refund.**
 
-See [`examples/`](./examples/) for runnable code.
+See [`examples/`](./examples/) for runnable code and [`src/e2e-lifecycle.test.ts`](./src/e2e-lifecycle.test.ts) for the canonical end-to-end reference.
 
 ---
 

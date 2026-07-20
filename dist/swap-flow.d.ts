@@ -3,7 +3,7 @@ export { hash160, hexToBytes } from './htlc-builder.js';
 export { sha256 } from '@noble/hashes/sha256';
 
 /**
- * swap-engine.ts — Local swap engine helpers.
+ * swap-flow.ts — swap construction helpers (createHTLC, fund, claim, extract-secret).
  *
  * Provides HTLC construction, funding, claiming, and secret utilities
  * used by SwapCreate and SwapExecute. Delegates to htlc-builder.ts for
