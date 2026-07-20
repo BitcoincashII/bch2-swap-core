@@ -666,3 +666,316 @@ describe('SwapController.watchForSecret() + claimWithKnownSecret() — the respo
     expect(btc.broadcasts.length).toBe(0);
   });
 });
+
+// ============================================================================
+// STEP 6 — refund() + canRefund() + reorg-safe finalizers + resume() (fix #10). UTXO-only.
+//
+// OWN_* = a REAL "own funded HTLC" whose refund branch pubkeyhash is hash160(PUB) (the seed vault's key), so
+// buildHTLCRefundTx signs a genuine refund, and whose funded output OWN_FUND pays its P2SH so the refund UTXO +
+// the resume myHTLC authentication both self-authenticate against a real raw tx. RFX = a single-tx block containing
+// a terminal (refund/claim) tx so the reorg-safe finalizer's SPV verifyConfirmations runs fully offline (verbatim
+// buildFundSynthChain technique). All four finalizer + resume fund-safety invariants below are fail-closed.
+// ============================================================================
+const OWN_LOCKTIME = 100050; // a block-height CLTV
+const OWN_REDEEM = createHTLCRedeemScript({
+  secretHash: sha256(S), recipientPubkeyHash: hexToBytes('aa'.repeat(20)), refundPubkeyHash: hash160(PUB), locktime: OWN_LOCKTIME,
+});
+const OWN_REDEEM_HEX = bytesToHex(OWN_REDEEM);
+const OWN_P2SH_SPK = 'a914' + bytesToHex(hash160(OWN_REDEEM)) + '87';
+const OWN_FUND = buildUtxoRawTx([{ value: 200000, scriptPubKeyHex: OWN_P2SH_SPK }]);
+const OWN_HTLC = {
+  redeemScript: OWN_REDEEM_HEX, p2shAddress: 'p2sh-own', secretHash: SECRET_HASH_HEX,
+  recipientPkh: 'aa'.repeat(20), refundPkh: bytesToHex(hash160(PUB)), locktime: OWN_LOCKTIME,
+};
+// A block whose single tx is the terminal (refund/claim) tx — merkleRoot == its txid so an empty-branch proof verifies.
+const RFX = buildFundSynthChain({ anchorHeight: 300000, count: 4, spacing: 600, bits: 0x20010000, fundSpkHex: OWN_P2SH_SPK });
+
+function refundableRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
+  return {
+    id: over.id ?? 'refund-1',
+    role: 'initiator',
+    offer: makeOffer({ id: over.id ?? 'refund-1', sendChain: 'bch2', receiveChain: 'btc' }),
+    phase: 'initiator_funded',
+    counterpartyClaimPkh: CLAIM_PKH_HEX,
+    myHTLC: OWN_HTLC,
+    myFundingTxid: OWN_FUND.txid,
+    fundLocktime: OWN_LOCKTIME,
+    ...over,
+  };
+}
+
+/** The bch2 own-leg client for refund/resume: the funding UTXO is at the HTLC address + its raw tx self-authenticates. */
+function refundClient(opts?: { height?: number; utxos?: Array<{ tx_hash: string; tx_pos: number; value: number; height: number }>; history?: Array<{ tx_hash: string; height: number }> }): MockElectrumClient {
+  return new MockElectrumClient({
+    height: opts?.height ?? 100100,
+    utxos: opts?.utxos ?? [{ tx_hash: OWN_FUND.txid, tx_pos: 0, value: 200000, height: 100040 }],
+    rawTxByTxid: { [OWN_FUND.txid]: OWN_FUND.rawTxHex },
+    history: opts?.history ?? [],
+    broadcastTxid: '99'.repeat(32),
+  });
+}
+
+// ── canRefund() + refund() ──────────────────────────────────────────────────────────────────────────────────
+describe('SwapController.canRefund() / refund() — recover own leg after the timelock (§9.7 / R280-H1 / fix #4)', () => {
+  it('canRefund() is a pure predicate over isHtlcRefundAvailable(myHTLC.locktime, tip)', () => {
+    const ctrl = new SwapController(refundableRecord(), makeMultiDeps({ bch2: refundClient() }));
+    expect(ctrl.canRefund(OWN_LOCKTIME)).toBe(true);      // tip == locktime
+    expect(ctrl.canRefund(OWN_LOCKTIME - 1)).toBe(false); // tip below locktime
+    expect(ctrl.canRefund(null)).toBe(false);             // unknown tip
+  });
+
+  it('refund BEFORE the timelock throws (not available) + broadcasts nothing', async () => {
+    const bch2 = refundClient({ height: OWN_LOCKTIME - 1 });
+    const ctrl = new SwapController(refundableRecord(), makeMultiDeps({ bch2 }));
+    await expect(ctrl.refund()).rejects.toThrow(/timelock has not passed|premature/i);
+    expect(bch2.broadcasts.length).toBe(0);
+    expect(ctrl.getState().phase).toBe('initiator_funded');
+  });
+
+  it('refund AFTER the timelock persists the refund tx + sentinel BEFORE the broadcast (ordered) -> phase refunded', async () => {
+    const order: string[] = [];
+    class OrderDurable extends InMemoryDurableStore {
+      async commit(entries: Array<[string, string]>): Promise<void> { order.push('commit'); return super.commit(entries); }
+    }
+    class OrderClient extends MockElectrumClient {
+      async broadcastTx(rawTx: string): Promise<string> { order.push('broadcast'); return super.broadcastTx(rawTx); }
+    }
+    const durable = new OrderDurable();
+    const bch2 = new OrderClient({
+      height: 100100, utxos: [{ tx_hash: OWN_FUND.txid, tx_pos: 0, value: 200000, height: 100040 }],
+      rawTxByTxid: { [OWN_FUND.txid]: OWN_FUND.rawTxHex }, history: [], broadcastTxid: '99'.repeat(32),
+    });
+    const ctrl = new SwapController(refundableRecord(), makeMultiDeps({ bch2 }, { durable }));
+    const { txid } = await ctrl.refund();
+    expect(order).toEqual(['commit', 'broadcast']);       // durable-before-broadcast (fix #4 / R280-H1)
+    expect(bch2.broadcasts.length).toBe(1);
+    expect(await durable.get('bch2swap:refundtx:refund-1')).toBeTruthy();
+    expect(await durable.get('bch2swap:refundbroadcast:refund-1')).toBe('1');
+    expect(ctrl.getState().phase).toBe('refunded');
+    expect(txid).toBeTruthy();
+  });
+
+  it('a commit FAILURE aborts the refund broadcast (fix #4) — no refund tx is sent', async () => {
+    class FailCommitDurable extends InMemoryDurableStore {
+      async commit(_e: Array<[string, string]>): Promise<void> { throw new Error('injected atomic-commit failure (QuotaExceeded)'); }
+    }
+    const durable = new FailCommitDurable();
+    const bch2 = refundClient();
+    const ctrl = new SwapController(refundableRecord(), makeMultiDeps({ bch2 }, { durable }));
+    await expect(ctrl.refund()).rejects.toThrow(/commit failure|QuotaExceeded/i);
+    expect(bch2.broadcasts.length).toBe(0);
+    expect(ctrl.getState().phase).toBe('initiator_funded');
+  });
+});
+
+// ── R181 claim <-> refund cross-guard (deferred from step 5) ──────────────────────────────────────────────────
+describe('SwapController claim<->refund cross-guard (R181)', () => {
+  beforeEach(() => { __setSpvConfigForTests('btc', FX.params, FX.checkpoint); __resetSpvCacheForTests(); });
+
+  it('a claim in flight (claimbroadcast sentinel) BLOCKS refund + broadcasts nothing', async () => {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:claimbroadcast:refund-1', '1');
+    const bch2 = refundClient();
+    const ctrl = new SwapController(refundableRecord(), makeMultiDeps({ bch2 }, { durable }));
+    await expect(ctrl.refund()).rejects.toThrow(/R181|claim/i);
+    expect(bch2.broadcasts.length).toBe(0);
+  });
+
+  it('a refund in flight (refundbroadcast sentinel) BLOCKS the initiator revealAndClaim (vice-versa) + no secret reveal', async () => {
+    const btc = fxClient();
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(revealRecord(), makeMultiDeps({ btc }, { durable }));
+    const auth = await ctrl.verifyCounterpartyLegForReveal();
+    await durable.set('bch2swap:refundbroadcast:reveal-1', '1'); // a refund of the shared HTLC is in flight
+    await expect(ctrl.revealAndClaim(auth)).rejects.toThrow(/refund/i);
+    expect(btc.broadcasts.length).toBe(0);
+    expect(ctrl.getState().phase).toBe('responder_funded'); // never revealed
+  });
+});
+
+// ── reorg-safe finalizers — never wipe on doubt; wipe only at reorg-safe SPV depth (§9.6) ─────────────────────
+function finalizeRefundRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
+  return {
+    id: over.id ?? 'fin-refund',
+    role: 'initiator',
+    offer: makeOffer({ id: over.id ?? 'fin-refund', sendChain: 'btc', receiveChain: 'bch2' }),
+    phase: 'refunded',
+    counterpartyClaimPkh: CLAIM_PKH_HEX,
+    myHTLC: OWN_HTLC,
+    myFundingTxid: OWN_FUND.txid,
+    refundTx: { txid: RFX.fundTxid, rawTx: RFX.fundRawHex },
+    ...over,
+  };
+}
+function finalizeClaimRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
+  return {
+    id: over.id ?? 'fin-claim',
+    role: 'initiator',
+    offer: makeOffer({ id: over.id ?? 'fin-claim', sendChain: 'bch2', receiveChain: 'btc' }),
+    phase: 'claimed',
+    counterpartyClaimPkh: CLAIM_PKH_HEX,
+    counterpartyHTLC: { ...CP_HTLC, locktime: RFX.tip + 100 },
+    counterpartyFundingOutpoint: FX_OUTPOINT,
+    myClaimTxid: RFX.fundTxid,
+    claimTx: { txid: RFX.fundTxid, rawTx: RFX.fundRawHex, spent: { tx_hash: 'ee'.repeat(32), tx_pos: 0 } },
+    ...over,
+  };
+}
+/** btc client backed by RFX: a terminal tx in a single-tx block. Knobs to force 0-conf / short-depth / pruned reads. */
+function finClient(opts?: { height?: number; entryHeight?: number; withMerkle?: boolean }): MockElectrumClient {
+  const eh = opts?.entryHeight ?? RFX.fundHeight;
+  const height = opts?.height ?? RFX.tip;
+  return new MockElectrumClient({
+    headersByHeight: RFX.headersByHeight,
+    height,
+    history: [{ tx_hash: RFX.fundTxid, height: eh }],
+    merkleProof: opts?.withMerkle === false ? undefined : { block_height: RFX.fundHeight, merkle: [], pos: 0 },
+    rawTxByTxid: { [RFX.fundTxid]: RFX.fundRawHex },
+    tipHeaderHex: RFX.headersByHeight[height],
+    broadcastTxid: '00'.repeat(31) + 'bb',
+  });
+}
+
+describe('SwapController finalizers — never wipe on doubt, wipe only at reorg-safe SPV depth (§9.6)', () => {
+  beforeEach(() => { __setSpvConfigForTests('btc', RFX.params, RFX.checkpoint); __resetSpvCacheForTests(); });
+
+  async function armedRefund(): Promise<DurableStore> {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:refundtx:fin-refund', JSON.stringify({ txid: RFX.fundTxid, rawTx: RFX.fundRawHex, spent: { tx_hash: OWN_FUND.txid, tx_pos: 0 } }));
+    await durable.set('bch2swap:refundbroadcast:fin-refund', '1');
+    await durable.set('bch2swap:encsecret:fin-refund', bytesToHex(S));
+    await durable.set('bch2swap:record:fin-refund', '{}');
+    return durable;
+  }
+
+  it('confirmRefund KEEPS everything on 0-conf (refund broadcast but not yet mined)', async () => {
+    const durable = await armedRefund();
+    const btc = finClient({ entryHeight: 0 }); // in history at height 0 -> not "mined" -> keep
+    const r = await new SwapController(finalizeRefundRecord(), makeMultiDeps({ btc }, { durable })).confirmRefund();
+    expect(r.finalized).toBe(false);
+    expect(await durable.get('bch2swap:refundtx:fin-refund')).toBeTruthy();
+    expect(await durable.get('bch2swap:refundbroadcast:fin-refund')).toBe('1');
+    expect(await durable.get('bch2swap:encsecret:fin-refund')).toBeTruthy();
+  });
+
+  it('confirmRefund KEEPS everything at a SHORT proxy depth (< reqConf)', async () => {
+    const durable = await armedRefund();
+    const btc = finClient({ height: RFX.fundHeight }); // tip == fundHeight -> depth 1 < btc reqConf 2
+    const r = await new SwapController(finalizeRefundRecord(), makeMultiDeps({ btc }, { durable })).confirmRefund();
+    expect(r.finalized).toBe(false);
+    expect(await durable.get('bch2swap:refundtx:fin-refund')).toBeTruthy();
+    expect(await durable.get('bch2swap:encsecret:fin-refund')).toBeTruthy();
+  });
+
+  it('confirmRefund KEEPS everything on a PRUNED / unprovable SPV read (deep proxy depth, no Merkle proof)', async () => {
+    const durable = await armedRefund();
+    const btc = finClient({ withMerkle: false }); // deep tip, but getMerkleProof throws -> SPV fail-closed
+    const r = await new SwapController(finalizeRefundRecord(), makeMultiDeps({ btc }, { durable })).confirmRefund();
+    expect(r.finalized).toBe(false);
+    expect(await durable.get('bch2swap:refundtx:fin-refund')).toBeTruthy();
+    expect(await durable.get('bch2swap:encsecret:fin-refund')).toBeTruthy();
+  });
+
+  it('confirmRefund WIPES the recovery material ONLY at >= reqConf SPV depth', async () => {
+    const durable = await armedRefund();
+    const btc = finClient(); // deep + Merkle-provable -> verifyConfirmations passes
+    const ctrl = new SwapController(finalizeRefundRecord(), makeMultiDeps({ btc }, { durable }));
+    const r = await ctrl.confirmRefund();
+    expect(r.finalized).toBe(true);
+    expect(await durable.get('bch2swap:refundtx:fin-refund')).toBeNull();
+    expect(await durable.get('bch2swap:refundbroadcast:fin-refund')).toBeNull();
+    expect(await durable.get('bch2swap:encsecret:fin-refund')).toBeNull(); // no claim in flight -> secret/state wiped
+    expect(ctrl.getState().phase).toBe('refunded');
+  });
+
+  it('confirmClaim KEEPS the secret + claim cache at a SHORT depth and WIPES only at reorg-safe SPV depth', async () => {
+    // KEEP (short depth)
+    const durableK = new InMemoryDurableStore();
+    await durableK.set('bch2swap:claimtx:fin-claim', JSON.stringify({ txid: RFX.fundTxid, rawTx: RFX.fundRawHex, spent: { tx_hash: 'ee'.repeat(32), tx_pos: 0 } }));
+    await durableK.set('bch2swap:claimbroadcast:fin-claim', '1');
+    await durableK.set('bch2swap:encsecret:fin-claim', bytesToHex(S));
+    const rk = await new SwapController(finalizeClaimRecord(), makeMultiDeps({ btc: finClient({ height: RFX.fundHeight }) }, { durable: durableK })).confirmClaim();
+    expect(rk.finalized).toBe(false);
+    expect(await durableK.get('bch2swap:claimtx:fin-claim')).toBeTruthy();
+    expect(await durableK.get('bch2swap:encsecret:fin-claim')).toBeTruthy();
+    // WIPE (reorg-safe depth)
+    const durableW = new InMemoryDurableStore();
+    await durableW.set('bch2swap:claimtx:fin-claim', JSON.stringify({ txid: RFX.fundTxid, rawTx: RFX.fundRawHex, spent: { tx_hash: 'ee'.repeat(32), tx_pos: 0 } }));
+    await durableW.set('bch2swap:claimbroadcast:fin-claim', '1');
+    await durableW.set('bch2swap:encsecret:fin-claim', bytesToHex(S));
+    const ctrlW = new SwapController(finalizeClaimRecord(), makeMultiDeps({ btc: finClient() }, { durable: durableW }));
+    const rw = await ctrlW.confirmClaim();
+    expect(rw.finalized).toBe(true);
+    expect(await durableW.get('bch2swap:claimtx:fin-claim')).toBeNull();
+    expect(await durableW.get('bch2swap:encsecret:fin-claim')).toBeNull();
+    expect(ctrlW.getState().phase).toBe('completed');
+  });
+});
+
+// ── resume() — rehydrate a stalled / crashed / new-device swap (fix #10) ──────────────────────────────────────
+describe('SwapController.resume() — fix #10 + funding rebroadcast + S re-derivation + idempotent adopt', () => {
+  beforeEach(() => { __setSpvConfigForTests('btc', FX.params, FX.checkpoint); __resetSpvCacheForTests(); });
+
+  it('resume with an INDETERMINATE myHTLC auth does NOT broadcast (fix #10) and refuses any irreversible action', async () => {
+    // funding NOT in the unspent set, getTx ambiguous, BUT the funding txid IS in our own HTLC scripthash history
+    // -> authenticateMyHtlcAgainstFunding returns 'indeterminate' (WAIT only).
+    const bch2 = new MockElectrumClient({
+      height: 100100, utxos: [], history: [{ tx_hash: OWN_FUND.txid, height: 100040 }], getTxThrows: true,
+    });
+    const ctrl = await SwapController.resume(refundableRecord({ id: 'resume-ind' }), makeMultiDeps({ bch2 }, {}));
+    expect(ctrl.getState().resumeAuth).toBe('indeterminate');
+    expect(bch2.broadcasts.length).toBe(0);                       // fix #10: no irreversible broadcast on doubt
+    await expect(ctrl.refund()).rejects.toThrow(/fix #10|DEFINITIVE|authentic/i); // WAIT only, even past the timelock
+    expect(bch2.broadcasts.length).toBe(0);
+  });
+
+  it("resume with a 'funded' sentinel but no on-chain funding tx rebroadcasts the EXACT durable raw funding tx", async () => {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:funded:resume-rb', OWN_FUND.txid);
+    await durable.set('bch2swap:fundedtx:resume-rb', OWN_FUND.rawTxHex);
+    const bch2 = new MockElectrumClient({
+      height: 100100, utxos: [], rawTxByTxid: { [OWN_FUND.txid]: OWN_FUND.rawTxHex }, history: [],
+    });
+    const ctrl = await SwapController.resume(refundableRecord({ id: 'resume-rb', myFundingTxid: OWN_FUND.txid }), makeMultiDeps({ bch2 }, { durable }));
+    expect(ctrl.getState().resumeAuth).toBe('ok');               // funding self-authenticated via getTx
+    expect(bch2.broadcasts.length).toBe(1);
+    expect(bch2.broadcasts[0]).toBe(OWN_FUND.rawTxHex);          // idempotent rebroadcast of the durable raw funding tx
+  });
+
+  it('resume re-derives S (hmac-v1) and re-enters the correct gate from chain truth', async () => {
+    const bch2 = bch2FundClient();
+    const ctrl = await SwapController.resume(makeRecord({ id: 'resume-s', phase: 'taken' }), makeMultiDeps({ bch2 }, {}));
+    expect(ctrl.getState().hasSecret).toBe(true);                // S re-derived from the seed (hmac-v1)
+    expect(ctrl.getState().resumeAuth).toBe('skip');            // no myHTLC yet -> nothing to authenticate
+    expect(ctrl.getState().resumeGate).toBe('pre-funding');    // not resumable -> route to the funding gate
+    expect(ctrl.getState().phase).toBe('taken');
+  });
+
+  it('a post-confirm revealAndClaim re-call returns the prior txid (idempotent adopt) — no second reveal', async () => {
+    const btc = fxClient();
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(revealRecord(), makeMultiDeps({ btc }, { durable }));
+    const auth = await ctrl.verifyCounterpartyLegForReveal();
+    const first = await ctrl.revealAndClaim(auth);
+    expect(btc.broadcasts.length).toBe(1);
+    btc.setUtxos([]); // the counterparty leg-Y UTXO is now spent -> a rebuild would throw
+    const again = await ctrl.revealAndClaim(auth);
+    expect(again.txid).toBe(first.txid);                        // ADOPT the prior txid
+    expect(btc.broadcasts.length).toBe(1);                      // no second secret-bearing broadcast
+  });
+
+  it('a post-confirm claimWithKnownSecret re-call returns the prior txid (idempotent adopt)', async () => {
+    const spend = await makeLegYClaimSpend(S);
+    const bch2 = new MockElectrumClient({ history: [{ tx_hash: spend.txid, height: 12 }], rawTxByTxid: { [spend.txid]: spend.rawTx } });
+    const btc = fxClient();
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(watchRecord(), makeMultiDeps({ bch2, btc }, { durable }));
+    await ctrl.watchForSecret();
+    const first = await ctrl.claimWithKnownSecret();
+    expect(btc.broadcasts.length).toBe(1);
+    btc.setUtxos([]); // leg X now spent
+    const again = await ctrl.claimWithKnownSecret();
+    expect(again.txid).toBe(first.txid);
+    expect(btc.broadcasts.length).toBe(1);
+  });
+});

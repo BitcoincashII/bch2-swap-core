@@ -42,12 +42,12 @@ import {
   createInitiatorHTLC, createResponderHTLC, fundHTLC, claimHTLC, extractSecret,
   verifyAndAuthenticateP2pkhInput, verifyAndAuthenticateUtxo, getHTLCScripthash,
 } from './swap-flow';
-import { hexToBytes, bytesToHex, hash160, sha256, maxPlausibleBlockHeight } from './htlc-builder';
+import { hexToBytes, bytesToHex, hash160, sha256, maxPlausibleBlockHeight, buildHTLCRefundTx, createHTLC } from './htlc-builder';
 import { p2pkhScripthash } from './address-codec';
 import { chainConfigs, isSwapPairSuspended } from './chain-config';
-import { spvSupported, verifyFundingHeight } from './spv-verifier';
+import { spvSupported, verifyFundingHeight, verifyConfirmations } from './spv-verifier';
 import { assertLegBuriedForFunding, assertRevealSafe, type FundProof, type RevealAuthorization } from './gates';
-import type { HTLCDetails, Utxo } from './swap-types';
+import type { HTLCDetails, HTLCParams, Utxo } from './swap-types';
 
 // ============================================================================
 // Phase enum + durable record (design §3)
@@ -228,6 +228,12 @@ export interface SwapSnapshot {
   fundLocktime?: number;
   myHTLC?: DurableHTLC;
   disposed: boolean;
+  /** True iff an in-memory re-derivable 32-byte secret is currently loaded. */
+  hasSecret: boolean;
+  /** Set by resume(): the myHTLC on-chain authentication disposition (fix #10 — only 'ok' authorizes irreversibility). */
+  resumeAuth?: 'ok' | 'mismatch' | 'indeterminate' | 'skip';
+  /** Set by resume(): which gate the swap re-entered, computed from CHAIN truth (isResumableSwapState), not status. */
+  resumeGate?: string;
 }
 
 // ============================================================================
@@ -255,6 +261,10 @@ const claimBroadcastKey = (id: string): string => `bch2swap:claimbroadcast:${id}
 /** A refund of our own HTLC is in flight (set by the step-6 refund path). The responder's public-secret claim
  *  refuses to run while this is set so a claim + refund cannot race the same outpoint. */
 const refundBroadcastKey = (id: string): string => `bch2swap:refundbroadcast:${id}`;
+/** The signed raw refund tx + the funding outpoint it spends (R280-H1 durable-before-broadcast). Committed atomically
+ *  WITH the refundbroadcast sentinel BEFORE the broadcast, so a dropped/reorged refund is rebroadcastable and the
+ *  reorg-safe finalizer keeps it until >= reqConf. A signed refund carries NO secret — it is public material. */
+const refundTxKey = (id: string): string => `bch2swap:refundtx:${id}`;
 
 function durableHtlc(h: HTLCDetails): DurableHTLC {
   return {
@@ -269,6 +279,49 @@ function durableHtlc(h: HTLCDetails): DurableHTLC {
 
 const HEX20 = /^[0-9a-f]{40}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
+
+// ============================================================================
+// Ported pure helpers (step 6) — the availability + resume decision logic, brought into the SDK from the app so the
+// controller and a future host share ONE implementation. Diff-verified byte-identical to their app originals except
+// documented import/type changes (see the report). NONE touch network / storage / state: inputs in, decision out.
+// ============================================================================
+
+// isHtlcRefundAvailable — ported VERBATIM from bch2-swap/src/components/SwapExecute.tsx:355 (byte-identical body).
+// R167: an HTLC is refundable once its locktime is reached. For a block-height locktime (< 500_000_000), compare the
+// chain height; for a TIMESTAMP locktime (the responder's EVM-counterparty UTXO leg, >= 500_000_000), compare
+// wall-clock seconds — the proxy-supplied height is IRRELEVANT to a timestamp CLTV, which the chain enforces via
+// median-time-past. The on-chain CLTV is the real enforcer; this is only the UI/availability hint.
+function isHtlcRefundAvailable(locktime: number, currentHeight: number | null): boolean {
+  if (locktime >= 500_000_000) return Math.floor(Date.now() / 1000) >= locktime; // timestamp CLTV (MTP-enforced)
+  return currentHeight !== null && currentHeight >= locktime; // block-height CLTV
+}
+
+// isResumableSwapState — ported VERBATIM from bch2-swap/src/core/swap-execute-logic.ts:38 (byte-identical body).
+// R276: a swap is "resumable" (route through the funded resume branch) iff it has a funding txid or a built HTLC.
+function isResumableSwapState(s: { myFundingTxid?: unknown; myHTLC?: unknown } | null | undefined): boolean {
+  return !!(s?.myFundingTxid || s?.myHTLC);
+}
+
+// validateReconstructionInputs — ported VERBATIM from bch2-swap/src/core/swap-execute-logic.ts:61 (byte-identical
+// body). R277: the pure fail-closed input gate at the head of the durable-locktime myHTLC reconstruction — the
+// on-chain P2SH authentication downstream is the trust anchor, so this only screens obviously-unusable input.
+function validateReconstructionInputs(args: {
+  myChainIsEvm: boolean;
+  haveMyHtlc: boolean;
+  fundingTxid: string | null | undefined;
+  locktimeStr: string | null | undefined;
+  secretHash: Uint8Array | null | undefined;
+}): { ok: boolean; fundingTxid?: string; locktime?: number } {
+  const { myChainIsEvm, haveMyHtlc, fundingTxid, locktimeStr, secretHash } = args;
+  if (myChainIsEvm) return { ok: false };
+  if (haveMyHtlc) return { ok: false };
+  if (!fundingTxid || typeof fundingTxid !== 'string' || !/^[0-9a-f]{64}$/.test(fundingTxid)) return { ok: false };
+  let lt = NaN;
+  try { lt = parseInt(locktimeStr ?? '', 10); } catch { /* ignore */ }
+  if (!Number.isInteger(lt) || lt <= 0 || lt >= 2_147_483_648) return { ok: false };
+  if (!secretHash || secretHash.length !== 32 || secretHash.every((b) => b === 0)) return { ok: false };
+  return { ok: true, fundingTxid, locktime: lt };
+}
 
 // ============================================================================
 // SwapController
@@ -287,6 +340,15 @@ export class SwapController {
   /** In-memory only. The re-derivable HTLC preimage — NEVER written durably in plaintext (design §3, fix #5). */
   private secret: Uint8Array | null = null;
   private disposed = false;
+
+  /** FIX #10 (resume): set true when resume()'s myHTLC on-chain authentication was NOT a DEFINITIVE 'ok' (a
+   *  DEFINITIVE 'mismatch' or a network-blip 'indeterminate'). While set, refund()/revealAndClaim()/
+   *  claimWithKnownSecret() refuse any NEW irreversible broadcast — an idempotent ADOPT of an already-broadcast tx is
+   *  still allowed (it reveals nothing new). Cleared only by a DEFINITIVE re-authentication to 'ok'. */
+  private irreversibleBlocked = false;
+  /** resume() diagnostics (snapshot-exposed): the myHTLC auth disposition + the gate re-entered from CHAIN truth. */
+  private resumeAuthValue?: 'ok' | 'mismatch' | 'indeterminate' | 'skip';
+  private resumeGateValue?: string;
 
   constructor(record: DurableSwapRecord, deps: SwapControllerDeps) {
     this.record = { ...record };
@@ -342,6 +404,9 @@ export class SwapController {
       fundLocktime: this.record.fundLocktime,
       myHTLC: this.record.myHTLC ? Object.freeze({ ...this.record.myHTLC }) : undefined,
       disposed: this.disposed,
+      hasSecret: !!(this.secret && this.secret.length === 32),
+      resumeAuth: this.resumeAuthValue,
+      resumeGate: this.resumeGateValue,
     });
   }
 
@@ -771,12 +836,23 @@ export class SwapController {
     if (auth.role !== 'initiator' || auth.leg !== 'Y' || auth.for !== 'reveal') {
       throw new Error('revealAndClaim: the supplied authorization is not an initiator leg-Y reveal authorization — refusing to reveal the secret (fix #3)');
     }
+    // Step-5 deferred idempotent-adopt: a post-confirmation / crash-resume re-call returns the PRIOR claim txid rather
+    // than rebuilding (the counterparty leg-Y UTXO is now SPENT, so a rebuild would throw). It reveals nothing new, so
+    // it is allowed even under the fix #10 auth block. This precedes the phase check so a 'claimed'/'completed' re-call
+    // adopts instead of throwing on an unexpected phase.
+    const adopted = await this.priorClaimTxid(rec.id);
+    if (adopted) { this.record = { ...this.record, myClaimTxid: adopted } as DurableSwapRecord; this.status('revealAndClaim:adopted'); return { txid: adopted }; }
+    // FIX #10: a resume whose myHTLC authentication was not DEFINITIVE 'ok' must NOT authorize an irreversible reveal.
+    this.assertIrreversibleAllowed('revealAndClaim');
+    // R181 claim<->refund cross-guard: never reveal the secret while a refund of the shared HTLC is in flight.
+    if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
+      throw new Error('revealAndClaim: a refund is already in flight — refusing to reveal the secret while a refund is active (R181 cross-guard)');
+    }
     if (rec.phase !== 'responder_funded' && rec.phase !== 'claimed') {
       throw new Error(`revealAndClaim: unexpected phase '${rec.phase}' — reveal runs from 'responder_funded'`);
     }
-    if (isSwapPairSuspended(this.myChain, this.theirChain)) {
-      throw new Error(`revealAndClaim: swap pair ${this.myChain}/${this.theirChain} is suspended — refusing to reveal`);
-    }
+    // Suspension gates ONLY new swaps (prepare/fund) — a fully-funded swap MUST always be able to SETTLE. Blocking
+    // the claim of a suspended pair would strand a funded swap (mirrors the app claim path, which has no such gate).
     const cfg = chainConfigs[this.theirChain];
     if (!cfg || (cfg as { isEvm?: boolean }).isEvm) {
       throw new Error('revealAndClaim: leg Y is not a UTXO chain — EVM reveal is step 7');
@@ -832,6 +908,10 @@ export class SwapController {
         }
       }
 
+      // R181 cross-guard re-check INSIDE the lock: a refund could have raced in since the pre-check.
+      if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
+        throw new Error('revealAndClaim: a refund became active — refusing to reveal the secret');
+      }
       // FIX #2: RE-MINT the reveal authorization from a FRESH read at the broadcast choke point, bound to the EXACT
       // outpoint the claim spends (part 2 of the fix #8 triangulation: still-confirmed-at >= reqConf via SPV). The
       // passed `auth`'s captured values are NEVER reused. A throw ABORTS here — S is never broadcast.
@@ -944,6 +1024,12 @@ export class SwapController {
     if (rec.role !== 'responder') {
       throw new Error('claimWithKnownSecret: responder-only (the initiator reveals via revealAndClaim)');
     }
+    // Step-5 deferred idempotent-adopt: a post-confirmation / crash-resume re-call returns the PRIOR claim txid rather
+    // than rebuilding against a now-spent leg-X UTXO. Precedes the phase check so a 'completed' re-call adopts.
+    const adopted = await this.priorClaimTxid(rec.id);
+    if (adopted) { this.record = { ...this.record, myClaimTxid: adopted } as DurableSwapRecord; this.status('claimWithKnownSecret:adopted'); return { txid: adopted }; }
+    // FIX #10: a resume whose myHTLC authentication was not DEFINITIVE 'ok' must NOT authorize an irreversible claim.
+    this.assertIrreversibleAllowed('claimWithKnownSecret');
     if (rec.phase !== 'claimed' && rec.phase !== 'responder_funded') {
       throw new Error(`claimWithKnownSecret: unexpected phase '${rec.phase}' — the responder claim runs after the secret is public`);
     }
@@ -1001,6 +1087,508 @@ export class SwapController {
     this.status('claimWithKnownSecret:completed');
     await this.persistRecord();
     return { txid: finalTxid };
+  }
+
+  // ── canRefund() / refund() — recover OUR OWN funded leg after its timelock (§9.7) ───────────────────────────
+
+  /**
+   * PURE predicate (no side effects, no network): is OUR funded HTLC refundable at the host-supplied `currentHeight`?
+   * Exposes the ported isHtlcRefundAvailable(myHTLC.locktime, tip) for the host to render an affordance. This is only
+   * an availability HINT — the REAL enforcer is the on-chain CLTV plus the FRESH-tip re-check inside refund() (§9.7).
+   * Returns false when there is no funded own HTLC.
+   */
+  canRefund(currentHeight: number | null): boolean {
+    const h = this.record.myHTLC;
+    if (!h || !Number.isInteger(h.locktime)) return false;
+    return isHtlcRefundAvailable(h.locktime, currentHeight);
+  }
+
+  /**
+   * Recover OUR OWN funded leg after its timelock. Grounds in SwapExecute.tsx handleBroadcastRefund (~8349-8641):
+   *   - §9.7: RE-CHECK isHtlcRefundAvailable against a FRESH tip immediately before build (the on-chain CLTV is the
+   *     real enforcer, but never build/broadcast a premature refund the node will reject).
+   *   - build buildHTLCRefundTx (nSequence 0xfffffffe + nLockTime=locktime are set INSIDE the builder). Carries NO secret.
+   *   - R280-H1 / fix #4 durable-before-broadcast: PERSIST the raw refund tx + a `refundbroadcast` sentinel via
+   *     durable.commit BEFORE the broadcast; a commit throw ABORTS the broadcast.
+   *   - broadcast under a SINGLE-FLIGHT mutex.
+   *   - arm the reorg-safe confirmRefund finalizer.
+   * FIX (deferred from step 5 — R181 claim<->refund cross-guard): take the SAME 'bch2swap:claim:'+id lock the claim
+   * paths use (and refuse if a `claimbroadcast` sentinel is set) so a claim and a refund never race the same outpoint.
+   * FIX #10: refuse if resume left the myHTLC authentication non-definitive (see assertIrreversibleAllowed).
+   * Transitions -> 'refunded' at broadcast; the recovery material is KEPT until confirmRefund reaches reorg-safe depth.
+   */
+  async refund(): Promise<{ txid: string }> {
+    this.assertLive();
+    const rec = this.record;
+    // §9.7: refund is ALWAYS reachable after the timelock — suspension MUST NOT gate it, or a leg funded before the
+    // pair was suspended (or a pair suspended mid-swap, e.g. BC2) could never be recovered after its CLTV expires
+    // (fund loss). Suspension gates only prepare()/fundOwnLeg(). The fresh-tip isHtlcRefundAvailable re-check below
+    // is the only precondition.
+    const myHtlc = rec.myHTLC;
+    if (!myHtlc || typeof myHtlc.redeemScript !== 'string' || !/^[0-9a-f]+$/i.test(myHtlc.redeemScript) || !Number.isInteger(myHtlc.locktime)) {
+      throw new Error('refund: no valid funded own HTLC recorded — nothing to refund');
+    }
+    const cfg = chainConfigs[this.myChain];
+    if (!cfg || (cfg as { isEvm?: boolean }).isEvm) {
+      throw new Error('refund: own leg is not a UTXO chain — EVM refund is step 7');
+    }
+    // FIX #10: refuse an irreversible refund broadcast while a resume's myHTLC auth is not DEFINITIVE 'ok'.
+    this.assertIrreversibleAllowed('refund');
+    // R181 cross-guard (pre-check; re-checked inside the shared claim lock): never refund while a claim is in flight.
+    if (await this.deps.durable.get(claimBroadcastKey(rec.id))) {
+      throw new Error('refund: a claim is already in flight — refusing to refund while a claim is active (R181 cross-guard)');
+    }
+
+    const redeemScript = hexToBytes(myHtlc.redeemScript.toLowerCase());
+    const locktime = myHtlc.locktime;
+    const client = this.deps.chainClientFor(this.myChain);
+
+    // §9.7: FRESH-tip refund-availability re-check immediately before building.
+    this.status('refund:checking-timelock');
+    const [freshTip] = await client.getBlockHeight();
+    const tip = (Number.isInteger(freshTip) && freshTip > 0) ? freshTip : null;
+    if (!isHtlcRefundAvailable(locktime, tip)) {
+      throw new Error(`refund: HTLC refund timelock has not passed yet (locktime ${locktime}, tip ${tip ?? 'unknown'}) — not building a premature refund`);
+    }
+
+    const sk = await this.deps.seedVault.signingKey(this.myChain);
+    const myPkh = hash160(sk.publicKey); // refund goes back to our own wallet (the refund pkh committed in the HTLC)
+    const destScriptPubKey = new Uint8Array([0x76, 0xa9, 0x14, ...myPkh, 0x88, 0xac]);
+
+    // Take the SAME 'bch2swap:claim:'+id single-flight lock the claim paths use (R181) so a claim and a refund can
+    // never race the same outpoint; the refund tx + sentinel are committed durably BEFORE the broadcast.
+    const lockName = `bch2swap:claim:${rec.id}`;
+    const finalTxid = await this.deps.mutex.withLock(lockName, async (): Promise<string> => {
+      // Adopt a prior refund (a sibling call / crash-resume already committed+broadcast it) instead of double-broadcasting.
+      if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
+        const prior = await this.readDurableRefundTx(rec.id);
+        if (prior) return prior.txid.toLowerCase();
+      }
+      // Re-check the claim sentinel INSIDE the lock (a claim could have raced in since the pre-check).
+      if (await this.deps.durable.get(claimBroadcastKey(rec.id))) {
+        throw new Error('refund: a claim became active — refusing to refund');
+      }
+      // Select the HTLC UTXO to refund; authenticate its value + P2SH from the self-derived raw tx before signing.
+      this.status('refund:selecting-utxo');
+      const scriptHex = 'a914' + bytesToHex(hash160(redeemScript)) + '87';
+      const utxos = (await client.getUTXOs(getHTLCScripthash(redeemScript), scriptHex)) as GateUtxo[];
+      const valid = utxos.filter((u) => u && typeof u.tx_hash === 'string' && Number.isInteger(u.tx_pos) && Number.isFinite(u.value) && u.value > 0);
+      if (valid.length === 0) throw new Error('refund: no UTXO at the HTLC address — already refunded or never funded');
+      const selected = [...valid].sort((a, b) => b.value - a.value)[0];
+      const authed = (await verifyAndAuthenticateUtxo(
+        { tx_hash: selected.tx_hash, tx_pos: selected.tx_pos, value: selected.value, height: selected.height },
+        redeemScript,
+        (txid: string) => client.getTx(txid),
+      )) as Utxo;
+      if (!(authed.value > 0)) throw new Error('refund: HTLC funding output failed re-authentication — not signing the refund');
+
+      // Build the refund tx (nSequence 0xfffffffe + nLockTime=locktime set inside buildHTLCRefundTx). No secret.
+      this.status('refund:building');
+      const refundTx = await buildHTLCRefundTx(authed, redeemScript, locktime, sk.privateKey, sk.publicKey, destScriptPubKey, this.myChain);
+      const refundRec = { txid: refundTx.txid, rawTx: refundTx.rawTx, spent: { tx_hash: selected.tx_hash, tx_pos: selected.tx_pos } };
+
+      // R280-H1 / fix #4 durable-before-broadcast: persist the raw refund tx + the sentinel ATOMICALLY BEFORE the
+      // broadcast; a commit throw ABORTS here — the recovery material never lags the on-chain refund.
+      this.status('refund:committing');
+      await this.deps.durable.commit([
+        [refundTxKey(rec.id), JSON.stringify(refundRec)],
+        [refundBroadcastKey(rec.id), '1'],
+      ]);
+      this.status('refund:broadcasting');
+      await client.broadcastTx(refundTx.rawTx);
+      return refundTx.txid.toLowerCase();
+    });
+
+    // Rehydrate the durable refund tx (on the adopt path finalTxid is a prior txid) so record.refundTx is consistent.
+    const durableRefund = await this.readDurableRefundTx(rec.id);
+    this.record = {
+      ...this.record,
+      refundTx: durableRefund ? { txid: durableRefund.txid, rawTx: durableRefund.rawTx } : this.record.refundTx,
+    };
+    this.setPhase('refunded');
+    this.status('refund:broadcast');
+    await this.persistRecord();
+    // Arm the reorg-safe finalizer (best-effort single poll; the host/scheduler re-drives it). It is fail-closed —
+    // it KEEPS all recovery material on 0-conf / short depth / any doubt, wiping only at reorg-safe SPV depth.
+    try { await this.confirmRefund(); } catch { /* the finalizer never wipes on doubt; a throw here must not undo the refund */ }
+    return { txid: finalTxid };
+  }
+
+  // ── reorg-safe finalizers (§9.6) — delete non-recoverable material ONLY at reorg-safe SPV depth ─────────────
+
+  /**
+   * CLAIM finalizer (§9.6). Ground: SwapExecute.tsx confirmClaim (~8019-8112). Polls the counterparty leg (theirChain)
+   * for OUR claim txid; ONLY once it is buried at >= requiredConfirmations VERIFIED BY SPV (verifyConfirmations,
+   * provenTxid-bound) does it delete the non-recoverable secret + claim cache + record. On 0-conf / absent / short
+   * depth / inconclusive-or-pruned SPV read it KEEPS everything (fail closed). Single poll — the host re-drives it.
+   */
+  async confirmClaim(): Promise<{ finalized: boolean }> {
+    this.assertLive();
+    const rec = this.record;
+    const claimTxid = (rec.myClaimTxid ?? rec.claimTx?.txid ?? '').toLowerCase();
+    const cp = rec.counterpartyHTLC;
+    if (!HEX64.test(claimTxid) || !cp || typeof cp.redeemScript !== 'string' || !/^[0-9a-f]+$/i.test(cp.redeemScript)) return { finalized: false };
+    const cfg = chainConfigs[this.theirChain];
+    if (!cfg || (cfg as { isEvm?: boolean }).isEvm) return { finalized: false }; // EVM finalize is step 7
+    const redeemScript = hexToBytes(cp.redeemScript.toLowerCase());
+    const client = this.deps.chainClientFor(this.theirChain);
+    const reqConf = Math.max(1, cfg.requiredConfirmations ?? 6);
+    let history: Array<{ tx_hash: string; height: number }>;
+    try { history = await client.getHistory(getHTLCScripthash(redeemScript), 'a914' + bytesToHex(hash160(redeemScript)) + '87'); }
+    catch { return { finalized: false }; } // transient read error — KEEP everything
+    const entry = history.find((h) => typeof h?.tx_hash === 'string' && h.tx_hash.toLowerCase() === claimTxid && Number.isInteger(h.height) && h.height > 0);
+    if (!entry) return { finalized: false }; // 0-conf / absent — KEEP
+    const ok = await this.spvReorgSafe(client, this.theirChain, claimTxid, entry.height, rec.claimTx?.rawTx, reqConf);
+    if (!ok) return { finalized: false }; // short depth / pruned read / stale / unknown tip — KEEP
+    // REORG-SAFE: now it is safe to destroy the non-recoverable secret + the secret-bearing claim cache + the record.
+    if (this.secret) { this.secret.fill(0); this.secret = null; }
+    await this.wipeDurable([claimTxKey(rec.id), claimBroadcastKey(rec.id), durableSecretKey(rec.id), recordKey(rec.id)]);
+    this.setPhase('completed');
+    this.status('confirmClaim:finalized');
+    return { finalized: true };
+  }
+
+  /**
+   * REFUND finalizer (§9.6). Ground: SwapExecute.tsx confirmRefund (~8466-8531). Polls OUR OWN leg (myChain) for OUR
+   * refund txid; ONLY once buried at >= requiredConfirmations VERIFIED BY SPV does it wipe the recovery material. On
+   * 0-conf / dropped / short depth / inconclusive-or-pruned read it KEEPS refundtx/refundbroadcast/state — "give up
+   * POLLING after 4h but KEEP everything" maps to a single non-finalizing poll (SwapExecute.tsx:8468). The secret/state
+   * are wiped ONLY if no claim is in flight (a co-running winning claim needs the shared preimage); the refundtx +
+   * sentinel are always cleared at reorg-safe depth. Fail-closed = keep material.
+   */
+  async confirmRefund(): Promise<{ finalized: boolean }> {
+    this.assertLive();
+    const rec = this.record;
+    const durableRefund = await this.readDurableRefundTx(rec.id);
+    const refund = durableRefund ?? (rec.refundTx ? { txid: rec.refundTx.txid, rawTx: rec.refundTx.rawTx } : null);
+    const myHtlc = rec.myHTLC;
+    if (!refund || !HEX64.test(refund.txid.toLowerCase()) || !myHtlc || typeof myHtlc.redeemScript !== 'string' || !/^[0-9a-f]+$/i.test(myHtlc.redeemScript)) return { finalized: false };
+    const cfg = chainConfigs[this.myChain];
+    if (!cfg || (cfg as { isEvm?: boolean }).isEvm) return { finalized: false };
+    const redeemScript = hexToBytes(myHtlc.redeemScript.toLowerCase());
+    const client = this.deps.chainClientFor(this.myChain);
+    const reqConf = Math.max(1, cfg.requiredConfirmations ?? 6);
+    const refundTxid = refund.txid.toLowerCase();
+    let history: Array<{ tx_hash: string; height: number }>;
+    try { history = await client.getHistory(getHTLCScripthash(redeemScript), 'a914' + bytesToHex(hash160(redeemScript)) + '87'); }
+    catch { return { finalized: false }; } // transient read error — KEEP everything
+    const entry = history.find((h) => typeof h?.tx_hash === 'string' && h.tx_hash.toLowerCase() === refundTxid && Number.isInteger(h.height) && h.height > 0);
+    if (!entry) return { finalized: false }; // 0-conf / dropped — KEEP refundtx/refundbroadcast/state (never wipe on a timeout). A genuinely-dropped refund is resubmitted by resume()'s rebroadcastRefundIfDropped (not here — a 0-conf refund is indistinguishable from a dropped one on the immediate post-broadcast poll).
+    const ok = await this.spvReorgSafe(client, this.myChain, refundTxid, entry.height, refund.rawTx, reqConf);
+    if (!ok) return { finalized: false }; // short depth / pruned read / stale / unknown tip — KEEP
+    // REORG-SAFE. Record the terminal phase; wipe the secret/state ONLY if no claim is in flight; always clear the refund tx.
+    this.setPhase('refunded');
+    const claimSeen = !!(await this.deps.durable.get(claimBroadcastKey(rec.id)));
+    const wipe: string[] = [refundTxKey(rec.id), refundBroadcastKey(rec.id)];
+    if (!claimSeen) {
+      if (this.secret) { this.secret.fill(0); this.secret = null; }
+      wipe.push(durableSecretKey(rec.id), recordKey(rec.id), fundedKey(rec.id), fundLocktimeKey(rec.id), fundRecipientKey(rec.id), fundedHtlcKey(rec.id), fundedTxKey(rec.id));
+    }
+    await this.wipeDurable(wipe);
+    this.status('confirmRefund:finalized');
+    return { finalized: true };
+  }
+
+  /**
+   * Pruned-safe SETTLE for a tangled completed swap (§9.6 / SwapExecute.tsx trySettleIfBothLegsSpent ~6809). Only when
+   * the `claimbroadcast` sentinel is set AND BOTH legs are spent on the LIVE UTXO set is the swap terminal (their claim
+   * of our leg used our revealed secret, or both refunded) — nothing left to recover — so wipe + finalize. If OUR leg
+   * is still funded (refundable) it returns false + KEEPS the recovery material (fail closed). Any inconclusive read
+   * returns false. Returns true iff it settled.
+   */
+  async trySettleIfBothLegsSpent(): Promise<boolean> {
+    this.assertLive();
+    const rec = this.record;
+    if (!(await this.deps.durable.get(claimBroadcastKey(rec.id)))) return false; // no in-flight winning claim
+    const myHtlc = rec.myHTLC; const cpHtlc = rec.counterpartyHTLC;
+    if (!myHtlc || !cpHtlc || typeof myHtlc.redeemScript !== 'string' || typeof cpHtlc.redeemScript !== 'string') return false;
+    if ((chainConfigs[this.myChain] as { isEvm?: boolean } | undefined)?.isEvm || (chainConfigs[this.theirChain] as { isEvm?: boolean } | undefined)?.isEvm) return false;
+    try {
+      const cpRedeem = hexToBytes(cpHtlc.redeemScript.toLowerCase());
+      const cpClient = this.deps.chainClientFor(this.theirChain);
+      const cpUtxos = (await cpClient.getUTXOs(getHTLCScripthash(cpRedeem), 'a914' + bytesToHex(hash160(cpRedeem)) + '87')) as GateUtxo[];
+      if (cpUtxos.some((u) => Number.isFinite(u.value) && u.value > 0)) return false; // their leg still funded -> not settled
+      const myRedeem = hexToBytes(myHtlc.redeemScript.toLowerCase());
+      const myClient = this.deps.chainClientFor(this.myChain);
+      const myUtxos = (await myClient.getUTXOs(getHTLCScripthash(myRedeem), 'a914' + bytesToHex(hash160(myRedeem)) + '87')) as GateUtxo[];
+      if (myUtxos.some((u) => Number.isFinite(u.value) && u.value > 0)) return false; // OUR leg still funded -> refundable -> KEEP
+      // BOTH legs spent -> terminal. Safe to wipe + finalize.
+      if (this.secret) { this.secret.fill(0); this.secret = null; }
+      await this.wipeDurable([claimTxKey(rec.id), claimBroadcastKey(rec.id), durableSecretKey(rec.id), recordKey(rec.id)]);
+      this.setPhase('completed');
+      this.status('trySettle:finalized');
+      return true;
+    } catch { return false; } // inconclusive (e.g. getUTXOs at-capacity throw) -> caller runs the normal resume
+  }
+
+  // ── resume() — rehydrate a stalled / crashed / new-device swap from durable state (fix #10) ──────────────────
+
+  /**
+   * Rehydrate a swap from a durable record: re-derive S, RECONSTRUCT + on-chain-AUTHENTICATE myHTLC, run the
+   * FINALIZERS-FIRST (refund-first short-circuit), rebroadcast a funded-but-missing funding tx idempotently, and
+   * re-enter the correct gate from CHAIN truth (isResumableSwapState), NOT the persisted status. FIX #10 (critical): a
+   * DEFINITIVE myHTLC 'mismatch' fails closed; an INDETERMINATE (network-blip) auth may WAIT / re-poll ONLY — neither
+   * authorizes any irreversible broadcast (refund/claim) until authentication is DEFINITIVE 'ok'. Returns the controller.
+   */
+  static async resume(record: DurableSwapRecord, deps: SwapControllerDeps): Promise<SwapController> {
+    const ctrl = new SwapController(record, deps);
+    await ctrl.rehydrate();
+    return ctrl;
+  }
+
+  private async rehydrate(): Promise<void> {
+    this.assertLive();
+    const rec = this.record;
+
+    // (0) Re-derive S from the seed (hmac-v1) or a durable S — best-effort; the responder learns S on-chain later.
+    try { await this.loadInitiatorSecret(); } catch { /* responder / locked vault: S comes from watchForSecret */ }
+
+    // (1) RECONSTRUCT myHTLC from the durable fundedhtlc / fundlocktime side-channels when the states-map copy is gone.
+    await this.reconstructMyHtlc();
+
+    // (2) Authenticate myHTLC against the LIVE on-chain P2SH (SwapExecute.tsx:4699). FIX #10.
+    const auth = await this.authenticateMyHtlcAgainstFunding();
+    this.resumeAuthValue = auth;
+    this.irreversibleBlocked = (auth === 'mismatch' || auth === 'indeterminate');
+    if (auth === 'mismatch') {
+      this.status('resume:auth-mismatch');
+      this.emit({ type: 'error', error: new Error('resume: myHTLC failed on-chain authentication (DEFINITIVE P2SH mismatch) — failing closed, no irreversible action permitted (fix #10)') });
+    } else if (auth === 'indeterminate') {
+      this.status('resume:auth-indeterminate'); // WAIT only — re-poll; no irreversible broadcast until DEFINITIVE 'ok'
+    } else if (auth === 'ok') {
+      this.status('resume:auth-ok');
+    }
+
+    // (3) FINALIZERS-FIRST + refund-first short-circuit. These only rebroadcast an ALREADY-committed tx / finalize at
+    // reorg-safe depth (reveal nothing new), so they run regardless of the fix #10 auth block.
+    if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
+      const r = await this.confirmRefund();
+      this.setResumeGate(r.finalized ? 'refund-finalized' : 'refund-in-flight');
+      return; // refund-first short-circuit: a refund is in flight — do NOT also route to a claim / fund gate
+    }
+    if (await this.deps.durable.get(claimBroadcastKey(rec.id))) {
+      if (await this.trySettleIfBothLegsSpent()) { this.setResumeGate('settled'); return; }
+      const c = await this.confirmClaim();
+      this.setResumeGate(c.finalized ? 'claim-finalized' : 'claim-in-flight');
+      return;
+    }
+
+    // (4) If the durable 'funded' sentinel/txid is set but the funding tx is NOT on-chain, rebroadcast the durable raw
+    // funding tx (bch2swap:fundedtx) IDEMPOTENTLY (same txid) rather than re-selecting inputs (which would diverge).
+    await this.rebroadcastFundingIfMissing();
+    // (4b) §9.7: if a refund was broadcast but dropped while the funding is still unspent, resubmit it (idempotent).
+    await this.rebroadcastRefundIfDropped();
+
+    // (5) Re-enter the correct gate computed from CHAIN truth (isResumableSwapState), not the persisted status. The
+    // individual methods each re-verify chain truth at their own choke points; this only tells the host what to drive.
+    this.setResumeGate(isResumableSwapState(rec) ? 'post-funding' : 'pre-funding');
+  }
+
+  private setResumeGate(gate: string): void {
+    this.resumeGateValue = gate;
+    this.status(`resume:${gate}`);
+  }
+
+  /**
+   * Authenticate our recorded myHTLC against the LIVE on-chain funding output (faithful port of SwapExecute.tsx:4699
+   * authenticateMyHtlcAgainstFunding; the React mountedRef guards + Promise.race timeouts are dropped — the SDK client
+   * owns transport timeouts). Returns:
+   *   'ok'            — the funding output[0] byte-matches our HTLC P2SH (unspent set OR self-authenticated raw tx),
+   *   'mismatch'      — a DEFINITIVE tamper (non-bare-hex funding txid, or output[0] present but not our P2SH),
+   *   'indeterminate' — an AMBIGUOUS read (network/cold-proxy getTx failure) BUT the funding txid is in our own HTLC
+   *                     scripthash history (a genuine, possibly-already-spent funding) — caller may WAIT / re-poll,
+   *   'skip'          — no UTXO myHTLC / funding txid to check (an EVM leg, or not funded yet).
+   * FIX #10: only 'ok' authorizes an irreversible action; 'mismatch' fails closed; 'indeterminate' waits.
+   */
+  private async authenticateMyHtlcAgainstFunding(): Promise<'ok' | 'mismatch' | 'indeterminate' | 'skip'> {
+    const h = this.record.myHTLC;
+    const ft = this.record.myFundingTxid;
+    const myChainIsEvm = !!(chainConfigs[this.myChain] as { isEvm?: boolean } | undefined)?.isEvm;
+    if (!h || !ft || typeof ft !== 'string' || myChainIsEvm) return 'skip';
+    if (!HEX64.test(ft.toLowerCase())) return 'mismatch'; // a non-bare-hex funding txid is itself a tamper on a UTXO leg (R257)
+    const ftLower = ft.toLowerCase();
+    const redeemScript = hexToBytes((h.redeemScript ?? '').toLowerCase());
+    const client = this.deps.chainClientFor(this.myChain);
+    let inOwnHistory = false; // R257-gate: declared OUTSIDE the try so the ambiguous-getTx catch can read it
+    try {
+      const sh = getHTLCScripthash(redeemScript);
+      const scriptHex = 'a914' + bytesToHex(hash160(redeemScript)) + '87';
+      let ownUnspent = false;
+      try {
+        const own = (await client.getUTXOs(sh, scriptHex)) as GateUtxo[];
+        ownUnspent = Array.isArray(own) && own.some((u) => typeof u?.tx_hash === 'string' && u.tx_hash.toLowerCase() === ftLower && u.tx_pos === 0);
+        const hist = await client.getHistory(sh, scriptHex);
+        inOwnHistory = Array.isArray(hist) && hist.some((x) => typeof x?.tx_hash === 'string' && x.tx_hash.toLowerCase() === ftLower);
+      } catch { /* warm-up / history failed: leave both false -> stricter ambiguous handling below */ }
+      // In the unspent set => the funding output pays our myHTLC P2SH at vout 0 by definition -> authenticated.
+      if (ownUnspent) return 'ok';
+      const auth = await verifyAndAuthenticateUtxo(
+        { tx_hash: ftLower, tx_pos: 0, value: 0, height: 0 },
+        redeemScript,
+        (txid: string) => client.getTx(txid),
+      );
+      return auth.value > 0 ? 'ok' : 'mismatch'; // output[0] present but not our P2SH -> mismatch
+    } catch (e: unknown) {
+      const m = e instanceof Error ? e.message : String(e);
+      if (/does not match the HTLC P2SH|malformed UTXO tx_hash|malformed UTXO tx_pos/i.test(m)) return 'mismatch';
+      // Ambiguous getTx (unreachable / timeout / internal): a GENUINE (possibly already-spent) funding is in our own
+      // scripthash history -> 'indeterminate' (WAIT, arm the watch; do NOT strand a spent cold-proxy recovery); a
+      // fabricated non-existent txid is NOT in our history -> fail CLOSED ('mismatch').
+      return inOwnHistory ? 'indeterminate' : 'mismatch';
+    }
+  }
+
+  /**
+   * RECONSTRUCT myHTLC on resume from the durable side-channels when the states-map copy is gone (R170 fundedhtlc, then
+   * R277 fundlocktime + funding-txid rebuild). The single trust anchor is the on-chain P2SH byte-match
+   * (verifyAndAuthenticateUtxo): a lying/tampered source can only DENY a rebuild (fail-closed skip), never install a
+   * bad refund/watch target. No-op if myHTLC already present, or on an EVM leg.
+   */
+  private async reconstructMyHtlc(): Promise<void> {
+    const rec = this.record;
+    if (rec.myHTLC) return;
+    const myChainIsEvm = !!(chainConfigs[this.myChain] as { isEvm?: boolean } | undefined)?.isEvm;
+    if (myChainIsEvm) return;
+    // (a) durable fundedhtlc side-channel (R170) — already P2SH+params-bound when written.
+    const hydrated = await this.readDurableFundedHtlc(rec.id);
+    if (hydrated) { this.record = { ...rec, myHTLC: hydrated, fundLocktime: rec.fundLocktime ?? hydrated.locktime }; return; }
+    // (b) durable fundlocktime + funding txid + counterparty claim pkh -> rebuild params + AUTHENTICATE on-chain (R277).
+    const fltStr = (await this.deps.durable.get(fundLocktimeKey(rec.id))) ?? (rec.fundLocktime !== undefined ? String(rec.fundLocktime) : null);
+    const secretHashHex = (rec.offer.secretHash ?? '').toLowerCase().replace(/^0x/, '');
+    const secretHash = HEX64.test(secretHashHex) ? hexToBytes(secretHashHex) : null;
+    const gate = validateReconstructionInputs({ myChainIsEvm, haveMyHtlc: false, fundingTxid: rec.myFundingTxid, locktimeStr: fltStr, secretHash });
+    if (!gate.ok || !gate.fundingTxid || gate.locktime === undefined || !secretHash) return;
+    const claimPkhHex = ((rec.counterpartyClaimPkh ?? (await this.deps.durable.get(fundRecipientKey(rec.id))) ?? '')).toLowerCase().replace(/^0x/, '');
+    if (!HEX20.test(claimPkhHex)) return;
+    let refundPkh: Uint8Array;
+    try { const sk = await this.deps.seedVault.signingKey(this.myChain); refundPkh = hash160(sk.publicKey); } catch { return; }
+    const params: HTLCParams = { secretHash, recipientPubkeyHash: hexToBytes(claimPkhHex), refundPubkeyHash: refundPkh, locktime: gate.locktime };
+    let rebuilt: HTLCDetails;
+    try { rebuilt = createHTLC(params, this.myChain); } catch { return; } // degenerate / out-of-range -> fail-closed skip
+    // AUTHENTICATE against the on-chain funding output[0] — the R277 trust anchor (value: NaN feeds only a console hint).
+    const client = this.deps.chainClientFor(this.myChain);
+    try {
+      const authed = await verifyAndAuthenticateUtxo(
+        { tx_hash: gate.fundingTxid, tx_pos: 0, value: NaN as unknown as number, height: 0 },
+        rebuilt.redeemScript,
+        (txid: string) => client.getTx(txid),
+      );
+      if (!(authed.value > 0)) return;
+    } catch { return; } // not authenticatable -> skip (leave myHTLC unset; a later re-poll may heal)
+    this.record = { ...rec, myHTLC: durableHtlc(rebuilt), fundLocktime: gate.locktime };
+  }
+
+  /**
+   * If the durable 'funded' sentinel/txid is set but the funding tx is NOT on-chain, rebroadcast the EXACT durable raw
+   * funding tx (bch2swap:fundedtx, step 4) IDEMPOTENTLY (same txid — the node dedups) rather than re-selecting inputs
+   * (which would pick different inputs -> a divergent txid than the durable sentinel). Fail-closed: if we cannot tell
+   * whether the funding is on-chain (read error), we do NOT rebroadcast blindly.
+   */
+  private async rebroadcastFundingIfMissing(): Promise<void> {
+    const rec = this.record;
+    const fundedSentinel = (await this.deps.durable.get(fundedKey(rec.id)))?.toLowerCase();
+    const fundingTxid = (rec.myFundingTxid ?? fundedSentinel ?? '').toLowerCase();
+    if (!HEX64.test(fundingTxid)) return; // not funded yet — nothing to rebroadcast
+    const rawTx = await this.deps.durable.get(fundedTxKey(rec.id));
+    if (!rawTx) return; // no durable raw funding tx to rebroadcast (nothing safe to do)
+    const myHtlc = rec.myHTLC;
+    if (!myHtlc || typeof myHtlc.redeemScript !== 'string') return;
+    if ((chainConfigs[this.myChain] as { isEvm?: boolean } | undefined)?.isEvm) return;
+    const client = this.deps.chainClientFor(this.myChain);
+    const redeemScript = hexToBytes(myHtlc.redeemScript.toLowerCase());
+    let onChain = false;
+    try {
+      const hist = await client.getHistory(getHTLCScripthash(redeemScript), 'a914' + bytesToHex(hash160(redeemScript)) + '87');
+      onChain = Array.isArray(hist) && hist.some((h) => typeof h?.tx_hash === 'string' && h.tx_hash.toLowerCase() === fundingTxid);
+    } catch { return; } // can't tell -> do NOT rebroadcast blindly (fail-closed; a later resume retries)
+    if (onChain) return;
+    this.status('resume:rebroadcast-funding');
+    try { await client.broadcastTx(rawTx); } catch { /* already-in-mempool / transient -> harmless; the node dedups by txid */ }
+  }
+
+  /**
+   * §9.7 refund-reachability is not one-shot: if a refund was broadcast (durable refundtx + refundbroadcast sentinel)
+   * but its txid is NOT in the HTLC history AND the funding output is STILL unspent, the refund DROPPED — resubmit the
+   * EXACT durable refund tx (idempotent, same txid). Resume-driven (NOT the immediate post-broadcast poll, where a
+   * 0-conf refund is indistinguishable from a dropped one). Fail-closed: a read error / an already-spent funding output
+   * does NOT rebroadcast, and this NEVER wipes.
+   */
+  private async rebroadcastRefundIfDropped(): Promise<void> {
+    const rec = this.record;
+    if (!(await this.deps.durable.get(refundBroadcastKey(rec.id)))) return; // no refund was ever broadcast
+    const refund = await this.readDurableRefundTx(rec.id);
+    if (!refund || !HEX64.test(refund.txid.toLowerCase())) return;
+    const myHtlc = rec.myHTLC;
+    if (!myHtlc || typeof myHtlc.redeemScript !== 'string') return;
+    if ((chainConfigs[this.myChain] as { isEvm?: boolean } | undefined)?.isEvm) return;
+    const client = this.deps.chainClientFor(this.myChain);
+    const redeemScript = hexToBytes(myHtlc.redeemScript.toLowerCase());
+    const scriptHex = 'a914' + bytesToHex(hash160(redeemScript)) + '87';
+    const refundTxid = refund.txid.toLowerCase();
+    try {
+      const hist = await client.getHistory(getHTLCScripthash(redeemScript), scriptHex);
+      if (Array.isArray(hist) && hist.some((h) => typeof h?.tx_hash === 'string' && h.tx_hash.toLowerCase() === refundTxid)) return; // present (mempool/confirmed) — pending, not dropped
+      const utxos = await client.getUTXOs(getHTLCScripthash(redeemScript), scriptHex);
+      if (!Array.isArray(utxos) || utxos.length === 0) return; // funding already spent (refund landed / claimed) — nothing to resubmit
+    } catch { return; } // can't tell -> do NOT rebroadcast blindly
+    this.status('resume:rebroadcast-dropped-refund');
+    try { await client.broadcastTx(refund.rawTx); } catch { /* in-mempool / transient — the node dedups by txid */ }
+  }
+
+  /** Step-5 deferred idempotent-adopt source: the PRIOR winning claim txid iff the `claimbroadcast` sentinel is set and
+   *  a durable claim tx (or record.myClaimTxid) supplies a bare-hex txid; else null. */
+  private async priorClaimTxid(id: string): Promise<string | null> {
+    if (!(await this.deps.durable.get(claimBroadcastKey(id)))) return null;
+    const priorRaw = await this.deps.durable.get(claimTxKey(id));
+    if (priorRaw) {
+      try { const p = JSON.parse(priorRaw) as { txid?: string }; if (p?.txid && HEX64.test(p.txid.toLowerCase())) return p.txid.toLowerCase(); } catch { /* fall through */ }
+    }
+    const mine = (this.record.myClaimTxid ?? '').toLowerCase();
+    return HEX64.test(mine) ? mine : null;
+  }
+
+  /** Read + validate the durable refund tx cache (R280-H1). */
+  private async readDurableRefundTx(id: string): Promise<{ txid: string; rawTx: string; spent?: Outpoint } | null> {
+    try {
+      const raw = await this.deps.durable.get(refundTxKey(id));
+      if (!raw) return null;
+      const r = JSON.parse(raw) as { txid?: string; rawTx?: string; spent?: Outpoint };
+      if (typeof r.txid === 'string' && HEX64.test(r.txid.toLowerCase()) && typeof r.rawTx === 'string') {
+        return { txid: r.txid, rawTx: r.rawTx, spent: r.spent };
+      }
+      return null;
+    } catch { return null; }
+  }
+
+  /**
+   * §9.6 reorg-safe depth check for a terminal tx (claim/refund) at `height` on `chain`. Requires BOTH a proxy depth
+   * >= reqConf AND — on spvSupported mainnets — verifyConfirmations (SPV, provenTxid-bound) >= reqConf. FAIL CLOSED:
+   * any unknown tip, SPV throw (pruned/short/tampered header/Merkle proof), or below-required depth returns false
+   * (the caller KEEPS all recovery material). Regtest / non-SPV chains fall back to the proxy depth (test-only).
+   */
+  private async spvReorgSafe(client: SwapChainClient, chain: Chain, txid: string, height: number, rawTx: string | undefined, reqConf: number): Promise<boolean> {
+    let tip = NaN;
+    try { const [h] = await client.getBlockHeight(); tip = Number.isInteger(h) ? h : NaN; } catch { tip = NaN; }
+    if (!Number.isFinite(tip)) return false; // unknown tip — never wipe on uncertainty
+    const depth = tip - height + 1;
+    if (!(depth >= reqConf)) return false;
+    if (!spvSupported(chain)) return true; // regtest / non-SPV: proxy depth only (test-only chains)
+    let raw = rawTx;
+    if (!raw) { try { raw = await client.getTx(txid); } catch { return false; } }
+    try { return (await verifyConfirmations(client, chain, txid, height, raw, tip)) >= reqConf; }
+    catch { return false; } // pruned / short / tampered SPV read — KEEP everything
+  }
+
+  /** Fail-closed = keep material: refuse a NEW irreversible broadcast while a resume's myHTLC auth is not definitive (fix #10). */
+  private assertIrreversibleAllowed(label: string): void {
+    if (this.irreversibleBlocked) {
+      throw new Error(`${label}: myHTLC on-chain authentication is not DEFINITIVE 'ok' (${this.resumeAuthValue ?? 'unknown'}) — refusing an irreversible broadcast until re-authenticated (fix #10)`);
+    }
+  }
+
+  /** Best-effort delete of a set of durable keys (§9.6 wipe — reached only at reorg-safe depth). */
+  private async wipeDurable(keys: string[]): Promise<void> {
+    for (const k of keys) { try { await this.deps.durable.remove(k); } catch { /* best-effort */ } }
   }
 
   // ── helpers ──────────────────────────────────────────────────────────────────────────────────────────────
