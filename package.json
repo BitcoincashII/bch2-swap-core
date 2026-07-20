@@ -71,6 +71,10 @@
       "types": "./dist/timelock-gates.d.ts",
       "import": "./dist/timelock-gates.js"
     },
+    "./gates": {
+      "types": "./dist/gates.d.ts",
+      "import": "./dist/gates.js"
+    },
     "./fee-rate": {
       "types": "./dist/fee-rate.d.ts",
       "import": "./dist/fee-rate.js"
