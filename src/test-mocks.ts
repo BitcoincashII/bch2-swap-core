@@ -525,14 +525,39 @@ export const SENDTX_SENTINEL = 'MockSigner.sendTransaction — BROADCAST ATTEMPT
 export class MockSigner {
   provider: MockEvmProvider;
   address: string;
-  /** vi.fn() spy — throws the sentinel so any broadcast attempt both throws AND is recorded. */
+  /** 'throw' (DEFAULT — the fail-closed spy) throws SENDTX_SENTINEL on any broadcast; 'ok' broadcasts SUCCESSFULLY
+   *  (used ONLY by the deliberate happy-path tests, e.g. a genuine EVM refund). The default is unchanged so every
+   *  existing fail-closed assertion (`broadcastCount === 0` / `.rejects.toThrow(SENDTX_SENTINEL)`) still holds. */
+  readonly mode: 'throw' | 'ok';
+  /** vi.fn() spy — throws the sentinel (default) or, in 'ok' mode, returns a valid tx response + stages a status-1
+   *  receipt on the provider so ethers' ContractTransactionResponse.wait() resolves. */
   public readonly sendTransaction: ReturnType<typeof vi.fn>;
 
-  constructor(provider: MockEvmProvider, address = '0x2222222222222222222222222222222222222222') {
+  constructor(provider: MockEvmProvider, address = '0x2222222222222222222222222222222222222222', opts?: { mode?: 'throw' | 'ok' }) {
     this.provider = provider;
     this.address = address;
-    this.sendTransaction = vi.fn(() => {
-      throw new Error(SENDTX_SENTINEL);
+    this.mode = opts?.mode ?? 'throw';
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    this.sendTransaction = vi.fn((tx?: any) => {
+      if (this.mode === 'throw') throw new Error(SENDTX_SENTINEL);
+      const hash = '0x' + 'ab'.repeat(32);
+      const bn = this.provider.opts.blockNumber ?? 1_000;
+      // Stage the status-1 receipt the (mock) provider returns for tx.wait() -> getTransactionReceipt(hash).
+      this.provider.opts.receipt = {
+        status: 1, logs: [], hash, blockNumber: bn, index: 0,
+        to: tx?.to ?? null, from: this.address, contractAddress: null,
+        blockHash: '0x' + 'bc'.repeat(32), logsBloom: '0x' + '00'.repeat(256),
+        gasUsed: 21_000n, cumulativeGasUsed: 21_000n, blobGasUsed: null,
+        gasPrice: 0n, blobGasPrice: null, type: 2, root: null,
+      };
+      // A TransactionResponse-shaped object ethers wraps in a ContractTransactionResponse; .wait() reads the receipt above.
+      return {
+        hash, blockNumber: null, blockHash: null, index: 0, type: 2,
+        from: this.address, to: tx?.to ?? null, gasLimit: 21_000n, nonce: 0,
+        data: tx?.data ?? '0x', value: tx?.value ?? 0n, gasPrice: 0n,
+        maxPriorityFeePerGas: null, maxFeePerGas: null, maxFeePerBlobGas: null,
+        chainId: this.provider.opts.chainId ?? 8453n, signature: null, accessList: null,
+      };
     });
   }
 

@@ -30,7 +30,7 @@ import {
   InMemoryDurableStore, InMemorySessionStore, InProcessMutex, type DurableStore,
 } from './storage';
 import { UtxoReservationRegistry } from './utxo-reservation';
-import { MockElectrumClient, buildUtxoRawTx } from './test-mocks';
+import { MockElectrumClient, buildUtxoRawTx, MockEvmProvider, MockSigner, makeSwap, htlcInterface, ZERO_ADDRESS } from './test-mocks';
 import { hexToBytes, bytesToHex, hash160, sha256, createHTLCRedeemScript } from './htlc-builder';
 import { claimHTLC } from './swap-flow';
 import { swapSecretFromKss } from './seed-secret';
@@ -38,9 +38,19 @@ import { __setSpvConfigForTests, __resetSpvCacheForTests } from './spv-verifier'
 import { blockHashInternal, checkPoW, hash256, type AsertParams } from './spv';
 import {
   assertRevealSafe as gateAssertRevealSafe,
+  assertEvmLegBuriedForFunding as gateAssertEvmLegBuriedForFunding,
+  assertEvmRevealSafe as gateAssertEvmRevealSafe,
   type GateChainClient, type FundProof, type RevealAuthorization,
 } from './gates';
+import { getEvmConfig } from './evm-config';
+import { ethers, type Provider, type Signer } from 'ethers';
 import type { SwapOffer, Chain } from './swap-types';
+// FIX #6: the brand compile-check functions live in a NON-test file so `tsc --noEmit` actually compiles their
+// @ts-expect-error directives (an unused directive / a brand regression fails typecheck). Imported here only so the
+// smoke `it(typeof === 'function')` assertions keep them referenced.
+import {
+  _fundLegYCompileCheck, _revealAndClaimCompileCheck, _lockEvmCompileCheck, _revealAndClaimEvmCompileCheck,
+} from './brand-compile-tests';
 
 // ============================================================================
 // Synthetic PoW chain (verbatim technique from gates.test.ts) — a real header chain from the checkpoint so
@@ -474,23 +484,8 @@ function watchRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
   };
 }
 
-// Compile-time proof that fundLegY STRUCTURALLY requires a FundProof (validated by `tsc --noEmit`, not the runtime).
-// If either directive becomes UNUSED (fundLegY drops the required proof / accepts the wrong brand) tsc FAILS.
-async function _fundLegYCompileCheck(ctrl: SwapController, ra: RevealAuthorization): Promise<void> {
-  // @ts-expect-error fundLegY requires a FundProof — a no-arg call must NOT compile (safe-by-default, design §4).
-  await ctrl.fundLegY();
-  // @ts-expect-error a RevealAuthorization is NOT a FundProof — the two brands are non-interchangeable (fix #1).
-  await ctrl.fundLegY(ra);
-}
-
-// Compile-time proof that revealAndClaim STRUCTURALLY requires a RevealAuthorization (validated by `tsc --noEmit`).
-// If either directive becomes UNUSED (revealAndClaim drops the required auth / accepts the wrong brand) tsc FAILS.
-async function _revealAndClaimCompileCheck(ctrl: SwapController, fp: FundProof): Promise<void> {
-  // @ts-expect-error revealAndClaim requires a RevealAuthorization — a no-arg call must NOT compile (fix #3 / §4).
-  await ctrl.revealAndClaim();
-  // @ts-expect-error a FundProof is NOT a RevealAuthorization — the two brands are non-interchangeable (fix #1).
-  await ctrl.revealAndClaim(fp);
-}
+// FIX #6: the four brand compile-check functions moved to src/brand-compile-tests.ts (a NON-test file `tsc --noEmit`
+// actually compiles — tsconfig excludes **/*.test.ts). The smoke `it(...)` assertions below keep them referenced.
 
 // ============================================================================
 // (f) verifyCounterpartyLegForReveal + revealAndClaim — the initiator's single irreversible secret reveal
@@ -977,5 +972,458 @@ describe('SwapController.resume() — fix #10 + funding rebroadcast + S re-deriv
     const again = await ctrl.claimWithKnownSecret();
     expect(again.txid).toBe(first.txid);
     expect(btc.broadcasts.length).toBe(1);
+  });
+});
+
+// ============================================================================
+// STEP 7 — EVM parity: the EVM fund-critical half (the EVM reveal + the refund-race secret recovery).
+//
+// The EVM GATE minters (assertEvmLegBuriedForFunding / assertEvmRevealSafe) are driven over MockEvmProvider (+ leaf
+// providers for the quorum chain-clock reads, mirroring gates.test.ts); the on-chain lock/claim/refund broadcasts go
+// through the proven evm-client handlers with the injected MockSigner. Default MockSigner THROWS on any broadcast, so
+// every fail-closed assertion is `broadcastCount === 0`; the ONE happy path (a genuine EVM refund) uses a `mode:'ok'`
+// signer. The refund-race pivot recovers S from an on-chain `Claimed` event (staged via getLogs) and claims the OTHER
+// (UTXO) leg with the now-public secret. No assertion is weakened — the default signer + the UTXO harness are unchanged.
+// ============================================================================
+const EVM_HASHLOCK = '0x' + SECRET_HASH_HEX;               // the on-chain hashLock the gates bind (== sha256(S))
+const EVM_RECIP = '0x2222222222222222222222222222222222222222'; // OUR EVM address (recipient of the counterparty leg)
+const EVM_CP_ADDR = '0x3333333333333333333333333333333333333333'; // the counterparty's EVM address (recipient of our lock)
+const EVM_AMT = 1_000_000_000_000_000_000n;               // 1e18 wei — an 18-dec value that overflows Number()
+const EVM_AMT_STR = '1000000000000000000';                // canonical base-unit STRING (fix #10 — never Number() this)
+const EVM_CHAIN_NOW = 1_800_000_000;                      // the corroborated leaf block timestamp
+const EVM_SWAP_ID = '0x' + 'ab'.repeat(32);
+const ARB_HTLC = getEvmConfig(42161)!.htlcAddress;        // theirChain 'arb' deployed HTLC
+const P = (x: MockEvmProvider) => x as unknown as Provider;
+const G = (x: MockEvmProvider) => x as unknown as GateChainClient;
+const SG = (x: MockSigner) => x as unknown as Signer;
+
+/** An EVM counterparty-leg provider: a quorum (2-leaf) FallbackProvider-shaped mock with a `safe`-tag swap + a
+ *  corroborated chain clock, mirroring gates.test.ts's evmFundProvider/evmRevealProvider. `single:true` drops the leaf
+ *  set so the gate's quorum>=2 refusal (fix #7/#1) fires; `swap:null` makes the counterparty lock vanish. */
+function evmLegProvider(over: { swap?: ReturnType<typeof makeSwap> | null; leafTs?: Array<number | null>; single?: boolean; logs?: unknown[] } = {}): MockEvmProvider {
+  const swap = over.swap !== undefined ? over.swap : makeSwap({
+    hashLock: EVM_HASHLOCK, recipient: EVM_RECIP, token: ZERO_ADDRESS, amount: EVM_AMT, timeLock: 1_900_000_000n,
+  });
+  if (over.single) return new MockEvmProvider({ safeSwap: swap, swap, blockNumber: 5000, block: { timestamp: EVM_CHAIN_NOW } });
+  const ts = over.leafTs ?? [EVM_CHAIN_NOW, EVM_CHAIN_NOW];
+  const leaves = ts.map((t) => new MockEvmProvider({ block: t === null ? null : { timestamp: t }, logs: over.logs }));
+  return new MockEvmProvider({ safeSwap: swap, swap, leafProviders: leaves, blockNumber: 5000 });
+}
+
+function makeEvmDeps(opts: {
+  evmProviderFor?: (chain: Chain) => Provider;
+  evmSignerFor?: (chain: Chain) => Signer;
+  clients?: Partial<Record<Chain, MockElectrumClient>>;
+  durable?: DurableStore;
+}): SwapControllerDeps {
+  const durable = opts.durable ?? new InMemoryDurableStore();
+  const mutex = new InProcessMutex({ store: durable, settle: () => Promise.resolve() });
+  const reservation = new UtxoReservationRegistry();
+  return {
+    chainClientFor: (chain: Chain) => {
+      const c = opts.clients?.[chain];
+      if (!c) throw new Error(`test: no UTXO client wired for chain ${chain}`);
+      return c as unknown as SwapChainClient;
+    },
+    seedVault: new MockSeedVault(KSS),
+    durable, session: new InMemorySessionStore(), mutex, reservation,
+    clock: () => 1_700_000_000_000,
+    evmProviderFor: opts.evmProviderFor,
+    evmSignerFor: opts.evmSignerFor,
+  };
+}
+
+// responder (EVM↔EVM): leg X on 'arb' (initiator, verified), OUR leg Y on 'base' (locked).
+function evmFundRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
+  return {
+    id: over.id ?? 'evmfund-1', role: 'responder',
+    offer: makeOffer({ id: over.id ?? 'evmfund-1', sendChain: 'arb', receiveChain: 'base', sendAmount: EVM_AMT_STR, receiveAmount: EVM_AMT_STR, secretHash: SECRET_HASH_HEX }),
+    phase: 'taken',
+    counterpartyEvmSwapId: EVM_SWAP_ID,
+    myEvmAddress: EVM_RECIP, counterpartyEvmAddress: EVM_CP_ADDR,
+    myEvmToken: ZERO_ADDRESS, counterpartyEvmToken: ZERO_ADDRESS,
+    ...over,
+  };
+}
+// initiator (EVM↔EVM): OUR leg X on 'base', leg Y on 'arb' (responder, revealed against).
+function evmRevealRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
+  return {
+    id: over.id ?? 'evmreveal-1', role: 'initiator',
+    offer: makeOffer({ id: over.id ?? 'evmreveal-1', sendChain: 'base', receiveChain: 'arb', sendAmount: EVM_AMT_STR, receiveAmount: EVM_AMT_STR, secretHash: SECRET_HASH_HEX, secretScheme: 'hmac-v1', secretNonce: bytesToHex(NONCE) }),
+    phase: 'responder_funded',
+    counterpartyEvmSwapId: EVM_SWAP_ID,
+    myEvmAddress: EVM_RECIP, counterpartyEvmAddress: EVM_CP_ADDR,
+    myEvmToken: ZERO_ADDRESS, counterpartyEvmToken: ZERO_ADDRESS,
+    ...over,
+  };
+}
+const REVEAL_GATE_PARAMS = {
+  chain: 'arb', htlcAddr: ARB_HTLC, swapId: EVM_SWAP_ID, requiredConfirmations: 30,
+  hashLock: EVM_HASHLOCK, recipient: EVM_RECIP, minAmount: EVM_AMT, token: ZERO_ADDRESS,
+};
+const FUND_GATE_PARAMS = {
+  chain: 'arb', htlcAddr: ARB_HTLC, swapId: EVM_SWAP_ID, requiredConfirmations: 30,
+  hashLock: EVM_HASHLOCK, recipient: EVM_RECIP, minAmount: EVM_AMT, token: ZERO_ADDRESS,
+};
+
+// FIX #6: _lockEvmCompileCheck + _revealAndClaimEvmCompileCheck moved to src/brand-compile-tests.ts (imported above).
+
+// ── (i) verifyEvmCounterpartyLeg* minters + the fix #7 single-leaf refusal ────────────────────────────────
+describe('SwapController EVM verify minters (assertEvmLegBuriedForFunding / assertEvmRevealSafe)', () => {
+  it('verifyEvmCounterpartyLegForFunding mints a swapId-bound FundProof over the quorum>=2 provider', async () => {
+    const ctrl = new SwapController(evmFundRecord(), makeEvmDeps({ evmProviderFor: () => P(evmLegProvider()) }));
+    const proof = await ctrl.verifyEvmCounterpartyLegForFunding();
+    expect(proof.leg).toBe('X');
+    expect(proof.for).toBe('fundY');
+    expect(proof.role).toBe('responder');
+    expect(proof.swapId).toBe(EVM_SWAP_ID);
+    expect(proof.marginBasis).toBe('evm-timestamp');
+  });
+
+  it('verifyEvmCounterpartyLegForReveal mints an initiator RevealAuthorization over the quorum>=2 provider', async () => {
+    const ctrl = new SwapController(evmRevealRecord(), makeEvmDeps({ evmProviderFor: () => P(evmLegProvider()) }));
+    const auth = await ctrl.verifyEvmCounterpartyLegForReveal();
+    expect(auth.leg).toBe('Y');
+    expect(auth.for).toBe('reveal');
+    expect(auth.role).toBe('initiator');
+    expect(auth.swapId).toBe(EVM_SWAP_ID);
+  });
+
+  it('(fix #7) a SINGLE-LEAF EVM provider is REFUSED by the gate — quorum>=2 required, mints nothing', async () => {
+    const ctrl = new SwapController(evmFundRecord(), makeEvmDeps({ evmProviderFor: () => P(evmLegProvider({ single: true })) }));
+    await expect(ctrl.verifyEvmCounterpartyLegForFunding()).rejects.toMatchObject({ name: 'GateFailure' });
+    const ctrl2 = new SwapController(evmRevealRecord(), makeEvmDeps({ evmProviderFor: () => P(evmLegProvider({ single: true })) }));
+    await expect(ctrl2.verifyEvmCounterpartyLegForReveal()).rejects.toMatchObject({ name: 'GateFailure' });
+  });
+
+  it('verifyEvmCounterpartyLegForFunding is responder-only; verifyEvmCounterpartyLegForReveal is initiator-only', async () => {
+    const asInit = new SwapController(evmFundRecord({ role: 'initiator', offer: makeOffer({ id: 'evmfund-1', sendChain: 'base', receiveChain: 'arb', sendAmount: EVM_AMT_STR, receiveAmount: EVM_AMT_STR, secretHash: SECRET_HASH_HEX }) }), makeEvmDeps({ evmProviderFor: () => P(evmLegProvider()) }));
+    await expect(asInit.verifyEvmCounterpartyLegForFunding()).rejects.toThrow(/responder-only/i);
+    const asResp = new SwapController(evmRevealRecord({ role: 'responder', offer: makeOffer({ id: 'evmreveal-1', sendChain: 'arb', receiveChain: 'base', sendAmount: EVM_AMT_STR, receiveAmount: EVM_AMT_STR, secretHash: SECRET_HASH_HEX }) }), makeEvmDeps({ evmProviderFor: () => P(evmLegProvider()) }));
+    await expect(asResp.verifyEvmCounterpartyLegForReveal()).rejects.toThrow(/initiator-only/i);
+  });
+});
+
+// ── (ii) lockEvm(proof) — the fix #2 re-mint at the broadcast choke point ─────────────────────────────────
+describe('SwapController.lockEvm() — fix #2 re-mint FRESH at the choke point', () => {
+  it('(fix #2) lockEvm re-mint FAILS (counterparty leg X vanished) -> NO lock tx broadcast, phase unchanged', async () => {
+    const goodProof = await gateAssertEvmLegBuriedForFunding(P(evmLegProvider()), FUND_GATE_PARAMS);
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP); // throw-mode: any lock broadcast would throw
+    const ctrl = new SwapController(evmFundRecord(), makeEvmDeps({
+      // the choke-point re-mint reads a FRESH provider where the counterparty lock has vanished (safe=null) -> GateFailure
+      evmProviderFor: () => P(evmLegProvider({ swap: null })),
+      evmSignerFor: () => SG(signer),
+    }));
+    await expect(ctrl.lockEvm(goodProof)).rejects.toMatchObject({ name: 'GateFailure' });
+    expect(signer.broadcastCount).toBe(0);              // fix #2: the fresh re-mint throw ABORTS before any lock tx
+    expect(ctrl.getState().phase).toBe('taken');
+  });
+
+  it('(fix #5) lockEvm commits the lockpending recovery marker DURABLY + AWAITED BEFORE broadcast; a commit FAILURE aborts the lock', async () => {
+    // A durable whose atomic commit() ALWAYS throws (e.g. QuotaExceeded). Because the lockpending marker commit is now
+    // durable-BEFORE-broadcast + AWAITED, that throw ABORTS the lock. Crucially `broadcastCount === 0` proves the
+    // failing commit ran STRICTLY BEFORE any lock broadcast: were the marker written only AFTER (the old fire-and-
+    // forget onBroadcast path) the lock tx would already have broadcast (count 1) before the commit threw. So this one
+    // test proves BOTH "marker committed before broadcast" AND "a commit failure aborts the lock" (fix #5).
+    class FailCommitDurable extends InMemoryDurableStore {
+      commits = 0;
+      async commit(_e: Array<[string, string]>): Promise<void> { this.commits++; throw new Error('injected atomic-commit failure (QuotaExceeded)'); }
+    }
+    const goodProof = await gateAssertEvmLegBuriedForFunding(P(evmLegProvider()), FUND_GATE_PARAMS);
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP); // throw-mode: any lock broadcast would throw the sentinel
+    const durable = new FailCommitDurable();
+    const ctrl = new SwapController(evmFundRecord(), makeEvmDeps({
+      evmProviderFor: () => P(evmLegProvider()), // healthy quorum -> the fix #2 choke-point re-mint passes
+      evmSignerFor: () => SG(signer),
+      durable,
+    }));
+    await expect(ctrl.lockEvm(goodProof)).rejects.toThrow(/commit failure|QuotaExceeded/i);
+    expect(signer.broadcastCount).toBe(0);              // fix #5: NO lock tx broadcast without a durable recovery marker
+    expect(durable.commits).toBe(1);                    // the aborting throw came from the FIRST (pre-broadcast) commit
+    expect(ctrl.getState().phase).toBe('taken');        // never advanced
+  });
+
+  it('(fix #1 compile) lockEvm STRUCTURALLY requires a FundProof — no-arg / RevealAuthorization do not compile', () => {
+    expect(typeof _lockEvmCompileCheck).toBe('function');
+  });
+});
+
+// ── (iii) revealAndClaimEvm(auth) — fix #3 role + fix #2 re-mint ──────────────────────────────────────────
+describe('SwapController.revealAndClaimEvm() — the initiator EVM secret reveal (fix #2/#3)', () => {
+  beforeEach(() => { __setSpvConfigForTests('btc', FX.params, FX.checkpoint); __resetSpvCacheForTests(); });
+
+  it('(fix #3) revealAndClaimEvm with a RESPONDER-role authorization THROWS and reveals NOTHING', async () => {
+    // A responder RevealAuthorization (marginBasis 'none' — SKIPS the 4h margin) can only come from the UTXO gate.
+    const btc = fxClient();
+    const responderAuth = await gateAssertRevealSafe(G(btc), {
+      role: 'responder', theirChain: 'btc', counterpartyRedeemScript: CP_REDEEM,
+      recordedOutpoint: FX_OUTPOINT, counterpartyLocktime: FX.tip + 1,
+    });
+    expect(responderAuth.role).toBe('responder');
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP);
+    const ctrl = new SwapController(evmRevealRecord(), makeEvmDeps({ evmProviderFor: () => P(evmLegProvider()), evmSignerFor: () => SG(signer) }));
+    await expect(ctrl.revealAndClaimEvm(responderAuth)).rejects.toThrow(/fix #3|initiator/i);
+    expect(signer.broadcastCount).toBe(0);
+    expect(ctrl.getState().phase).toBe('responder_funded');
+  });
+
+  it('(fix #2) revealAndClaimEvm re-mint FAILS (fresh on-chain margin < 4h) -> NO claim, S NOT sent', async () => {
+    const goodAuth = await gateAssertEvmRevealSafe(P(evmLegProvider()), REVEAL_GATE_PARAMS); // a valid initiator auth
+    expect(goodAuth.role).toBe('initiator');
+    // Between mint and reveal, the FRESH on-chain timeLock is now within the 4h claim margin -> assertEvmRevealSafe throws.
+    const tight = makeSwap({ hashLock: EVM_HASHLOCK, recipient: EVM_RECIP, token: ZERO_ADDRESS, amount: EVM_AMT, timeLock: BigInt(EVM_CHAIN_NOW + 10_000) });
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP);
+    const ctrl = new SwapController(evmRevealRecord(), makeEvmDeps({ evmProviderFor: () => P(evmLegProvider({ swap: tight })), evmSignerFor: () => SG(signer) }));
+    await expect(ctrl.revealAndClaimEvm(goodAuth)).rejects.toMatchObject({ name: 'GateFailure' });
+    expect(signer.broadcastCount).toBe(0);              // fix #2: S never reaches claim calldata
+    expect(ctrl.getState().phase).toBe('responder_funded');
+  });
+
+  it('(fix #3) a PRE-broadcast claimSwap throw CLEARS the claimbroadcast sentinel so a retry can re-arm', async () => {
+    // The choke-point re-mint PASSES (healthy quorum), the winning-claim sentinel is committed, then claimSwap throws a
+    // PRE-broadcast chain-mismatch (the signer's provider is on chainId 8453, but theirChain 'arb' expects 42161) —
+    // tagged preBroadcast=true, no secret in calldata. FIX #3: the sentinel we set must be CLEARED so a retry re-arms;
+    // the OLD code left it set -> a later call ADOPTS a never-broadcast claim -> the swap is stuck (never reveals S).
+    const goodAuth = await gateAssertEvmRevealSafe(P(evmLegProvider()), REVEAL_GATE_PARAMS);
+    expect(goodAuth.role).toBe('initiator');
+    const signer = new MockSigner(new MockEvmProvider({ chainId: 8453n }), EVM_RECIP); // wrong chain -> pre-broadcast throw
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(evmRevealRecord(), makeEvmDeps({
+      evmProviderFor: () => P(evmLegProvider()), // healthy quorum -> assertEvmRevealSafe re-mint passes
+      evmSignerFor: () => SG(signer),
+      durable,
+    }));
+    await expect(ctrl.revealAndClaimEvm(goodAuth)).rejects.toThrow(/chain mismatch/i);
+    expect(signer.broadcastCount).toBe(0);                                       // S never broadcast (pre-flight threw)
+    expect(await durable.get('bch2swap:claimbroadcast:evmreveal-1')).toBeNull(); // fix #3: sentinel cleared for retry
+    expect(ctrl.getState().phase).toBe('responder_funded');                     // never advanced
+  });
+
+  it('(fix #1/#3 compile) revealAndClaimEvm STRUCTURALLY requires a RevealAuthorization — no-arg / FundProof do not compile', () => {
+    expect(typeof _revealAndClaimEvmCompileCheck).toBe('function');
+  });
+});
+
+// ── (iv) refundEvm() — happy + durable-before-broadcast + the refund-race pivot (fix #7) ──────────────────
+describe('SwapController.refundEvm() — refund own EVM lock + the refund-race secret-recovery pivot (fix #7)', () => {
+  beforeEach(() => { __setSpvConfigForTests('btc', FX.params, FX.checkpoint); __resetSpvCacheForTests(); });
+
+  // OUR own EVM leg 'base' with role responder; leg X on 'btc' is the counterparty leg we may still claim.
+  function refundEvmRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
+    return {
+      id: over.id ?? 'evmrefund-1', role: 'responder',
+      offer: makeOffer({ id: over.id ?? 'evmrefund-1', sendChain: 'btc', receiveChain: 'base', sendAmount: EVM_AMT_STR, receiveAmount: EVM_AMT_STR, secretHash: SECRET_HASH_HEX, secretScheme: 'hmac-v1', secretNonce: bytesToHex(NONCE) }),
+      phase: 'responder_funded',
+      myEvmSwapId: EVM_SWAP_ID,
+      myEvmAddress: EVM_RECIP, counterpartyEvmAddress: EVM_CP_ADDR,
+      myEvmToken: ZERO_ADDRESS, counterpartyEvmToken: ZERO_ADDRESS,
+      counterpartyHTLC: { ...CP_HTLC, locktime: FX.tip + 200 }, // leg X on btc (claimable with the recovered secret)
+      counterpartyFundingOutpoint: FX_OUTPOINT,
+      ...over,
+    };
+  }
+
+  it('HAPPY: refundEvm after expiry broadcasts the refund ONCE and sets the durable refundbroadcast sentinel -> refunded', async () => {
+    const okProvider = new MockEvmProvider({
+      swap: makeSwap({ initiator: EVM_RECIP, claimed: false, refunded: false, timeLock: 1_699_000_000n, amount: EVM_AMT }),
+      block: { timestamp: 1_700_000_000 }, blockNumber: 5000, chainId: 8453n,
+    });
+    const signer = new MockSigner(okProvider, EVM_RECIP, { mode: 'ok' });
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(refundEvmRecord(), makeEvmDeps({ evmSignerFor: () => SG(signer), durable }));
+    const { txHash } = await ctrl.refundEvm();
+    expect(signer.broadcastCount).toBe(1);
+    expect(await durable.get('bch2swap:refundbroadcast:evmrefund-1')).toBe('1'); // durable sentinel written (before the send)
+    expect(ctrl.getState().phase).toBe('refunded');
+    expect(txHash).toBe(EVM_SWAP_ID);
+  });
+
+  it('durable-before-broadcast (fix #4): a commit FAILURE aborts the refund — no refund tx broadcasts', async () => {
+    class FailCommitDurable extends InMemoryDurableStore {
+      async commit(_e: Array<[string, string]>): Promise<void> { throw new Error('injected atomic-commit failure (QuotaExceeded)'); }
+    }
+    const okProvider = new MockEvmProvider({ swap: makeSwap({ initiator: EVM_RECIP, timeLock: 1_699_000_000n, amount: EVM_AMT }), block: { timestamp: 1_700_000_000 }, blockNumber: 5000 });
+    const signer = new MockSigner(okProvider, EVM_RECIP, { mode: 'ok' });
+    const ctrl = new SwapController(refundEvmRecord(), makeEvmDeps({ evmSignerFor: () => SG(signer), durable: new FailCommitDurable() }));
+    await expect(ctrl.refundEvm()).rejects.toThrow(/commit failure|QuotaExceeded/i);
+    expect(signer.broadcastCount).toBe(0);
+    expect(ctrl.getState().phase).toBe('responder_funded');
+  });
+
+  it('a claim in flight (claimbroadcast sentinel) BLOCKS refundEvm (R181 cross-guard) + no broadcast', async () => {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:claimbroadcast:evmrefund-1', '1');
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP, { mode: 'ok' });
+    const ctrl = new SwapController(refundEvmRecord(), makeEvmDeps({ evmSignerFor: () => SG(signer), durable }));
+    await expect(ctrl.refundEvm()).rejects.toThrow(/R181|claim/i);
+    expect(signer.broadcastCount).toBe(0);
+  });
+
+  it('THE PIVOT (fix #7): refund reverts because the counterparty ALREADY CLAIMED -> recover S from the on-chain Claimed event, verify the hash, claim the OTHER (UTXO) leg -> made whole', async () => {
+    // refundSwap pre-flight sees our lock ALREADY CLAIMED (initiator took it with S) -> throws 'already claimed'.
+    const claimedProvider = new MockEvmProvider({
+      swap: makeSwap({ initiator: EVM_RECIP, claimed: true, timeLock: 1_800_000_000n, amount: EVM_AMT }),
+      block: { timestamp: 1_700_000_000 }, blockNumber: 5000,
+    });
+    const signer = new MockSigner(claimedProvider, EVM_RECIP); // throw-mode: refundSwap throws PRE-broadcast (no send)
+    // The quorum>=2 read provider whose leaves both carry the on-chain Claimed(swapId, S) event (fix #7 corroboration).
+    const claimedLog = htlcInterface.encodeEventLog('Claimed', [EVM_SWAP_ID, ethers.hexlify(S)]);
+    const leaf = () => new MockEvmProvider({ logs: [{ topics: claimedLog.topics, data: claimedLog.data, blockNumber: 10 }] });
+    const quorum = new MockEvmProvider({ leafProviders: [leaf(), leaf()], blockNumber: 5000 });
+    const btc = fxClient(); // leg X on btc — claimable with the recovered public secret
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(refundEvmRecord(), makeEvmDeps({
+      evmSignerFor: () => SG(signer),
+      evmProviderFor: (chain) => P(chain === 'base' ? quorum : evmLegProvider()),
+      clients: { btc },
+      durable,
+    }));
+    const { txHash } = await ctrl.refundEvm();
+    expect(signer.broadcastCount).toBe(0);              // the EVM refund never broadcast (it reverted pre-flight)
+    expect(btc.broadcasts.length).toBe(1);              // we CLAIMED the counterparty UTXO leg with the recovered S
+    expect(ctrl.getState().hasSecret).toBe(true);       // S recovered + retained
+    expect(ctrl.getState().phase).toBe('completed');    // made whole
+    expect(txHash).toBeTruthy();
+    // the refund sentinel was cleared (the refund did NOT execute) so the pivot claim was not blocked by the cross-guard
+    expect(await durable.get('bch2swap:refundbroadcast:evmrefund-1')).toBeNull();
+  });
+
+  it('the pivot KEEPS retrying (does not abandon) when S is NOT yet extractable from the Claimed event', async () => {
+    const claimedProvider = new MockEvmProvider({ swap: makeSwap({ initiator: EVM_RECIP, claimed: true, timeLock: 1_800_000_000n, amount: EVM_AMT }), block: { timestamp: 1_700_000_000 }, blockNumber: 5000 });
+    const signer = new MockSigner(claimedProvider, EVM_RECIP);
+    // Both leaves return NO Claimed log yet (a lagging/pruned view) -> readEvmClaimedSecret yields null -> retryable throw.
+    const quorum = new MockEvmProvider({ leafProviders: [new MockEvmProvider({ logs: [] }), new MockEvmProvider({ logs: [] })], blockNumber: 5000 });
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(refundEvmRecord(), makeEvmDeps({ evmSignerFor: () => SG(signer), evmProviderFor: () => P(quorum), clients: { btc: fxClient() }, durable }));
+    await expect(ctrl.refundEvm()).rejects.toThrow(/never abandon|not yet corroborated|fix #7/i);
+    // fail-safe: the refund sentinel is KEPT set (a co-running claim/refund cannot slip past while S may still surface)
+    expect(await durable.get('bch2swap:refundbroadcast:evmrefund-1')).toBe('1');
+    // fix #2: a durable refund-race-pending marker is ALSO set so a later refundEvm re-call RE-ENTERS recovery.
+    expect(await durable.get('bch2swap:refundracepending:evmrefund-1')).toBe('1');
+  });
+
+  it('(fix #2) the pivot retry RE-ENTERS recovery via the durable marker (never a fresh refund / false-refunded) and recovers once S is extractable', async () => {
+    // Attempt #1: our lock is already CLAIMED (refundSwap reverts pre-flight) but S is NOT yet extractable — both
+    // leaves lag. recoverFromRefundRace persists the refund-race-pending marker + throws retryable.
+    const claimedProvider = new MockEvmProvider({ swap: makeSwap({ initiator: EVM_RECIP, claimed: true, timeLock: 1_800_000_000n, amount: EVM_AMT }), block: { timestamp: 1_700_000_000 }, blockNumber: 5000 });
+    const signer = new MockSigner(claimedProvider, EVM_RECIP); // throw-mode: refundSwap throws PRE-broadcast (no send)
+    const leafA = new MockEvmProvider({ logs: [] });
+    const leafB = new MockEvmProvider({ logs: [] });
+    const quorum = new MockEvmProvider({ leafProviders: [leafA, leafB], blockNumber: 5000 });
+    const btc = fxClient(); // leg X on btc — claimable with the recovered public secret
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(refundEvmRecord(), makeEvmDeps({
+      evmSignerFor: () => SG(signer),
+      evmProviderFor: (chain) => P(chain === 'base' ? quorum : evmLegProvider()),
+      clients: { btc },
+      durable,
+    }));
+    await expect(ctrl.refundEvm()).rejects.toThrow(/never abandon|not yet corroborated|fix #7/i);
+    expect(await durable.get('bch2swap:refundbroadcast:evmrefund-1')).toBe('1');
+    expect(await durable.get('bch2swap:refundracepending:evmrefund-1')).toBe('1'); // marker persisted
+    expect(btc.broadcasts.length).toBe(0);                                          // no claim yet
+
+    // S becomes extractable on both leaves (the Claimed event surfaces).
+    const claimedLog = htlcInterface.encodeEventLog('Claimed', [EVM_SWAP_ID, ethers.hexlify(S)]);
+    const logEntry = { topics: claimedLog.topics, data: claimedLog.data, blockNumber: 10 };
+    leafA.opts.logs = [logEntry];
+    leafB.opts.logs = [logEntry];
+
+    // Retry: the marker RE-ENTERS recovery (NOT a fresh refund, NOT an adopt-as-refunded) and makes us whole.
+    const { txHash } = await ctrl.refundEvm();
+    expect(signer.broadcastCount).toBe(0);              // fix #2: never sent a fresh EVM refund on the retry
+    expect(btc.broadcasts.length).toBe(1);              // claimed the counterparty UTXO leg with the recovered public S
+    expect(ctrl.getState().hasSecret).toBe(true);       // S recovered + retained
+    expect(ctrl.getState().phase).toBe('completed');    // made whole (never falsely 'refunded')
+    expect(txHash).toBeTruthy();
+    // both markers cleared once S is recovered + the other leg is claimed
+    expect(await durable.get('bch2swap:refundracepending:evmrefund-1')).toBeNull();
+    expect(await durable.get('bch2swap:refundbroadcast:evmrefund-1')).toBeNull();
+  });
+});
+
+// ── (v) watchForClaimEvm() — the responder watches its OWN EVM lock; hash is the authenticator ────────────
+describe('SwapController.watchForClaimEvm() — responder watches its own EVM lock (hash-verified, quorum>=1)', () => {
+  function watchEvmRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
+    return {
+      id: over.id ?? 'evmwatch-1', role: 'responder',
+      offer: makeOffer({ id: over.id ?? 'evmwatch-1', sendChain: 'btc', receiveChain: 'base', sendAmount: EVM_AMT_STR, receiveAmount: EVM_AMT_STR, secretHash: SECRET_HASH_HEX }),
+      phase: 'responder_funded',
+      myEvmSwapId: EVM_SWAP_ID,
+      myEvmAddress: EVM_RECIP, counterpartyEvmAddress: EVM_CP_ADDR,
+      myEvmToken: ZERO_ADDRESS, counterpartyEvmToken: ZERO_ADDRESS,
+      ...over,
+    };
+  }
+  function claimedProviderFor(secretBytes: Uint8Array): MockEvmProvider {
+    const log = htlcInterface.encodeEventLog('Claimed', [EVM_SWAP_ID, ethers.hexlify(secretBytes)]);
+    return new MockEvmProvider({ logs: [{ topics: log.topics, data: log.data, blockNumber: 10 }] });
+  }
+
+  it('returns the secret + advances to claimed when the initiator reveals a VALID preimage', async () => {
+    const ctrl = new SwapController(watchEvmRecord(), makeEvmDeps({ evmProviderFor: () => P(claimedProviderFor(S)) }));
+    const { secret } = await ctrl.watchForClaimEvm();
+    expect(secret).not.toBeNull();
+    expect(bytesToHex(secret!)).toBe(bytesToHex(S));
+    expect(ctrl.getState().phase).toBe('claimed');
+    expect(ctrl.getState().hasSecret).toBe(true);
+  });
+
+  it('REJECTS a forged preimage (sha256(S) !== hashLock) and does NOT advance', async () => {
+    const forged = hexToBytes('ab'.repeat(32)); // a 32-byte value that is NOT the preimage
+    const ctrl = new SwapController(watchEvmRecord(), makeEvmDeps({ evmProviderFor: () => P(claimedProviderFor(forged)) }));
+    const { secret } = await ctrl.watchForClaimEvm();
+    expect(secret).toBeNull();
+    expect(ctrl.getState().phase).toBe('responder_funded'); // never advanced on a forged reveal
+  });
+
+  it('does NOT throw on absence (no Claimed event) — returns {secret:null}', async () => {
+    const ctrl = new SwapController(watchEvmRecord(), makeEvmDeps({ evmProviderFor: () => P(new MockEvmProvider({ logs: [] })) }));
+    await expect(ctrl.watchForClaimEvm()).resolves.toEqual({ secret: null });
+  });
+
+  // FIX #1: a leaf modelling a REAL public RPC — it REJECTS any getLogs whose block range exceeds `maxRange`
+  // ('range too large'), and it THROWS if the OLD unbounded `toBlock:'latest'` is ever used. It returns the Claimed
+  // log only when its block falls inside the queried [from,to] window. Records every attempted range so the test can
+  // prove the read is BOUNDED + WINDOWED (never one wide fromBlock..latest query).
+  class RangeCappedLeaf extends MockEvmProvider {
+    readonly maxRange: number;
+    readonly claimedBlock: number;
+    readonly claimed: { topics: readonly string[]; data: string; blockNumber: number };
+    readonly ranges: Array<{ from: number; to: number | string }> = [];
+    constructor(cfg: { tip: number; maxRange: number; claimedBlock: number; secret: Uint8Array }) {
+      super({ blockNumber: cfg.tip });
+      this.maxRange = cfg.maxRange;
+      this.claimedBlock = cfg.claimedBlock;
+      const log = htlcInterface.encodeEventLog('Claimed', [EVM_SWAP_ID, ethers.hexlify(cfg.secret)]);
+      this.claimed = { topics: log.topics, data: log.data, blockNumber: cfg.claimedBlock };
+    }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    async getLogs(filter: any): Promise<unknown[]> {
+      const from = Number(filter?.fromBlock);
+      const toRaw = filter?.toBlock;
+      this.ranges.push({ from, to: toRaw });
+      if (toRaw === 'latest') throw new Error('query returned more than 10000 results (range too large)'); // OLD unbounded path
+      const to = Number(toRaw);
+      if (to - from + 1 > this.maxRange) throw new Error('query returned more than 10000 results (range too large)');
+      return (this.claimedBlock >= from && this.claimedBlock <= to) ? [this.claimed] : [];
+    }
+  }
+
+  it('(fix #1) recovers S with a BOUNDED, WINDOWED getLogs — a public RPC that rejects a wide range never strands S', async () => {
+    // tip is ~12k blocks past the lock, but the RPC caps getLogs at 5000 blocks/query. A single unbounded
+    // fromBlock..latest query (the OLD code) would THROW 'range too large' -> S stranded -> refund-race loser lost.
+    // The windowed reader caps + slides + shrink-retries, so it still finds the Claimed event at block 11000.
+    const leaf = new RangeCappedLeaf({ tip: 13000, maxRange: 5000, claimedBlock: 11000, secret: S });
+    const ctrl = new SwapController(watchEvmRecord({ evmLockBlock: 1000 }), makeEvmDeps({ evmProviderFor: () => P(leaf) }));
+    const { secret } = await ctrl.watchForClaimEvm();
+    expect(secret).not.toBeNull();
+    expect(bytesToHex(secret!)).toBe(bytesToHex(S));
+    expect(ctrl.getState().phase).toBe('claimed');
+    // The read was BOUNDED: multiple windows were queried (sliding), and NONE used the unbounded toBlock:'latest'.
+    expect(leaf.ranges.length).toBeGreaterThan(1);
+    expect(leaf.ranges.every((r) => r.to !== 'latest')).toBe(true);
+    // And every SUCCESSFUL (non-throwing) window stayed within the RPC's range cap.
+    expect(leaf.ranges.every((r) => typeof r.to === 'number' && (r.to - r.from + 1) <= 9000)).toBe(true);
   });
 });

@@ -46,8 +46,19 @@ import { hexToBytes, bytesToHex, hash160, sha256, maxPlausibleBlockHeight, build
 import { p2pkhScripthash } from './address-codec';
 import { chainConfigs, isSwapPairSuspended } from './chain-config';
 import { spvSupported, verifyFundingHeight, verifyConfirmations } from './spv-verifier';
-import { assertLegBuriedForFunding, assertRevealSafe, type FundProof, type RevealAuthorization } from './gates';
+import {
+  assertLegBuriedForFunding, assertRevealSafe, assertEvmLegBuriedForFunding, assertEvmRevealSafe,
+  type FundProof, type RevealAuthorization,
+} from './gates';
 import type { HTLCDetails, HTLCParams, Utxo } from './swap-types';
+// ── EVM parity (P1b step 7) — the injected quorum>=2 read provider + Node ethers.Wallet signer seams, plus the
+// proven on-chain handlers (lockETH/lockTokens/claimSwap/refundSwap/getSwap) and the EVM leg config lookups. ──
+import { ethers, type Provider, type Signer } from 'ethers';
+import { lockETH, lockTokens, claimSwap, refundSwap, getSwap, HTLC_ABI } from './evm-client';
+import { getEvmConfig, isNativeToken, evmLockSecondsForRole, NATIVE_ETH_ADDRESS, type EvmChainId, type EvmChainConfig } from './evm-config';
+
+/** The zero address (native-asset sentinel), lowercased — an HTLC config still pinned to it means "not deployed". */
+const NATIVE_ETH_ADDR = NATIVE_ETH_ADDRESS.toLowerCase();
 
 // ============================================================================
 // Phase enum + durable record (design §3)
@@ -109,6 +120,21 @@ export interface DurableSwapRecord {
   counterpartyFundingOutpoint?: Outpoint;
   counterpartyEvmSwapId?: string;
   counterpartyEvmTimeLock?: number; // R167 trusted EVM-leg expiry (absolute unix seconds)
+
+  // ── EVM leg specifics (step 7 — populated only on an EVM-leg topology) ────────────────────────────────
+  /** OUR own EVM lock's swapId (bytes32 hex), set by lockEvm; watched by watchForClaimEvm, refunded by refundEvm. */
+  myEvmSwapId?: string;
+  /** OUR EVM address — the recipient when WE claim the counterparty EVM leg (revealAndClaimEvm), and the initiator of
+   *  our own lock (the address refundSwap authenticates against). */
+  myEvmAddress?: string;
+  /** The counterparty's EVM address — the recipient of the lock WE create (lockEvm), i.e. who may claim our EVM leg. */
+  counterpartyEvmAddress?: string;
+  /** The token WE lock on our EVM leg (native => NATIVE_ETH_ADDRESS). Defaults to offer.evmInfo.tokenAddress. */
+  myEvmToken?: string;
+  /** The token the COUNTERPARTY locked on their EVM leg (the gate binds it). Defaults to offer.evmInfo.tokenAddress. */
+  counterpartyEvmToken?: string;
+  /** The block our own EVM lock mined at — a lower bound for the getLogs Claimed-event scan (watch / refund-race). */
+  evmLockBlock?: number;
 
   // ── funding / timelock durable singletons ────────────────────────────────────────────────────────────
   myFundingTxid?: string;
@@ -201,9 +227,13 @@ export interface SwapControllerDeps {
   /** Liveness/UX only — anti-theft margins anchor to CHAIN time, never this clock (fix #9). */
   clock: () => number;
   scheduler?: Scheduler;
-  // EVM funding is step 7 — these factories may be stubbed / omitted until then.
-  evmProviderFor?: (chain: Chain) => unknown;
-  evmSignerFor?: (chain: Chain) => unknown;
+  // EVM parity (step 7) — the REAL seams. `evmProviderFor` returns the quorum>=2 read Provider the EVM GATE minters
+  // (assertEvmLegBuriedForFunding / assertEvmRevealSafe) verify against + the refund-race Claimed-event corroboration
+  // reads; `evmSignerFor` returns an ethers Signer (a Node `ethers.Wallet` derived from the seed — MetaMask is NOT on
+  // the path, `connectMetaMask` is dead surface) the lock/claim/refund broadcasts sign with. Optional so a UTXO-only
+  // host can omit them; the EVM methods fail closed (throw) if a needed factory is absent.
+  evmProviderFor?: (chain: Chain) => Provider;
+  evmSignerFor?: (chain: Chain) => Signer;
 }
 
 // ============================================================================
@@ -265,6 +295,22 @@ const refundBroadcastKey = (id: string): string => `bch2swap:refundbroadcast:${i
  *  WITH the refundbroadcast sentinel BEFORE the broadcast, so a dropped/reorged refund is rebroadcastable and the
  *  reorg-safe finalizer keeps it until >= reqConf. A signed refund carries NO secret — it is public material. */
 const refundTxKey = (id: string): string => `bch2swap:refundtx:${id}`;
+/** EVM (step 7): the durable recovery marker holding a BROADCAST-but-unconfirmed lock tx hash (R160/R161). Written the
+ *  instant the lock is broadcast (onBroadcast) so a crash between broadcast and the funded-key write is recoverable —
+ *  the EVM lock is irreversible once mined. Cleared once the lock resolves with a known swapId (funded-key set). */
+const lockPendingKey = (id: string): string => `bch2swap:lockpending:${id}`;
+/** EVM (step 7): the live lock tx hash for a UI explorer link (R-EVMLOCKTX). Re-fires with the replacement hash on a
+ *  MetaMask speed-up; a Node signer typically won't, but the seam is kept so the app adapter interops. */
+const evmLockTxKey = (id: string): string => `bch2swap:evmlocktx:${id}`;
+/** EVM (step 7, fix #2): a durable "refund-race recovery is pending" marker. Set when our own EVM lock was already
+ *  CLAIMED by the counterparty (refundSwap reverts) but S is not YET extractable from the on-chain Claimed event
+ *  (a lagging/pruned/transient leaf). While set, a re-called refundEvm RE-ENTERS recovery straight away — it must
+ *  NEVER send a fresh refund and NEVER adopt the refund sentinel as a completed refund (which would strand the
+ *  other leg we are owed). Cleared only once S is recovered + the other leg is claimed. */
+const refundRacePendingKey = (id: string): string => `bch2swap:refundracepending:${id}`;
+/** EVM (step 7, fix #5): the pre-broadcast lockpending marker value written BEFORE lockETH/lockTokens broadcasts so a
+ *  crash between broadcast and the funded-key write is always recoverable; onBroadcast refines it with the real tx hash. */
+const LOCK_PENDING_SENTINEL = 'pending';
 
 function durableHtlc(h: HTLCDetails): DurableHTLC {
   return {
@@ -279,6 +325,17 @@ function durableHtlc(h: HTLCDetails): DurableHTLC {
 
 const HEX20 = /^[0-9a-f]{40}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
+const BYTES32_0X = /^0x[0-9a-fA-F]{64}$/;
+
+/** The quorum leaves behind a Provider (the R224/R278 `__leafProviders` pattern gates.ts uses). A bare Provider with
+ *  no attached leaves is treated as a single leaf — the EVM gates then REFUSE it (leaves.length < 2), so the quorum>=2
+ *  requirement stays structural, not advisory. Reused here for the fix #7 Claimed-event corroboration across leaves. */
+function evmLeaves(provider: Provider): Provider[] {
+  const ls = (provider as unknown as { __leafProviders?: Provider[] }).__leafProviders;
+  return Array.isArray(ls) && ls.length > 0 ? ls : [provider];
+}
+/** One shared Interface for parsing Claimed logs (built from the SAME HTLC_ABI the SUT + mocks use — no ABI drift). */
+const HTLC_IFACE = new ethers.Interface(HTLC_ABI);
 
 // ============================================================================
 // Ported pure helpers (step 6) — the availability + resume decision logic, brought into the SDK from the app so the
@@ -1734,6 +1791,639 @@ export class SwapController {
       }
       return r as DurableHTLC;
     } catch { return null; }
+  }
+
+  // ============================================================================================================
+  // EVM PARITY (P1b step 7) — the EVM fund-critical half: the EVM reveal + the refund-race secret recovery.
+  //
+  // The two GATE minters (assertEvmLegBuriedForFunding quorum>=2 -> FundProof; assertEvmRevealSafe quorum>=2 ->
+  // RevealAuthorization) already exist + are verified in gates.ts; these methods drive them over the injected
+  // quorum>=2 `evmProviderFor` provider and the injected `evmSignerFor` Node ethers.Wallet, and call the proven
+  // on-chain handlers (lockETH/lockTokens/claimSwap/refundSwap) from evm-client.ts. Same three corrections as the
+  // UTXO half: fix #2 (RE-MINT the gate FRESH at the broadcast choke point — never trust the passed proof's
+  // captured values), fix #4 (durable-before-broadcast), fix #10 (assertIrreversibleAllowed on every irreversible
+  // broadcast). PLUS fix #7 (the refund-race Claimed-event recovery corroborated across quorum>=2 leaves).
+  // ============================================================================================================
+
+  // ── EVM seams + small resolvers ──────────────────────────────────────────────────────────────────────────
+
+  /** The injected quorum>=2 EVM read Provider for `chain` (the EVM GATE surface). Fail closed if not injected. */
+  private evmProvider(chain: Chain): Provider {
+    if (!this.deps.evmProviderFor) throw new Error('EVM provider factory (evmProviderFor) is not injected — cannot run the EVM leg');
+    return this.deps.evmProviderFor(chain);
+  }
+  /** The injected EVM Signer (a Node ethers.Wallet from the seed) for `chain`. Fail closed if not injected. */
+  private evmSigner(chain: Chain): Signer {
+    if (!this.deps.evmSignerFor) throw new Error('EVM signer factory (evmSignerFor) is not injected — cannot sign the EVM leg');
+    return this.deps.evmSignerFor(chain);
+  }
+
+  /** Resolve `chain` -> its numeric EvmChainId + the canonical EVM config (htlcAddress, requiredConfirmations, lock
+   *  bounds). Fail closed if `chain` is not an EVM chain or has no deployed config. */
+  private evmCfgFor(chain: Chain): { evmChainId: EvmChainId; cfg: EvmChainConfig; htlcAddr: string } {
+    const cc = chainConfigs[chain] as { isEvm?: boolean; evmChainId?: number } | undefined;
+    if (!cc || !cc.isEvm || !Number.isInteger(cc.evmChainId)) {
+      throw new Error(`EVM leg: chain '${chain}' is not an EVM chain — cannot run the EVM path`);
+    }
+    const evmChainId = cc.evmChainId as EvmChainId;
+    const cfg = getEvmConfig(evmChainId);
+    if (!cfg) throw new Error(`EVM leg: no EVM config for chain '${chain}' (chainId ${evmChainId})`);
+    const htlcAddr = cfg.htlcAddress;
+    if (!/^0x[0-9a-fA-F]{40}$/.test(htlcAddr) || htlcAddr.toLowerCase() === NATIVE_ETH_ADDR) {
+      throw new Error(`EVM leg: no deployed HTLC contract for chain '${chain}' (chainId ${evmChainId})`);
+    }
+    return { evmChainId, cfg, htlcAddr };
+  }
+
+  /** FIX #10 §5(#10): carry EVM amounts as base-unit strings — never `Number()` an 18-dec (wei) value. Accept a
+   *  decimal-integer base-unit string (canonical) or a legacy safe-integer number; throw on anything else. */
+  private evmAmountBaseUnits(raw: string | number | undefined, label: string): bigint {
+    if (typeof raw === 'number') {
+      if (!Number.isSafeInteger(raw) || raw <= 0) throw new Error(`${label}: invalid EVM amount '${String(raw)}'`);
+      return BigInt(raw);
+    }
+    const s = (raw ?? '').trim();
+    if (!/^[0-9]+$/.test(s)) {
+      throw new Error(`${label}: EVM amount '${String(raw)}' is not an integer base-unit string — refusing (fix #10: never Number() an 18-dec value)`);
+    }
+    const b = BigInt(s);
+    if (b <= 0n) throw new Error(`${label}: EVM amount must be > 0 (got ${s})`);
+    return b;
+  }
+
+  /** The offer secretHash as a 0x-prefixed bytes32 (the on-chain hashLock). Fail closed if malformed. */
+  private hashLock0x(label: string): string {
+    const h = (this.record.offer.secretHash ?? '').toLowerCase().replace(/^0x/, '');
+    if (!HEX64.test(h)) throw new Error(`${label}: offer.secretHash is not a 32-byte hex hash — cannot bind the EVM hashLock`);
+    return '0x' + h;
+  }
+
+  /** Resolve the COUNTERPARTY EVM leg (the leg WE verify/claim on theirChain): htlc addr, swapId, requiredConfirmations,
+   *  hashLock, the recipient (= OUR EVM address, who may claim it), minAmount (what we receive), and its token. */
+  private counterpartyEvmLeg(label: string): {
+    evmChainId: EvmChainId; htlcAddr: string; requiredConfirmations: number; swapId: string;
+    hashLock: string; recipient: string; minAmount: bigint; token: string;
+  } {
+    const { evmChainId, cfg, htlcAddr } = this.evmCfgFor(this.theirChain);
+    const swapId = (this.record.counterpartyEvmSwapId ?? '').toLowerCase();
+    if (!BYTES32_0X.test(swapId)) throw new Error(`${label}: no valid counterparty EVM swapId recorded — cannot verify/claim the EVM leg`);
+    const recipient = (this.record.myEvmAddress ?? '');
+    if (!ethers.isAddress(recipient)) throw new Error(`${label}: our EVM address (myEvmAddress) is missing/invalid — cannot bind the claim recipient`);
+    const token = (this.record.counterpartyEvmToken ?? this.record.offer.evmInfo?.tokenAddress ?? '');
+    if (!ethers.isAddress(token)) throw new Error(`${label}: counterparty EVM token address is missing/invalid — cannot bind the token`);
+    // What WE receive from the counterparty leg: initiator claims leg Y (offer.receiveAmount); responder claims leg X
+    // (offer.sendAmount). The gate binds `minAmount` so we never reveal/commit against an under-funded lock.
+    const rawAmt = this.role === 'initiator' ? this.record.offer.receiveAmount : this.record.offer.sendAmount;
+    const minAmount = this.evmAmountBaseUnits(rawAmt, label);
+    return {
+      evmChainId, htlcAddr, requiredConfirmations: Math.max(1, cfg.requiredConfirmations),
+      swapId, hashLock: this.hashLock0x(label), recipient, minAmount, token,
+    };
+  }
+
+  // ── (1) verifyEvmCounterpartyLegForFunding -> FundProof (responder-only) ──────────────────────────────────
+
+  /**
+   * RESPONDER-ONLY. Mint a `FundProof` by proving the counterparty (initiator) EVM leg is locked at a reorg-safe
+   * depth with all invariants bound (gates.assertEvmLegBuriedForFunding over the injected quorum>=2 provider). The
+   * ONLY controller-side minter of an EVM `FundProof`. Grounds in verifyEvmCounterpartyHTLC (SwapExecute.tsx
+   * ~3055-3460): the responder-fund gate re-asserts DEPTH + {hashLock, recipient, minAmount, minTimeLock, token} and
+   * fails closed (quorum>=2) before the responder commits its own leg. Returns the branded proof or THROWS
+   * (mints nothing) — including refusing a single-leaf provider (fix #7/#1, done inside the gate).
+   */
+  async verifyEvmCounterpartyLegForFunding(): Promise<FundProof> {
+    this.assertLive();
+    if (this.record.role !== 'responder') {
+      throw new Error('verifyEvmCounterpartyLegForFunding: responder-only (the initiator does not fund against a FundProof)');
+    }
+    const leg = this.counterpartyEvmLeg('verifyEvmCounterpartyLegForFunding');
+    const provider = this.evmProvider(this.theirChain); // the counterparty EVM leg lives on theirChain
+    return assertEvmLegBuriedForFunding(provider, {
+      chain: this.theirChain,
+      htlcAddr: leg.htlcAddr,
+      swapId: leg.swapId,
+      requiredConfirmations: leg.requiredConfirmations,
+      hashLock: leg.hashLock,
+      recipient: leg.recipient,
+      minAmount: leg.minAmount,
+      token: leg.token,
+    });
+  }
+
+  // ── (2) verifyEvmCounterpartyLegForReveal -> RevealAuthorization (initiator-only) ─────────────────────────
+
+  /**
+   * INITIATOR-ONLY. Mint a `RevealAuthorization` by proving the counterparty (responder) EVM leg is at a reorg-safe
+   * depth AND keeps >= 4h (EVM_CLAIM_MARGIN_SEC) runway on its FRESH on-chain timeLock (gates.assertEvmRevealSafe,
+   * quorum>=2). The ONLY controller-side minter of an EVM `RevealAuthorization`. Grounds in handleEvmClaim gate #2 +
+   * the R258/R260/R261/R278 margin re-check (SwapExecute.tsx ~2128-2258). Returns the branded auth or THROWS — the
+   * secret NEVER leaks on any failure (this only READS the chain; it does not touch the secret).
+   */
+  async verifyEvmCounterpartyLegForReveal(): Promise<RevealAuthorization> {
+    this.assertLive();
+    if (this.record.role !== 'initiator') {
+      throw new Error('verifyEvmCounterpartyLegForReveal: initiator-only (only the initiator makes the irreversible secret reveal)');
+    }
+    const leg = this.counterpartyEvmLeg('verifyEvmCounterpartyLegForReveal');
+    const provider = this.evmProvider(this.theirChain);
+    return assertEvmRevealSafe(provider, {
+      chain: this.theirChain,
+      htlcAddr: leg.htlcAddr,
+      swapId: leg.swapId,
+      requiredConfirmations: leg.requiredConfirmations,
+      hashLock: leg.hashLock,
+      recipient: leg.recipient,
+      minAmount: leg.minAmount,
+      token: leg.token,
+    });
+  }
+
+  /** FIX #2 re-mint used by lockEvm at the broadcast choke point: re-prove the counterparty leg is buried FRESH. Uses
+   *  the EVM gate when the counterparty leg is EVM, else the UTXO gate — either throws (aborting the lock) on any doubt. */
+  private async reverifyCounterpartyLegForFunding(): Promise<void> {
+    const theirIsEvm = !!(chainConfigs[this.theirChain] as { isEvm?: boolean } | undefined)?.isEvm;
+    if (theirIsEvm) { await this.verifyEvmCounterpartyLegForFunding(); }
+    else { await this.verifyCounterpartyLegForFunding(); }
+  }
+
+  // ── (3) lockEvm(proof) — lock OUR OWN EVM leg (responder/initiator) ───────────────────────────────────────
+
+  /**
+   * Lock OUR OWN EVM leg (lockETH or lockTokens per isNativeToken) with the injected Node signer. STRUCTURALLY
+   * requires a `FundProof` (compile-time — the two brands are non-interchangeable, fix #1). Grounds in handleEvmFund
+   * (SwapExecute.tsx ~1089-1360).
+   *   FIX #2 (zero proof-reuse window): inside the fund mutex, at the choke point, RE-MINT the counterparty-leg burial
+   *     FRESH (assertEvmLegBuriedForFunding) — never the passed proof's captured values. A fresh throw ABORTS before
+   *     any lock tx is broadcast.
+   *   FIX #4 (durable-before-broadcast): the lockpending + evmlocktx recovery markers are committed durably in the
+   *     lock's onBroadcast callback — the instant the tx is broadcast (before it mines) — because the EVM lock is
+   *     irreversible once mined; the funded=swapId sentinel is committed the moment the lock resolves with its id.
+   *   FIX #10: gated by assertIrreversibleAllowed. Single-flight (fix #3) under mutex.withLock; a prior funded swapId
+   *     is ADOPTED rather than re-locked (a second on-chain lock would strand a fresh per-nonce swapId). Handles the
+   *     onBroadcast-replacement hash (a MetaMask speed-up; a Node signer typically won't) by capturing the final hash.
+   */
+  async lockEvm(proof: FundProof): Promise<{ swapId: string; txHash: string }> {
+    this.assertLive();
+    const rec = this.record;
+    // `proof` is required at the TYPE level (safe-by-default). Its captured facts may only ever FAIL a lock, never
+    // license skipping the fresh re-mint below (fix #2) — a structural brand touch keeps it load-bearing.
+    if (proof.leg !== 'X' || proof.for !== 'fundY') {
+      throw new Error('lockEvm: the supplied FundProof is not a leg-X fund authorization — refusing to lock');
+    }
+    this.assertIrreversibleAllowed('lockEvm'); // fix #10
+    if (rec.phase !== 'taken' && rec.phase !== 'prepared') {
+      throw new Error(`lockEvm: unexpected phase '${rec.phase}' — the EVM lock runs from 'taken' or 'prepared'`);
+    }
+    if (isSwapPairSuspended(this.myChain, this.theirChain)) {
+      throw new Error(`lockEvm: swap pair ${this.myChain}/${this.theirChain} is suspended — refusing to lock`);
+    }
+    const { evmChainId, cfg, htlcAddr } = this.evmCfgFor(this.myChain); // our own EVM leg lives on myChain
+    const recipient = (rec.counterpartyEvmAddress ?? '');
+    if (!ethers.isAddress(recipient)) throw new Error('lockEvm: counterparty EVM recipient address (counterpartyEvmAddress) is missing/invalid — cannot lock');
+    const token = (rec.myEvmToken ?? rec.offer.evmInfo?.tokenAddress ?? '');
+    if (!ethers.isAddress(token)) throw new Error('lockEvm: our EVM token address is missing/invalid — cannot lock');
+    // OUR leg amount: initiator locks offer.sendAmount, responder locks offer.receiveAmount (base units).
+    const amount = this.evmAmountBaseUnits(this.role === 'initiator' ? rec.offer.sendAmount : rec.offer.receiveAmount, 'lockEvm');
+    const hashLock = this.hashLock0x('lockEvm');
+    const signer = this.evmSigner(this.myChain);
+    const targetPhase: 'initiator_funded' | 'responder_funded' = this.role === 'initiator' ? 'initiator_funded' : 'responder_funded';
+
+    const lockName = `bch2swap:fund:${rec.id}`;
+    const outcome = await this.deps.mutex.withLock(lockName, async (): Promise<{ swapId: string; txHash: string; adopted: boolean }> => {
+      // Adopt a prior on-chain lock (the durable funded sentinel holds the bytes32 swapId) rather than double-locking.
+      const prior = (await this.deps.durable.get(fundedKey(rec.id)))?.toLowerCase();
+      if (prior && BYTES32_0X.test(prior)) return { swapId: prior, txHash: '', adopted: true };
+
+      // FIX #2: re-mint the counterparty-leg burial FRESH at the broadcast choke point. A throw ABORTS the lock.
+      this.status('lockEvm:reverifying-counterparty');
+      await this.reverifyCounterpartyLegForFunding();
+
+      // The unix-timestamp timeLock is derived from the FRESH on-chain block clock (never the local clock) + the
+      // role's wall-clock-normalized lock duration (evmLockSecondsForRole) — mirrors handleEvmFund ~1416-1460.
+      let nowSec: number | null = null;
+      try {
+        const b = await (signer.provider as Provider | null)?.getBlock('latest');
+        if (b && Number.isFinite(b.timestamp)) nowSec = Number(b.timestamp);
+      } catch { nowSec = null; }
+      if (nowSec === null) throw new Error('lockEvm: could not read the EVM chain clock to set the lock timeLock — not locking; retry');
+      const timeLock = BigInt(nowSec + evmLockSecondsForRole(cfg, this.role));
+
+      // FIX #5 (durable-before-broadcast): write the lockpending recovery marker BEFORE the irreversible lock
+      // broadcast — committed + AWAITED — so a commit failure ABORTS the lock (funds never move without a durable
+      // recovery record). The EXACT tx hash is not known until broadcast, so this pre-broadcast marker is a sentinel;
+      // onBroadcast refines it with the real hash below. A commit throw here aborts BEFORE any lock tx is broadcast.
+      this.status('lockEvm:committing-recovery-marker');
+      await this.deps.durable.commit([[lockPendingKey(rec.id), LOCK_PENDING_SENTINEL]]);
+
+      // FIX #5: record the recovery markers the INSTANT the lock is broadcast (onBroadcast fires before the tx mines).
+      // The commit is tracked + AWAITED after the lock resolves (below) instead of being fire-and-forget — the
+      // pre-broadcast marker above already guarantees recoverability, so this real-hash refinement is best-effort and
+      // must NOT fail an already-broadcast lock. A Node signer won't fire a replacement; a speed-up re-fires the hash.
+      let finalHash = '';
+      let onBroadcastCommit: Promise<void> | null = null;
+      const onBroadcast = (h: string): void => {
+        finalHash = h;
+        onBroadcastCommit = this.deps.durable.commit([[lockPendingKey(rec.id), h], [evmLockTxKey(rec.id), h]]);
+      };
+
+      this.status('lockEvm:broadcasting');
+      const swapId = isNativeToken(token)
+        ? await lockETH(htlcAddr, recipient, amount, hashLock, timeLock, signer, evmChainId, onBroadcast)
+        : await lockTokens(htlcAddr, recipient, token, amount, hashLock, timeLock, signer, evmChainId, onBroadcast);
+      // Await the real-hash marker refinement (no longer fire-and-forget). Best-effort: the lock is already broadcast,
+      // so a failure here must not throw — the pre-broadcast sentinel keeps the swap recoverable regardless.
+      if (onBroadcastCommit) { try { await onBroadcastCommit; } catch { /* best-effort real-hash refinement */ } }
+
+      // The lock mined with a known swapId: commit funded=swapId (durable single-flight sentinel) + clear lockpending.
+      await this.deps.durable.commit([[fundedKey(rec.id), swapId.toLowerCase()]]);
+      await this.deps.durable.remove(lockPendingKey(rec.id));
+      return { swapId, txHash: finalHash, adopted: false };
+    });
+
+    this.record = { ...this.record, myEvmSwapId: outcome.swapId, myFundingTxid: outcome.swapId, funded: true };
+    this.setPhase(targetPhase);
+    this.status('lockEvm:locked');
+    await this.persistRecord();
+    return { swapId: outcome.swapId, txHash: outcome.txHash };
+  }
+
+  // ── (4) revealAndClaimEvm(auth) — the INITIATOR reveals S by claiming the counterparty EVM leg ────────────
+
+  /**
+   * The initiator's ONE irreversible EVM action: reveal S by claiming the counterparty (responder) EVM leg with S in
+   * the claim calldata (evmClaimSwap = claimSwap). STRUCTURALLY requires a `RevealAuthorization` (compile-time).
+   * Grounds in handleEvmClaim (SwapExecute.tsx ~2128-2430).
+   *   FIX #3: throw unless `auth.role === 'initiator'` — a margin-skipped responder authorization must NEVER drive the
+   *     initiator's reveal.
+   *   FIX #2: inside the claim mutex at the broadcast choke point, RE-MINT assertEvmRevealSafe FRESH (quorum>=2 depth +
+   *     the 4h margin re-derived from the FRESH on-chain timeLock) — never the passed auth's captured values. A throw
+   *     ABORTS; S is never sent. (claimSwap itself also re-checks sha256(S)===hashLock + expiry + recipient before it
+   *     broadcasts, so S never reaches calldata on a bad claim — defense in depth.)
+   *   FIX #4: a durable `claimbroadcast` sentinel is committed BEFORE the secret-revealing claim; a second call /
+   *     crash-resume ADOPTS instead of re-revealing. FIX #10: gated by assertIrreversibleAllowed. R181 cross-guard:
+   *     refuses to reveal while a refund is in flight. Transitions `responder_funded -> claimed`.
+   */
+  async revealAndClaimEvm(auth: RevealAuthorization): Promise<{ txHash: string }> {
+    this.assertLive();
+    const rec = this.record;
+    if (rec.role !== 'initiator') {
+      throw new Error('revealAndClaimEvm: only the initiator reveals the secret (the responder uses watchForClaimEvm/claimWithKnownSecret)');
+    }
+    // FIX #3: a responder-role authorization (which SKIPS the 4h claim margin) must never drive the initiator's reveal.
+    if (auth.role !== 'initiator' || auth.leg !== 'Y' || auth.for !== 'reveal') {
+      throw new Error('revealAndClaimEvm: the supplied authorization is not an initiator leg-Y reveal authorization — refusing to reveal the secret (fix #3)');
+    }
+    // Idempotent adopt: a crash-resume / second call after the claimbroadcast sentinel is set reveals nothing new.
+    if (await this.deps.durable.get(claimBroadcastKey(rec.id))) {
+      this.status('revealAndClaimEvm:adopted');
+      return { txHash: (rec.myClaimTxid ?? '') };
+    }
+    this.assertIrreversibleAllowed('revealAndClaimEvm'); // fix #10
+    if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
+      throw new Error('revealAndClaimEvm: a refund is already in flight — refusing to reveal the secret (R181 cross-guard)');
+    }
+    if (rec.phase !== 'responder_funded' && rec.phase !== 'claimed') {
+      throw new Error(`revealAndClaimEvm: unexpected phase '${rec.phase}' — reveal runs from 'responder_funded'`);
+    }
+    const leg = this.counterpartyEvmLeg('revealAndClaimEvm');
+    const secret = await this.loadInitiatorSecret();
+    if (!secret || secret.length !== 32) {
+      throw new Error('revealAndClaimEvm: the swap secret is not available (vault locked / not re-derivable) — cannot reveal');
+    }
+    const provider = this.evmProvider(this.theirChain);
+    const signer = this.evmSigner(this.theirChain);
+
+    const lockName = `bch2swap:claim:${rec.id}`;
+    const result = await this.deps.mutex.withLock(lockName, async (): Promise<{ swapId: string }> => {
+      // Single-flight adopt inside the lock.
+      if (await this.deps.durable.get(claimBroadcastKey(rec.id))) return { swapId: leg.swapId };
+      // R181 re-check inside the lock (a refund could have raced in).
+      if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
+        throw new Error('revealAndClaimEvm: a refund became active — refusing to reveal the secret');
+      }
+      // FIX #2: RE-MINT the reveal authorization from a FRESH read (quorum>=2 depth + 4h margin off the FRESH on-chain
+      // timeLock). A throw ABORTS here — S is never broadcast.
+      this.status('revealAndClaimEvm:reverifying');
+      await assertEvmRevealSafe(provider, {
+        chain: this.theirChain, htlcAddr: leg.htlcAddr, swapId: leg.swapId,
+        requiredConfirmations: leg.requiredConfirmations, hashLock: leg.hashLock,
+        recipient: leg.recipient, minAmount: leg.minAmount, token: leg.token,
+      });
+      // Durable-before-broadcast (fix #4): set the winning-claim sentinel BEFORE the secret-revealing claim.
+      this.status('revealAndClaimEvm:committing');
+      await this.deps.durable.commit([[claimBroadcastKey(rec.id), '1']]);
+      // Reveal S. Pass a COPY — claimSwap zeroes its input buffer at submit, and we must not wipe our in-memory S
+      // (the responder-side / finalizer paths still need it until the claim is reorg-safe). FIX #3: a PRE-broadcast
+      // claimSwap throw (pre-flight getSwap/getBlock/timeout/chain-mismatch — no secret revealed) CLEARS the sentinel
+      // we just set so a retry can re-arm; a post-broadcast/ambiguous failure LEAVES it set (R201 fail-safe).
+      this.status('revealAndClaimEvm:broadcasting');
+      await this.claimEvmWithSentinelGuard(leg.htlcAddr, leg.swapId, secret.slice(), signer, leg.evmChainId);
+      return { swapId: leg.swapId };
+    });
+
+    // claimSwap surfaces { blockNumber }, not a tx hash, so we key the durable claim identity off the swapId.
+    this.record = { ...this.record, myClaimTxid: result.swapId };
+    this.setPhase('claimed');
+    this.status('revealAndClaimEvm:claimed');
+    await this.persistRecord();
+    return { txHash: result.swapId };
+  }
+
+  // ── (5) refundEvm() — refund OUR OWN EVM lock, with the refund-race secret-recovery pivot (fix #7) ─────────
+
+  /**
+   * Refund OUR OWN EVM lock (evmRefundSwap = refundSwap) after its timelock. §9.7: reachable after expiry (suspension
+   * never gates a refund). A durable `refundbroadcast` sentinel is committed BEFORE the send (durable-before-broadcast)
+   * under the shared claim/refund single-flight lock, so a claim and a refund can never race.
+   *
+   * THE REFUND-RACE PIVOT (fund-loss-critical, fix #7): if refundSwap REVERTS because the counterparty ALREADY CLAIMED
+   * our lock (took it with S), we do NOT treat that as a plain error. S is now PUBLIC in the on-chain `Claimed` event,
+   * so we RECOVER it — corroborated across quorum>=2 leaves (never conclude "safe to abandon" while an honest leaf may
+   * still yield S), verify sha256(S)===hashLock (the authenticator), and use S to CLAIM the OTHER (counterparty) leg so
+   * we are made whole. Grounds in the 'already claimed' branch (SwapExecute.tsx:2423) + watchForClaim/watchAndRefund.
+   */
+  async refundEvm(): Promise<{ txHash: string }> {
+    this.assertLive();
+    const rec = this.record;
+    const { evmChainId, htlcAddr } = this.evmCfgFor(this.myChain); // our own EVM leg lives on myChain
+    void evmChainId;
+    const swapId = (rec.myEvmSwapId ?? '').toLowerCase();
+    if (!BYTES32_0X.test(swapId)) throw new Error('refundEvm: no valid own EVM swapId (myEvmSwapId) recorded — nothing to refund');
+    this.assertIrreversibleAllowed('refundEvm'); // fix #10
+    // FIX #2: if a refund-race recovery is already pending (our lock was CLAIMED, S not yet extractable), RE-ENTER
+    // recovery straight away — never send a fresh refund, and never let the refund sentinel be adopted as a completed
+    // refund below (which would strand the other leg we are owed). Cleared only once S is recovered + that leg claimed.
+    if (await this.deps.durable.get(refundRacePendingKey(rec.id))) {
+      this.status('refundEvm:refund-race-pending');
+      return await this.recoverFromRefundRace(htlcAddr, swapId);
+    }
+    // R181 cross-guard (pre-check; re-checked inside the shared lock): never refund while OUR claim is in flight.
+    if (await this.deps.durable.get(claimBroadcastKey(rec.id))) {
+      throw new Error('refundEvm: a claim is already in flight — refusing to refund while a claim is active (R181 cross-guard)');
+    }
+    const signer = this.evmSigner(this.myChain);
+    const lockName = `bch2swap:claim:${rec.id}`;
+    let outcome: { refunded: boolean };
+    try {
+      outcome = await this.deps.mutex.withLock(lockName, async (): Promise<{ refunded: boolean }> => {
+        // Adopt a prior refund (already broadcast) rather than double-broadcasting — but FIX #4: only FINALIZE as
+        // 'refunded' if it actually refunded ON-CHAIN. An unconfirmed / dropped prior refund must NOT be reported as
+        // a completed refund (getSwap.refunded is the trust anchor; fail-closed to not-refunded on any read error).
+        if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
+          return { refunded: await this.evmSwapIsRefunded(signer.provider as Provider | null, htlcAddr, swapId) };
+        }
+        if (await this.deps.durable.get(claimBroadcastKey(rec.id))) {
+          throw new Error('refundEvm: a claim became active — refusing to refund');
+        }
+        // Durable-before-broadcast (§9.7): set the refundbroadcast sentinel BEFORE the send. refundSwap re-checks the
+        // timelock/initiator/claimed state on-chain and RETURNS ONLY on a CONFIRMED refund (receipt.status===1) — else
+        // it THROWS. So reaching the return below means the refund is genuinely confirmed (fix #4).
+        this.status('refundEvm:committing');
+        await this.deps.durable.commit([[refundBroadcastKey(rec.id), '1']]);
+        this.status('refundEvm:broadcasting');
+        await refundSwap(htlcAddr, swapId, signer);
+        return { refunded: true };
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // THE PIVOT (fix #7 parity, R184): the refund reverted because the counterparty already CLAIMED our lock (S is
+      // now public on-chain). Widened to match the contract-revert claim signals ('claimed before refund' / 'secret
+      // is on-chain') as well as the pre-flight 'already claimed' / 'was claimed'.
+      if (/already claimed|was claimed|claimed before refund|secret is on-chain/i.test(msg)) {
+        return await this.recoverFromRefundRace(htlcAddr, swapId);
+      }
+      // A definitively-no-funds-moved failure — clear the sentinel we set so a later retry can re-arm. Covers the
+      // PRE-broadcast reverts (not refundable yet / not ours / already refunded / unreadable clock) AND (fix #4) the
+      // definitive post-broadcast no-funds-moved outcomes: a 'dropped from mempool' refund (never landed) and the
+      // contract-revert 'timelock may not have expired'. An AMBIGUOUS post-broadcast failure is left SET (fail-safe).
+      if (/not found|not the HTLC initiator|already refunded|Timelock has not expired|timelock may not have expired|dropped from mempool|not a plausible unix|timeLock is zero|could not read latest block/i.test(msg)) {
+        try { await this.deps.durable.remove(refundBroadcastKey(rec.id)); } catch { /* best-effort */ }
+      }
+      throw e;
+    }
+    // FIX #4: transition to 'refunded' ONLY after a CONFIRMED refund (a fresh confirmed one above, or an adopt that
+    // getSwap confirmed on-chain). An adopted-but-unconfirmed prior refund leaves the phase untouched (the reorg-safe
+    // finalizer / resume reconcile it) so we never falsely mark 'refunded'.
+    if (outcome.refunded) {
+      this.setPhase('refunded');
+      this.status('refundEvm:broadcast');
+    } else {
+      this.status('refundEvm:refund-pending');
+    }
+    await this.persistRecord();
+    return { txHash: swapId };
+  }
+
+  /** Best-effort on-chain check used by refundEvm's adopt path (fix #4): is OUR own EVM swap actually REFUNDED? Reads
+   *  getSwap over the given provider and returns `!!swap.refunded`; fail-closed to `false` on any read error / missing
+   *  provider (a not-yet-confirmed / dropped refund must never be finalized as a completed 'refunded'). */
+  private async evmSwapIsRefunded(provider: Provider | null, htlcAddr: string, swapId: string): Promise<boolean> {
+    if (!provider) return false;
+    try { const sw = await getSwap(htlcAddr, swapId, provider); return !!sw?.refunded; }
+    catch { return false; }
+  }
+
+  /** Broadcast an EVM claim, clearing the durable claimbroadcast sentinel ONLY on a PRE-broadcast throw (claimSwap tags
+   *  pre-flight failures `preBroadcast:true` — no secret revealed), so a later call re-arms instead of adopting a
+   *  never-broadcast claim (fix #3). A POST-broadcast / ambiguous failure LEAVES the sentinel set (R201 fail-safe). */
+  private async claimEvmWithSentinelGuard(htlcAddr: string, swapId: string, secret: Uint8Array, signer: Signer, chainId: EvmChainId): Promise<void> {
+    try {
+      await claimSwap(htlcAddr, swapId, secret, signer, chainId);
+    } catch (e) {
+      if ((e as { preBroadcast?: boolean } | null)?.preBroadcast === true) {
+        try { await this.deps.durable.remove(claimBroadcastKey(this.record.id)); } catch { /* best-effort */ }
+      }
+      throw e;
+    }
+  }
+
+  /**
+   * THE REFUND-RACE PIVOT body (fix #7). Recover S from OUR OWN EVM lock's on-chain `Claimed` event, corroborated
+   * across quorum>=2 leaves, verify sha256(S)===hashLock, then claim the OTHER (counterparty) leg with the now-public
+   * S so we are made whole. If S is not YET extractable (a lagging/pruned leaf), we KEEP the refund sentinel and throw
+   * a RETRYABLE error — never conclude "safe to abandon" while S may still be extractable from an honest leaf.
+   */
+  private async recoverFromRefundRace(myHtlcAddr: string, mySwapId: string): Promise<{ txHash: string }> {
+    const rec = this.record;
+    const hashLockHex = (rec.offer.secretHash ?? '').toLowerCase().replace(/^0x/, '');
+    const provider = this.evmProvider(this.myChain); // quorum>=2 read of OUR own EVM lock's Claimed event (fix #7)
+    this.status('refundEvm:recovering-secret');
+    const recovered = await this.readEvmClaimedSecret(provider, myHtlcAddr, mySwapId, hashLockHex);
+    if (!recovered) {
+      // Do NOT abandon while S may still be extractable — keep the refund sentinel AND set a durable refund-race
+      // pending marker (fix #2) so a LATER refundEvm re-call RE-ENTERS this recovery instead of adopting the refund
+      // sentinel as a completed refund / sending a fresh refund. Then surface a retryable error.
+      try { await this.deps.durable.set(refundRacePendingKey(rec.id), '1'); } catch { /* best-effort */ }
+      throw new Error('refundEvm: our EVM lock was already claimed but S is not yet corroborated from the on-chain Claimed event (quorum>=2) — retry; never abandon while S may still be recoverable from an honest leaf (fix #7)');
+    }
+    // Belt-and-suspenders: re-verify the authenticator before using S.
+    if (bytesToHex(sha256(recovered)) !== hashLockHex) {
+      recovered.fill(0);
+      throw new Error('refundEvm: recovered preimage does not hash to the swap secretHash — fail closed');
+    }
+    if (this.secret) this.secret.fill(0);
+    this.secret = recovered;
+    // The refund did NOT execute (the counterparty took our lock) — clear the refund sentinel so the claim below is not
+    // blocked by the claim<->refund cross-guard.
+    try { await this.deps.durable.remove(refundBroadcastKey(rec.id)); } catch { /* best-effort */ }
+    this.status('refundEvm:claiming-other-leg');
+    // Claim the OTHER (counterparty) leg with the now-PUBLIC secret so we are made whole. UTXO leg -> the proven
+    // claimWithKnownSecret path (single-flight + durable + reveal-margin-skipped, S already public); EVM leg -> claim
+    // the counterparty EVM lock directly with the public S.
+    const theirIsEvm = !!(chainConfigs[this.theirChain] as { isEvm?: boolean } | undefined)?.isEvm;
+    const result = theirIsEvm
+      ? await this.claimEvmCounterpartyWithPublicSecret()
+      : { txHash: (await this.claimWithKnownSecret()).txid };
+    // FIX #2: S recovered + the other leg claimed -> clear the refund-race pending marker (recovery is complete).
+    try { await this.deps.durable.remove(refundRacePendingKey(rec.id)); } catch { /* best-effort */ }
+    return result;
+  }
+
+  /** Claim the COUNTERPARTY EVM leg with the now-PUBLIC secret (the refund-race pivot's EVM<->EVM branch). No reveal
+   *  margin gate (the secret is already public — no double-dip race), but the durable claimbroadcast sentinel + the
+   *  single-flight lock still apply. Uses claimSwap (which re-checks sha256(S)===hashLock + recipient on-chain). */
+  private async claimEvmCounterpartyWithPublicSecret(): Promise<{ txHash: string }> {
+    const rec = this.record;
+    const secret = this.secret;
+    if (!secret || secret.length !== 32) throw new Error('claimEvmCounterpartyWithPublicSecret: the public secret is not available');
+    const leg = this.counterpartyEvmLeg('claimEvmCounterpartyWithPublicSecret');
+    const signer = this.evmSigner(this.theirChain);
+    const lockName = `bch2swap:claim:${rec.id}`;
+    const result = await this.deps.mutex.withLock(lockName, async (): Promise<{ swapId: string }> => {
+      if (await this.deps.durable.get(claimBroadcastKey(rec.id))) return { swapId: leg.swapId };
+      await this.deps.durable.commit([[claimBroadcastKey(rec.id), '1']]);
+      // FIX #3: a PRE-broadcast claimSwap throw clears the sentinel we just set so a retry re-arms (the secret is
+      // already public here, so no double-dip risk); a post-broadcast/ambiguous failure leaves it set (R201).
+      await this.claimEvmWithSentinelGuard(leg.htlcAddr, leg.swapId, secret.slice(), signer, leg.evmChainId);
+      return { swapId: leg.swapId };
+    });
+    this.record = { ...this.record, myClaimTxid: result.swapId };
+    this.setPhase('completed');
+    this.status('refundEvm:made-whole');
+    await this.persistRecord();
+    return { txHash: result.swapId };
+  }
+
+  // ── (6) watchForClaimEvm() — the RESPONDER watches its OWN EVM lock for the initiator's claim ──────────────
+
+  /**
+   * RESPONDER-ONLY. Watch OUR OWN EVM lock (myEvmSwapId) for the initiator's `Claimed` event, EXTRACT + VERIFY S
+   * (sha256(S)===hashLock — the authenticator, so a quorum>=1 hash-verified liveness read is acceptable here per
+   * R-POLYHIST), and SAVE it. Grounds in handleEvmFund's responder watch (watchForClaim, SwapExecute.tsx ~1250-1310).
+   * A single scheduler-driven scan: NEVER throws on absence (returns `{secret:null}`); a forged/mismatched preimage is
+   * REJECTED (the hash check). On discovery, transitions `responder_funded -> claimed`.
+   */
+  async watchForClaimEvm(): Promise<{ secret: Uint8Array | null }> {
+    this.assertLive();
+    const rec = this.record;
+    if (rec.role !== 'responder') {
+      throw new Error('watchForClaimEvm: responder-only (the initiator holds S from prepare())');
+    }
+    const swapId = (rec.myEvmSwapId ?? '').toLowerCase();
+    if (!BYTES32_0X.test(swapId)) return { secret: null }; // not locked yet — nothing to watch (never throw on absence)
+    const hashLockHex = (rec.offer.secretHash ?? '').toLowerCase().replace(/^0x/, '');
+    if (!HEX64.test(hashLockHex)) return { secret: null };
+    let htlcAddr: string;
+    let provider: Provider;
+    try { htlcAddr = this.evmCfgFor(this.myChain).htlcAddr; provider = this.evmProvider(this.myChain); }
+    catch { return { secret: null }; } // misconfig / no provider — do not throw; the scheduler re-polls
+    // quorum>=1 acceptable: the sha256(S)===hashLock check IS the authenticator (a lying leaf cannot fabricate an S
+    // that hashes to our hashLock). readEvmClaimedSecret returns the first hash-verified S from ANY leaf.
+    let secret: Uint8Array | null;
+    try { secret = await this.readEvmClaimedSecret(provider, htlcAddr, swapId, hashLockHex); }
+    catch { return { secret: null }; } // transient read error — never throw on absence; the scheduler re-polls
+    if (!secret) return { secret: null };
+    if (this.secret) this.secret.fill(0);
+    this.secret = secret;
+    if (rec.phase === 'responder_funded') this.setPhase('claimed');
+    this.status('watchForClaimEvm:secret-found');
+    await this.persistRecord();
+    return { secret };
+  }
+
+  /**
+   * Read + hash-VERIFY the preimage S from a `Claimed` event on the given EVM swapId, corroborated across the
+   * provider's quorum leaves. Returns the FIRST S from ANY leaf whose sha256 equals `hashLockHex` (the authenticator —
+   * so a single honest leaf is sufficient to TRUST the value), else null. The hash check makes a forged/foreign
+   * Claimed log unusable (fund-safe), and reading every leaf means a lagging/pruned leaf never falsely hides an S that
+   * an honest leaf still holds (the fix #7 "never abandon while S may be extractable" property). Never throws on a
+   * per-leaf read error (a leaf that errors just doesn't contribute an S).
+   */
+  private async readEvmClaimedSecret(provider: Provider, htlcAddr: string, swapId: string, hashLockHex: string): Promise<Uint8Array | null> {
+    const leaves = evmLeaves(provider);
+    const claimedFrag = HTLC_IFACE.getEvent('Claimed');
+    if (!claimedFrag) return null;
+    const topic0 = claimedFrag.topicHash;
+    const idTopic = ethers.zeroPadValue(swapId, 32); // the indexed bytes32 id
+    const lockBlock = Number.isInteger(this.record.evmLockBlock) ? (this.record.evmLockBlock as number) : 0;
+    for (const leaf of leaves) {
+      const found = await this.scanLeafForClaimedSecret(leaf, htlcAddr, topic0, idTopic, swapId, hashLockHex, lockBlock);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  /**
+   * FIX #1 (fund-loss): scan ONE leaf for the hash-verified Claimed preimage with a BOUNDED, WINDOWED getLogs — the
+   * SDK's proven watchForClaim windowing (evm-client.ts ~L1486) ported into a single, non-blocking sweep. The old code
+   * issued one UNBOUNDED `getLogs({fromBlock: evmLockBlock, toBlock:'latest'})`; a real public RPC rejects a wide range
+   * ('range too large'), so S was never recovered and the refund-race loser could not be made whole. Here each query is
+   * capped to CLAIMED_LOG_WINDOW blocks, fromBlock slides forward window-by-window, and a range-too-large / transient
+   * rejection SHRINK-and-retries the SAME window (halving to a floor) before the leaf is abandoned. Returns the FIRST S
+   * whose sha256 equals `hashLockHex` (the authenticator — a single honest leaf suffices to TRUST it), else null.
+   */
+  private static readonly CLAIMED_LOG_WINDOW = 9_000; // matches watchForClaim's 9000-block cap (public-RPC-safe)
+
+  private async scanLeafForClaimedSecret(
+    leaf: Provider, htlcAddr: string, topic0: string, idTopic: string, swapId: string, hashLockHex: string, lockBlock: number,
+  ): Promise<Uint8Array | null> {
+    // A NUMERIC tip is required so every query is a bounded [from,to] range (never fromBlock..'latest'). A leaf that
+    // cannot report its tip simply doesn't contribute — the other leaves / a later poll still can (never throws).
+    let tip: number;
+    try {
+      tip = await Promise.race([
+        leaf.getBlockNumber(),
+        new Promise<never>((_, rej) => setTimeout(() => rej(new Error('getBlockNumber timed out')), 15_000)),
+      ]);
+    } catch { return null; }
+    if (!Number.isFinite(tip) || tip <= 0) return null;
+    // fromBlock lower bound: our own lock's mine block (lossless). If unknown (0), floor near the tip like
+    // watchForClaim (covers the ~24h lock window) rather than scanning from genesis.
+    let from = lockBlock > 0 ? Math.min(lockBlock, tip) : Math.max(0, tip - 90_000);
+    let window = SwapController.CLAIMED_LOG_WINDOW;
+    const MAX_QUERIES = 10_000; // hard bound so a pathological RPC can never spin this single-sweep scan forever
+    let guard = 0;
+    while (from <= tip && guard++ < MAX_QUERIES) {
+      const to = Math.min(tip, from + window - 1);
+      let logs: Array<{ topics: ReadonlyArray<string>; data: string }> | null = null;
+      try {
+        logs = (await leaf.getLogs({ address: htlcAddr, topics: [topic0, idTopic], fromBlock: from, toBlock: to })) as unknown as Array<{ topics: ReadonlyArray<string>; data: string }>;
+      } catch {
+        // A wide-range rejection ('range too large') or a transient read error: SHRINK the window and retry the SAME
+        // fromBlock (mirrors watchForClaim). At the floor (window===1) the leaf is unreliable -> abandon it (null).
+        if (window > 1) { window = Math.max(1, Math.floor(window / 2)); continue; }
+        return null;
+      }
+      if (Array.isArray(logs)) {
+        for (const log of logs) {
+          let parsed;
+          try { parsed = HTLC_IFACE.parseLog({ topics: [...(log.topics ?? [])], data: log.data }); } catch { continue; }
+          if (!parsed || parsed.name !== 'Claimed') continue;
+          if (String(parsed.args[0]).toLowerCase() !== swapId.toLowerCase()) continue; // bind the exact swapId
+          const secretHex = parsed.args[1] as string;
+          if (!secretHex || secretHex === '0x' + '0'.repeat(64)) continue;
+          let sb: Uint8Array;
+          try { sb = ethers.getBytes(secretHex); } catch { continue; }
+          if (sb.length !== 32) continue;
+          if (bytesToHex(sha256(sb)) !== hashLockHex) continue; // THE authenticator — reject a forged/foreign preimage
+          return sb;
+        }
+      }
+      // Advance past the scanned window; restore the full window after a successful query.
+      from = to + 1;
+      window = SwapController.CLAIMED_LOG_WINDOW;
+    }
+    return null;
   }
 
   /** Best-effort persist of the full record (rehydration source for resume in step 6). Not fund-critical — the
