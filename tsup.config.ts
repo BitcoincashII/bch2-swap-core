@@ -10,6 +10,8 @@ export default defineConfig({
     'src/order-book/index.ts',
     'src/htlc-builder.ts',
     'src/spv.ts',
+    'src/spv-verifier.ts',
+    'src/chain-client.ts',
     'src/seed-secret.ts',
     'src/chain-config.ts',
     'src/timelock-gates.ts',

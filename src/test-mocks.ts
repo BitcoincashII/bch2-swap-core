@@ -69,6 +69,18 @@ export interface MockElectrumOpts {
   broadcastThrows?: boolean;
   /** When true getTx() throws (simulate unreachable proxy). */
   getTxThrows?: boolean;
+  /**
+   * R175-SPV: 80-byte block headers (160-hex each) keyed by height. getBlockHeaders() concatenates the
+   * CONTIGUOUS run starting at `start` (verbatim from the app's spv-verifier.test.ts inline mockClient) —
+   * a gap makes the batch short, which the SPV verifier treats as "proxy cannot supply headers" (fail-closed).
+   */
+  headersByHeight?: Record<number, string>;
+  /** R175-SPV: fabricated Merkle proofs keyed by txid — a lying proxy's transaction.get_merkle answer. */
+  merkleProofByTxid?: Record<string, { block_height: number; merkle: string[]; pos: number }>;
+  /** R175-SPV: single Merkle proof returned for ANY txid (when merkleProofByTxid has no entry). */
+  merkleProof?: { block_height: number; merkle: string[]; pos: number };
+  /** getChainTimeSec: the tip header returned for a raw `blockchain.headers.subscribe` request. */
+  tipHeaderHex?: string;
 }
 
 /**
@@ -132,6 +144,41 @@ export class MockElectrumClient {
   /** blockchain.scripthash.get_history — a lying proxy can fabricate confirmations here. */
   async get_history(_scripthash: string): Promise<HistoryEntry[]> {
     return this.opts.history ?? [];
+  }
+
+  /**
+   * R175-SPV: blockchain.block.headers — a batch of contiguous 80-byte headers (concatenated hex). Serves the
+   * CONTIGUOUS run from `start` out of opts.headersByHeight; a missing height ends the run (short batch), which
+   * the SPV verifier fails-closed on. Behaviour copied from the app's spv-verifier.test.ts inline mockClient.
+   */
+  async getBlockHeaders(start: number, count: number): Promise<{ count: number; hex: string; max: number }> {
+    const byH = this.opts.headersByHeight ?? {};
+    let hex = ''; let n = 0;
+    for (let h = start; h < start + count && byH[h]; h++) { hex += byH[h]; n++; }
+    return { count: n, hex, max: 500 };
+  }
+
+  /**
+   * R175-SPV: blockchain.transaction.get_merkle — the proxy's (untrusted) Merkle inclusion proof. A test can
+   * fabricate one per-txid (merkleProofByTxid) or one for all txids (merkleProof); with neither set it throws
+   * (as the app's inline mock does for the "merkle not exercised" paths).
+   */
+  async getMerkleProof(txid: string, _height: number): Promise<{ block_height: number; merkle: string[]; pos: number }> {
+    const byTxid = this.opts.merkleProofByTxid?.[txid];
+    if (byTxid) return byTxid;
+    if (this.opts.merkleProof) return this.opts.merkleProof;
+    throw new Error(`MockElectrumClient: no merkle proof configured for ${txid}`);
+  }
+
+  /**
+   * Raw Electrum JSON-RPC — routes only `blockchain.headers.subscribe` (used by getChainTimeSec) to a
+   * fabricated tip header {height, hex}. Any other method throws (nothing else in the SPV layer uses request()).
+   */
+  async request<T = unknown>(method: string, _params: unknown[]): Promise<T> {
+    if (method === 'blockchain.headers.subscribe') {
+      return { height: this.opts.height ?? 0, hex: this.opts.tipHeaderHex ?? '' } as T;
+    }
+    throw new Error(`MockElectrumClient: unexpected request method ${method}`);
   }
 
   /** Mirrors proxy-client.getBlockHeight: returns [height, unsubscribe]; fabricated tip via opts.height. */

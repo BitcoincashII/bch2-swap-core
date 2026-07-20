@@ -51,6 +51,14 @@
       "types": "./dist/spv.d.ts",
       "import": "./dist/spv.js"
     },
+    "./spv-verifier": {
+      "types": "./dist/spv-verifier.d.ts",
+      "import": "./dist/spv-verifier.js"
+    },
+    "./chain-client": {
+      "types": "./dist/chain-client.d.ts",
+      "import": "./dist/chain-client.js"
+    },
     "./seed-secret": {
       "types": "./dist/seed-secret.d.ts",
       "import": "./dist/seed-secret.js"
