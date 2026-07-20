@@ -16,6 +16,8 @@ export default defineConfig({
     'src/chain-config.ts',
     'src/timelock-gates.ts',
     'src/gates.ts',
+    'src/utxo-reservation.ts',
+    'src/storage.ts',
     'src/fee-rate.ts',
     'src/swap-flow.ts',
     'src/address-codec.ts',

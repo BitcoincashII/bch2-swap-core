@@ -75,6 +75,14 @@
       "types": "./dist/gates.d.ts",
       "import": "./dist/gates.js"
     },
+    "./utxo-reservation": {
+      "types": "./dist/utxo-reservation.d.ts",
+      "import": "./dist/utxo-reservation.js"
+    },
+    "./storage": {
+      "types": "./dist/storage.d.ts",
+      "import": "./dist/storage.js"
+    },
     "./fee-rate": {
       "types": "./dist/fee-rate.d.ts",
       "import": "./dist/fee-rate.js"
