@@ -4614,6 +4614,10 @@ var SwapController = class _SwapController {
         this.setResumeGate("refund-race-recovered");
         return;
       }
+      if (await this.finalizeOrResubmitEvmRefund()) {
+        this.setResumeGate("refund-finalized");
+        return;
+      }
       await this.rebroadcastRefundIfDropped();
       this.setResumeGate("refund-in-flight");
       return;
@@ -4629,7 +4633,12 @@ var SwapController = class _SwapController {
         return;
       }
       const c = await this.confirmClaim();
-      this.setResumeGate(c.finalized ? "claim-finalized" : "claim-in-flight");
+      if (c.finalized) {
+        this.setResumeGate("claim-finalized");
+        return;
+      }
+      await this.rebroadcastClaimIfDropped();
+      this.setResumeGate("claim-in-flight");
       return;
     }
     await this.rebroadcastFundingIfMissing();
@@ -4798,6 +4807,55 @@ var SwapController = class _SwapController {
     try {
       await client.broadcastTx(refund.rawTx);
     } catch {
+    }
+  }
+  /**
+   * R-UTXO-CLAIM-REDRIVE-001: the UTXO analogue of confirmClaimEvm's orphan re-drive (and the claim-side sibling of
+   * rebroadcastRefundIfDropped). A UTXO receive-leg (leg X) claim that was broadcast then PERMANENTLY dropped (mempool
+   * eviction under fee pressure / a restrictive-policy reorg that does not re-admit it) is otherwise never re-sent:
+   * confirmClaim finds the txid absent + returns not-finalized WITHOUT re-broadcasting, and priorClaimTxid adopts the
+   * never-confirmed txid on the local sentinel alone — so the claim never lands and, after leg X's longer refund
+   * timelock, the counterparty refunds it (receive-leg-value loss, S already public). On resume: if OUR claim txid is
+   * ABSENT from leg X's history AND leg X is STILL unspent (proving the claim dropped, not landed), re-broadcast the
+   * durable claim rawTx idempotently (same txid). Fail-closed: do nothing on a read error, if the claim is present
+   * (mempool/confirmed), or if leg X is already spent (claim landed / counterparty took it). Returns true iff re-sent.
+   */
+  async rebroadcastClaimIfDropped() {
+    const rec = this.record;
+    if (!await this.deps.durable.get(claimBroadcastKey(rec.id))) return false;
+    if (chainConfigs[this.theirChain]?.isEvm) return false;
+    let redeemScript;
+    try {
+      ({ redeemScript } = this.counterpartyLeg("rebroadcastClaimIfDropped"));
+    } catch {
+      return false;
+    }
+    const priorRaw = await this.deps.durable.get(claimTxKey(rec.id));
+    if (!priorRaw) return false;
+    let claim;
+    try {
+      claim = JSON.parse(priorRaw);
+    } catch {
+      return false;
+    }
+    if (!claim.rawTx || !claim.txid || !HEX64.test(claim.txid.toLowerCase())) return false;
+    const claimTxid = claim.txid.toLowerCase();
+    const client = this.deps.chainClientFor(this.theirChain);
+    const scriptHex = "a914" + bytesToHex(hash160(redeemScript)) + "87";
+    try {
+      const hist = await client.getHistory(getHTLCScripthash(redeemScript), scriptHex);
+      if (Array.isArray(hist) && hist.some((h) => typeof h?.tx_hash === "string" && h.tx_hash.toLowerCase() === claimTxid)) return false;
+      const utxos = await client.getUTXOs(getHTLCScripthash(redeemScript), scriptHex);
+      if (!Array.isArray(utxos) || utxos.length === 0) return false;
+    } catch {
+      return false;
+    }
+    this.status("resume:rebroadcast-dropped-claim");
+    try {
+      await client.broadcastTx(claim.rawTx);
+      return true;
+    } catch {
+      return false;
     }
   }
   /** Step-5 deferred idempotent-adopt source: the PRIOR winning claim txid iff the `claimbroadcast` sentinel is set and
@@ -5735,6 +5793,54 @@ var SwapController = class _SwapController {
     this.status("recoverEvmRefundRaceOnResume:pivoting");
     try {
       await this.recoverFromRefundRace(htlcAddr, swapId);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  /**
+   * R-EVM-REFUND-RESUBMIT-001: the EVM-own-leg sibling of rebroadcastRefundIfDropped — a refundEvm that committed the
+   * refundbroadcast sentinel then dropped its refund tx (mempool eviction / crash during tx.wait) with the counterparty
+   * NEVER claiming has no in-SDK path forward: confirmRefund + recoverUtxoRefundRace + rebroadcastRefundIfDropped all
+   * bail for an EVM own leg, recoverEvmRefundRaceOnResume covers only the CLAIMED (race) case, and a manual refundEvm
+   * re-call adopts the set sentinel and reports a false 'refund-pending' — the own EVM funds stay locked past expiry.
+   * On resume this finalizes-or-resubmits: getSwap.refunded => finalize ('refunded'); exists && !claimed && !refunded
+   * => re-invoke refundSwap (re-verifies expiry/initiator on-chain, idempotent — a still-pending original's loser
+   * reverts) and finalize on a confirmed re-refund. Fail-closed: KEEP + no action on any read error, or when claimed
+   * (the race case, handled above) / still-unconfirmed. Returns true iff the refund is now terminal (finalized).
+   */
+  async finalizeOrResubmitEvmRefund() {
+    const rec = this.record;
+    if (!chainConfigs[this.myChain]?.isEvm) return false;
+    if (!await this.deps.durable.get(refundBroadcastKey(rec.id))) return false;
+    const swapId = (rec.myEvmSwapId ?? "").toLowerCase();
+    if (!BYTES32_0X.test(swapId)) return false;
+    let htlcAddr;
+    try {
+      ({ htlcAddr } = this.evmCfgFor(this.myChain));
+    } catch {
+      return false;
+    }
+    let sw;
+    try {
+      sw = await getSwap(htlcAddr, swapId, this.evmProvider(this.myChain));
+    } catch {
+      return false;
+    }
+    if (!sw) return false;
+    if (sw.refunded) {
+      this.setPhase("refunded");
+      this.status("finalizeOrResubmitEvmRefund:finalized");
+      await this.persistRecord();
+      return true;
+    }
+    if (sw.claimed) return false;
+    this.status("finalizeOrResubmitEvmRefund:resending");
+    try {
+      await refundSwap(htlcAddr, swapId, this.evmSigner(this.myChain));
+      this.setPhase("refunded");
+      this.status("finalizeOrResubmitEvmRefund:re-refunded");
+      await this.persistRecord();
       return true;
     } catch {
       return false;

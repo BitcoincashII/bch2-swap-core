@@ -972,6 +972,19 @@ describe('R-UTXO-REFUNDRACE-001 UTXO refund-race recovery', () => {
     expect(btc.broadcasts.length).toBe(1);                                    // the leg-X recovery claim was broadcast
     expect(ctrl.getState().phase).toBe('completed');                          // claimWithKnownSecret advanced claimed->completed
   });
+
+  it('R-UTXO-CLAIM-REDRIVE-001: resume() RE-BROADCASTS a dropped UTXO receive-leg claim (absent from leg-X history + leg X still unspent)', async () => {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:claimbroadcast:rrace-1', '1'); // a claim was broadcast...
+    const claimTxid = 'dd'.repeat(32);
+    await durable.set('bch2swap:claimtx:rrace-1', JSON.stringify({ txid: claimTxid, rawTx: 'aabbccddeeff', spent: { tx_hash: FX.fundTxid, tx_pos: 0 } }));
+    // leg X (btc): OUR claim txid is ABSENT from history (dropped) and the HTLC UTXO is STILL present (unspent).
+    const btc = fxClient();
+    const bch2 = new MockElectrumClient({ height: OWN_LOCKTIME + 5, utxos: legYUtxo, rawTxByTxid: { [OWN_FUND.txid]: OWN_FUND.rawTxHex }, history: [], broadcastTxid: '99'.repeat(32) });
+    const ctrl = await SwapController.resume(respRaceRec({ phase: 'claimed' }), makeMultiDeps({ bch2, btc }, { durable }));
+    expect(btc.broadcasts.length).toBe(1);                       // the dropped leg-X claim was re-broadcast (same rawTx)
+    expect(ctrl.getState().resumeGate).toBe('claim-in-flight');
+  });
 });
 
 // ── reorg-safe finalizers — never wipe on doubt; wipe only at reorg-safe SPV depth (§9.6) ─────────────────────
@@ -1704,6 +1717,30 @@ describe('SwapController.refundEvm() — refund own EVM lock + the refund-race s
     expect(ctrl.getState().hasSecret).toBe(true);               // S recovered + retained
     expect(ctrl.getState().phase).toBe('completed');            // made whole via RESUME (parity with the UTXO twin)
     expect(ctrl.getState().resumeGate).toBe('refund-race-recovered');
+  });
+
+  it('R-EVM-REFUND-RESUBMIT-001: resume() RESUBMITS a dropped EVM refund (exists && !claimed && !refunded) -> re-refunds', async () => {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:refundbroadcast:evmrefund-1', '1'); // sentinel set; the original refund dropped
+    const droppedSwap = makeSwap({ initiator: EVM_RECIP, claimed: false, refunded: false, timeLock: 1_699_000_000n, amount: EVM_AMT });
+    const provider = new MockEvmProvider({ swap: droppedSwap, block: { timestamp: 1_700_000_000 }, blockNumber: 5000, chainId: 8453n });
+    const signer = new MockSigner(provider, EVM_RECIP, { mode: 'ok' });
+    const ctrl = await SwapController.resume(refundEvmRecord(), makeEvmDeps({ evmProviderFor: () => P(provider), evmSignerFor: () => SG(signer), durable }));
+    expect(signer.broadcastCount).toBe(1);                    // the dropped refund was re-sent
+    expect(ctrl.getState().phase).toBe('refunded');           // re-refund confirmed on-chain
+    expect(ctrl.getState().resumeGate).toBe('refund-finalized');
+  });
+
+  it('R-EVM-REFUND-RESUBMIT-001: resume() FINALIZES an already-on-chain-refunded EVM leg (no re-send)', async () => {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:refundbroadcast:evmrefund-1', '1');
+    const refundedSwap = makeSwap({ initiator: EVM_RECIP, claimed: false, refunded: true, timeLock: 1_699_000_000n, amount: EVM_AMT });
+    const provider = new MockEvmProvider({ swap: refundedSwap, block: { timestamp: 1_700_000_000 }, blockNumber: 5000, chainId: 8453n });
+    const signer = new MockSigner(provider, EVM_RECIP, { mode: 'ok' });
+    const ctrl = await SwapController.resume(refundEvmRecord(), makeEvmDeps({ evmProviderFor: () => P(provider), evmSignerFor: () => SG(signer), durable }));
+    expect(signer.broadcastCount).toBe(0);                    // already refunded on-chain — nothing to re-send
+    expect(ctrl.getState().phase).toBe('refunded');
+    expect(ctrl.getState().resumeGate).toBe('refund-finalized');
   });
 
   it('the pivot KEEPS retrying (does not abandon) when S is NOT yet extractable from the Claimed event', async () => {

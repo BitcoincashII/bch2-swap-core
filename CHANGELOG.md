@@ -1,5 +1,27 @@
 # Changelog
 
+## 3.1.13
+
+### Fixed (fund-safety — HIGH, audit round 8 — UTXO↔EVM recovery parity)
+- **R-UTXO-CLAIM-REDRIVE-001** (HIGH): the UTXO receive-leg claim had no analogue of `confirmClaimEvm`'s orphan
+  re-drive. A UTXO claim broadcast then PERMANENTLY dropped (mempool eviction under fee pressure / a restrictive-policy
+  reorg that doesn't re-admit it) was never re-sent — `confirmClaim` found the txid absent and returned not-finalized
+  without re-broadcasting, and `priorClaimTxid` adopted the never-confirmed txid on the local sentinel alone. The claim
+  never landed and, after leg X's longer refund timelock, the counterparty refunded it (receive-leg-value loss, S
+  already public). Fix: new `rebroadcastClaimIfDropped()` — on resume, when OUR claim txid is absent from leg X's
+  history AND leg X is still unspent (proving the claim dropped, not landed), re-broadcast the durable claim rawTx
+  idempotently; fail-closed (no re-send on a read error, if the claim is present, or if leg X is already spent). Wired
+  into resume's UTXO claim branch. Regression test added.
+- **R-EVM-REFUND-RESUBMIT-001** (HIGH — liveness/recoverability): the EVM own-leg refund had no analogue of
+  `rebroadcastRefundIfDropped`. A `refundEvm` that committed the `refundbroadcast` sentinel then dropped its refund tx
+  (mempool eviction / crash during `tx.wait`) with the counterparty NEVER claiming was permanently stuck — every resume
+  path bails for an EVM own leg (`confirmRefund`, `recoverUtxoRefundRace`, `rebroadcastRefundIfDropped`),
+  `recoverEvmRefundRaceOnResume` covers only the CLAIMED (race) case, and a manual `refundEvm` re-call adopted the
+  sentinel and reported a false `refund-pending` — the own EVM funds stayed locked past expiry. Fix: new
+  `finalizeOrResubmitEvmRefund()` — on resume, `getSwap.refunded` ⇒ finalize (`refunded`); `exists && !claimed &&
+  !refunded` ⇒ re-invoke `refundSwap` (re-verifies expiry/initiator on-chain, idempotent) and finalize on a confirmed
+  re-refund; fail-closed otherwise. Wired into resume's refund-first branch. Regression tests added.
+
 ## 3.1.12
 
 ### Fixed (fund-safety — CRITICAL, audit round 8)

@@ -423,6 +423,18 @@ declare class SwapController {
      * does NOT rebroadcast, and this NEVER wipes.
      */
     private rebroadcastRefundIfDropped;
+    /**
+     * R-UTXO-CLAIM-REDRIVE-001: the UTXO analogue of confirmClaimEvm's orphan re-drive (and the claim-side sibling of
+     * rebroadcastRefundIfDropped). A UTXO receive-leg (leg X) claim that was broadcast then PERMANENTLY dropped (mempool
+     * eviction under fee pressure / a restrictive-policy reorg that does not re-admit it) is otherwise never re-sent:
+     * confirmClaim finds the txid absent + returns not-finalized WITHOUT re-broadcasting, and priorClaimTxid adopts the
+     * never-confirmed txid on the local sentinel alone — so the claim never lands and, after leg X's longer refund
+     * timelock, the counterparty refunds it (receive-leg-value loss, S already public). On resume: if OUR claim txid is
+     * ABSENT from leg X's history AND leg X is STILL unspent (proving the claim dropped, not landed), re-broadcast the
+     * durable claim rawTx idempotently (same txid). Fail-closed: do nothing on a read error, if the claim is present
+     * (mempool/confirmed), or if leg X is already spent (claim landed / counterparty took it). Returns true iff re-sent.
+     */
+    private rebroadcastClaimIfDropped;
     /** Step-5 deferred idempotent-adopt source: the PRIOR winning claim txid iff the `claimbroadcast` sentinel is set and
      *  a durable claim tx (or record.myClaimTxid) supplies a bare-hex txid; else null. */
     private priorClaimTxid;
@@ -651,6 +663,18 @@ declare class SwapController {
      * @returns true iff the pivot ran AND completed (S recovered + leg X claimed).
      */
     private recoverEvmRefundRaceOnResume;
+    /**
+     * R-EVM-REFUND-RESUBMIT-001: the EVM-own-leg sibling of rebroadcastRefundIfDropped — a refundEvm that committed the
+     * refundbroadcast sentinel then dropped its refund tx (mempool eviction / crash during tx.wait) with the counterparty
+     * NEVER claiming has no in-SDK path forward: confirmRefund + recoverUtxoRefundRace + rebroadcastRefundIfDropped all
+     * bail for an EVM own leg, recoverEvmRefundRaceOnResume covers only the CLAIMED (race) case, and a manual refundEvm
+     * re-call adopts the set sentinel and reports a false 'refund-pending' — the own EVM funds stay locked past expiry.
+     * On resume this finalizes-or-resubmits: getSwap.refunded => finalize ('refunded'); exists && !claimed && !refunded
+     * => re-invoke refundSwap (re-verifies expiry/initiator on-chain, idempotent — a still-pending original's loser
+     * reverts) and finalize on a confirmed re-refund. Fail-closed: KEEP + no action on any read error, or when claimed
+     * (the race case, handled above) / still-unconfirmed. Returns true iff the refund is now terminal (finalized).
+     */
+    private finalizeOrResubmitEvmRefund;
     /**
      * THE REFUND-RACE PIVOT body (fix #7). Recover S from OUR OWN EVM lock's on-chain `Claimed` event, corroborated
      * across quorum>=2 leaves, verify sha256(S)===hashLock, then claim the OTHER (counterparty) leg with the now-public
