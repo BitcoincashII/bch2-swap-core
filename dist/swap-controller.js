@@ -4823,6 +4823,15 @@ var SwapController = class _SwapController {
     if (isSwapPairSuspended(this.myChain, this.theirChain)) {
       throw new Error(`lockEvm: swap pair ${this.myChain}/${this.theirChain} is suspended \u2014 refusing to lock`);
     }
+    if (this.role === "initiator") {
+      const isHmacV1 = rec.offer.secretScheme === SWAP_SECRET_SCHEME;
+      const durableSecretHex = await this.deps.durable.get(durableSecretKey(rec.id));
+      if (!isHmacV1 && !durableSecretHex) {
+        throw new Error(
+          `lockEvm: offer secretScheme '${rec.offer.secretScheme ?? "none"}' is not '${SWAP_SECRET_SCHEME}' and no encrypted-at-rest durable secret is present \u2014 refusing to lock a swap whose secret a crash would strand (fix #5)`
+        );
+      }
+    }
     const { evmChainId, cfg, htlcAddr } = this.evmCfgFor(this.myChain);
     const recipient = rec.counterpartyEvmAddress ?? "";
     if (!ethers.isAddress(recipient)) throw new Error("lockEvm: counterparty EVM recipient address (counterpartyEvmAddress) is missing/invalid \u2014 cannot lock");

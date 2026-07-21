@@ -2235,6 +2235,22 @@ export class SwapController {
     if (isSwapPairSuspended(this.myChain, this.theirChain)) {
       throw new Error(`lockEvm: swap pair ${this.myChain}/${this.theirChain} is suspended — refusing to lock`);
     }
+    // R-EVMLOCK-SECRETGATE-001 (FIX #5 parity): NEVER lock an EVM own leg for a swap whose secret a crash would strand.
+    // fundOwnLeg (leg X, UTXO) + prepare() enforce this; lockEvm is the initiator's EVM own-leg equivalent (it locks
+    // offer.sendAmount and targets 'initiator_funded' for this.role==='initiator') yet skipped it — so an initiator
+    // could lock EVM funds it can NEVER claim: a non-hmac-v1 offer with no encrypted-at-rest durable S makes
+    // loadInitiatorSecret return null at reveal time (revealAndClaimEvm), stranding the leg (only the timelocked
+    // refundEvm recovers). The responder learns S on-chain, so it is exempt (keyed on this.role, matching fundOwnLeg).
+    if (this.role === 'initiator') {
+      const isHmacV1 = rec.offer.secretScheme === SWAP_SECRET_SCHEME;
+      const durableSecretHex = await this.deps.durable.get(durableSecretKey(rec.id));
+      if (!isHmacV1 && !durableSecretHex) {
+        throw new Error(
+          `lockEvm: offer secretScheme '${rec.offer.secretScheme ?? 'none'}' is not '${SWAP_SECRET_SCHEME}' and no ` +
+          `encrypted-at-rest durable secret is present — refusing to lock a swap whose secret a crash would strand (fix #5)`,
+        );
+      }
+    }
     const { evmChainId, cfg, htlcAddr } = this.evmCfgFor(this.myChain); // our own EVM leg lives on myChain
     const recipient = (rec.counterpartyEvmAddress ?? '');
     if (!ethers.isAddress(recipient)) throw new Error('lockEvm: counterparty EVM recipient address (counterpartyEvmAddress) is missing/invalid — cannot lock');

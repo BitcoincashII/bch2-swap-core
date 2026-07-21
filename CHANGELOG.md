@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.1.15
+
+### Fixed (fund-safety — HIGH, audit round 10 — fix #5 parity)
+- **R-EVMLOCK-SECRETGATE-001** (HIGH): `lockEvm` omitted the fix #5 secret-re-derivability gate that `fundOwnLeg`
+  (leg X, UTXO) and `prepare()` enforce. For an initiator, `lockEvm` locks `offer.sendAmount` and targets
+  `initiator_funded`, yet did not require the swap secret to be re-derivable — so an initiator EVM own-leg lock on a
+  non-hmac-v1 offer with no encrypted-at-rest durable S would lock funds it can never claim from (`loadInitiatorSecret`
+  returns null at `revealAndClaimEvm` → stranded until the timelocked `refundEvm`). Fix: replicate `fundOwnLeg`'s gate
+  in `lockEvm`, keyed on `this.role === 'initiator'` (the responder learns S on-chain and stays exempt) — refuse unless
+  `offer.secretScheme === SWAP_SECRET_SCHEME` OR a durable S is present, before any on-chain action. Regression tests
+  added (initiator throws + broadcasts nothing; responder is not blocked). Reachability note: `lockEvm` requires a
+  `FundProof` whose only minters are responder-only, so an initiator reaches this path only via an intended EVM-initiator
+  flow or a directly-minted proof (bot-author surface) — this restores parity with the reachable `fundOwnLeg` gate and
+  closes the strand at the SDK boundary regardless.
+
 ## 3.1.14
 
 ### Fixed (fund-safety — HIGH, audit round 9 — EVM resume/recovery parity)

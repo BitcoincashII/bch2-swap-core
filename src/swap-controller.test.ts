@@ -1506,6 +1506,32 @@ describe('SwapController.lockEvm() — fix #2 re-mint FRESH at the choke point',
     expect(typeof _lockEvmCompileCheck).toBe('function');
   });
 
+  it('R-EVMLOCK-SECRETGATE-001 (fix #5 parity): lockEvm THROWS for an initiator whose secret is not re-derivable (non-hmac-v1, no durable S) — broadcasts nothing', async () => {
+    // Parity with fundLegX's fix #5 gate (swap-controller.test.ts ~346): NEVER lock an EVM own leg whose secret a crash
+    // would strand. An initiator EVM own-leg lock with a non-hmac-v1 offer + no durable S would lock funds it can never
+    // claim from (loadInitiatorSecret returns null at reveal). The gate fires before any broadcast.
+    const goodProof = await gateAssertEvmLegBuriedForFunding(P(evmLegProvider()), FUND_GATE_PARAMS);
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP); // throw-mode: any lock broadcast would throw
+    const rec = evmFundRecord({ role: 'initiator', offer: makeOffer({ id: 'evmfund-1', sendChain: 'arb', receiveChain: 'base', sendAmount: EVM_AMT_STR, receiveAmount: EVM_AMT_STR, secretHash: SECRET_HASH_HEX, secretScheme: 'random-v0', secretNonce: undefined }) });
+    const ctrl = new SwapController(rec, makeEvmDeps({ evmProviderFor: () => P(evmLegProvider()), evmSignerFor: () => SG(signer) }));
+    await expect(ctrl.lockEvm(goodProof)).rejects.toThrow(/secretScheme|crash would strand|fix #5/i);
+    expect(signer.broadcastCount).toBe(0);                    // no lock broadcast — strand prevented before any irreversible action
+    expect(ctrl.getState().phase).toBe('taken');             // never advanced
+  });
+
+  it('R-EVMLOCK-SECRETGATE-001: a RESPONDER (learns S on-chain) stays EXEMPT from the fix #5 gate — a non-hmac-v1 offer is NOT blocked', async () => {
+    // The responder never needs to re-derive S (it extracts it on-chain), so the gate must NOT block it — mirrors fundLegY.
+    const goodProof = await gateAssertEvmLegBuriedForFunding(P(evmLegProvider()), FUND_GATE_PARAMS);
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP); // throw-mode: the lock proceeds past the gate then fails on the incomplete mock
+    const rec = evmFundRecord({ offer: makeOffer({ id: 'evmfund-1', sendChain: 'arb', receiveChain: 'base', sendAmount: EVM_AMT_STR, receiveAmount: EVM_AMT_STR, secretHash: SECRET_HASH_HEX, secretScheme: 'random-v0', secretNonce: undefined }) }); // role responder (default)
+    const ctrl = new SwapController(rec, makeEvmDeps({ evmProviderFor: () => P(evmLegProvider()), evmSignerFor: () => SG(signer) }));
+    let err: Error | null = null;
+    try { await ctrl.lockEvm(goodProof); } catch (e) { err = e as Error; }
+    // The responder is EXEMPT: it must NOT throw the fix #5 secret-strand error (it proceeds past the gate; the mock lock
+    // then fails on a later mechanical step, which is fine — the point is the gate did not block a non-hmac-v1 responder).
+    expect(err?.message ?? '').not.toMatch(/crash would strand|fix #5/i);
+  });
+
   it('R-EVMLOCK-RESUME-001: resume() reconstructs a CRASHED EVM own-leg lock (lockpending+evmlocktx set, funded unset) -> myEvmSwapId + funded restored', async () => {
     // Crash during lockEvm's tx.wait: the lock BROADCAST (onBroadcast committed lockpending+evmlocktx) but funded +
     // record.myEvmSwapId were never set. The leg IS locked on-chain. Before the fix, resume left it un-refundable /
