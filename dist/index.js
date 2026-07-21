@@ -4359,7 +4359,7 @@ var SwapController = class _SwapController {
         [refundBroadcastKey(rec.id), "1"]
       ]);
       this.status("refund:broadcasting");
-      await client.broadcastTx(refundTx.rawTx);
+      await this.broadcastRefundWithSentinelGuard(client, refundTx.rawTx, rec.id);
       return refundTx.txid.toLowerCase();
     });
     const durableRefund = await this.readDurableRefundTx(rec.id);
@@ -4585,8 +4585,16 @@ var SwapController = class _SwapController {
     }
     if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
       const r = await this.confirmRefund();
-      if (!r.finalized) await this.rebroadcastRefundIfDropped();
-      this.setResumeGate(r.finalized ? "refund-finalized" : "refund-in-flight");
+      if (r.finalized) {
+        this.setResumeGate("refund-finalized");
+        return;
+      }
+      if (await this.recoverUtxoRefundRace()) {
+        this.setResumeGate("refund-race-recovered");
+        return;
+      }
+      await this.rebroadcastRefundIfDropped();
+      this.setResumeGate("refund-in-flight");
       return;
     }
     if (await this.deps.durable.get(claimBroadcastKey(rec.id))) {
@@ -5442,6 +5450,96 @@ var SwapController = class _SwapController {
       }
       throw e;
     }
+  }
+  /**
+   * R-UTXO-REFUNDRACE-001 (B1): the refund-path analogue of broadcastClaimWithSentinelGuard. A DEFINITIVE node
+   * rejection means no refund reached any mempool — critically 'bad-txns-inputs-missingorspent' (the counterparty
+   * already CLAIMED our leg Y, revealing S), where the refund can NEVER succeed. Without clearing the sentinel it
+   * would permanently block the responder's ONLY remaining payout — claimWithKnownSecret on leg X (still claimable
+   * with the now-public S). Clear it on a definitive rejection (a min-relay-fee rejection also clears safely: the
+   * outpoint is still unspent, so a refund retry re-arms and the claim cannot proceed while S is not yet public). An
+   * AMBIGUOUS / timeout failure KEEPS the sentinel — the refund may still confirm (fail-safe).
+   */
+  async broadcastRefundWithSentinelGuard(client, rawTx, id) {
+    try {
+      await client.broadcastTx(rawTx);
+    } catch (e) {
+      if (isDefinitiveBroadcastRejection(e)) {
+        try {
+          await this.deps.durable.remove(refundBroadcastKey(id));
+        } catch {
+        }
+      }
+      throw e;
+    }
+  }
+  /**
+   * R-UTXO-REFUNDRACE-001 (B2): the UTXO analogue of recoverFromRefundRace, for the case where the refund broadcast
+   * SUCCEEDED (so B1's definitive-rejection clear never fired and phase='refunded' was set) but the refund is later
+   * ORPHANED — the initiator won the mempool/mining race and CLAIMED our leg Y, revealing S. Without this the responder
+   * is permanently wedged: phase='refunded' (blocks claimWithKnownSecret at its phase gate) + the refundbroadcast
+   * sentinel (blocks its cross-guard), so leg X — still claimable with the now-PUBLIC S until its LONGER timelock — is
+   * forfeited, netting the strategic initiator BOTH legs. Detect the lost race (leg Y's HTLC output spent by a tx that
+   * is NOT our refund and that reveals a preimage of our secretHash), recover S, clear the refund sentinel, reset phase
+   * to 'claimed', and drive claimWithKnownSecret on leg X. Fail-closed: pivots ONLY on a confirmed-public S; otherwise
+   * returns false and KEEPS all recovery material (the refund may still be pending — never abandon while S may still be
+   * recoverable). RESPONDER-only (only the responder claims leg X with the counterparty's public secret).
+   * @returns true iff the lost race was detected and S recovered (the leg-X claim is then driven best-effort).
+   */
+  async recoverUtxoRefundRace() {
+    const rec = this.record;
+    if (rec.role !== "responder") return false;
+    if (!await this.deps.durable.get(refundBroadcastKey(rec.id))) return false;
+    const myHtlc = rec.myHTLC;
+    if (!myHtlc || typeof myHtlc.redeemScript !== "string" || !/^[0-9a-f]+$/i.test(myHtlc.redeemScript)) return false;
+    if (chainConfigs[this.myChain]?.isEvm) return false;
+    const hashLockHex = (rec.offer.secretHash ?? "").toLowerCase().replace(/^0x/, "");
+    if (!HEX64.test(hashLockHex)) return false;
+    const client = this.deps.chainClientFor(this.myChain);
+    const redeemScript = hexToBytes(myHtlc.redeemScript.toLowerCase());
+    const scriptHex = "a914" + bytesToHex(hash160(redeemScript)) + "87";
+    const dr = await this.readDurableRefundTx(rec.id);
+    const refundTxid = dr ? dr.txid.toLowerCase() : "";
+    let history;
+    try {
+      history = await client.getHistory(getHTLCScripthash(redeemScript), scriptHex);
+    } catch {
+      return false;
+    }
+    if (!Array.isArray(history)) return false;
+    for (const item of history) {
+      const txid = (item?.tx_hash ?? "").toLowerCase();
+      if (!HEX64.test(txid) || txid === refundTxid) continue;
+      let raw;
+      try {
+        raw = await client.getTx(txid);
+      } catch {
+        continue;
+      }
+      let s;
+      try {
+        s = extractSecret(raw, hashLockHex);
+      } catch {
+        s = null;
+      }
+      if (!s || s.length !== 32) continue;
+      if (bytesToHex(sha256(s)) !== hashLockHex) continue;
+      if (this.secret) this.secret.fill(0);
+      this.secret = s;
+      try {
+        await this.deps.durable.remove(refundBroadcastKey(rec.id));
+      } catch {
+      }
+      this.setPhase("claimed");
+      await this.persistRecord();
+      this.status("recoverUtxoRefundRace:recovered-secret");
+      try {
+        await this.claimWithKnownSecret();
+      } catch {
+      }
+      return true;
+    }
+    return false;
   }
   /** Broadcast an EVM claim, clearing the durable claimbroadcast sentinel ONLY on a PRE-broadcast throw (claimSwap tags
    *  pre-flight failures `preBroadcast:true` — no secret revealed), so a later call re-arms instead of adopting a

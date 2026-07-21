@@ -913,6 +913,67 @@ describe('SwapController claim<->refund cross-guard (R181)', () => {
   });
 });
 
+// ── R-UTXO-REFUNDRACE-001: UTXO refund-race recovery (B1 sentinel-clear on definitive rejection + B2 resume pivot) ──
+describe('R-UTXO-REFUNDRACE-001 UTXO refund-race recovery', () => {
+  beforeEach(() => { __setSpvConfigForTests('btc', FX.params, FX.checkpoint); __resetSpvCacheForTests(); });
+
+  // A RESPONDER whose OWN funded leg Y is on bch2 (offer sendChain=btc => myChain=bch2), refundable at OWN_LOCKTIME.
+  // Leg X (the initiator's leg the responder claims with the public S) is on btc at FX_OUTPOINT.
+  function respRaceRec(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
+    return {
+      id: over.id ?? 'rrace-1', role: 'responder',
+      offer: makeOffer({ id: over.id ?? 'rrace-1', sendChain: 'btc', receiveChain: 'bch2', secretHash: SECRET_HASH_HEX }),
+      phase: 'responder_funded',
+      counterpartyClaimPkh: CLAIM_PKH_HEX,
+      counterpartyHTLC: { ...CP_HTLC, locktime: FX.tip + 200 }, // leg X on btc
+      counterpartyFundingOutpoint: FX_OUTPOINT,
+      myHTLC: OWN_HTLC, myFundingTxid: OWN_FUND.txid, fundLocktime: OWN_LOCKTIME, // our leg Y on bch2
+      ...over,
+    };
+  }
+  const legYUtxo = [{ tx_hash: OWN_FUND.txid, tx_pos: 0, value: 200000, height: 100040 }];
+
+  it('(B1) a DEFINITIVE broadcast rejection (missingorspent) CLEARS the refund sentinel — the leg-X recovery claim is unblocked', async () => {
+    class RejectClient extends MockElectrumClient { async broadcastTx(): Promise<string> { throw new Error('bad-txns-inputs-missingorspent'); } }
+    const durable = new InMemoryDurableStore();
+    const bch2 = new RejectClient({ height: OWN_LOCKTIME, utxos: legYUtxo, rawTxByTxid: { [OWN_FUND.txid]: OWN_FUND.rawTxHex }, history: [], broadcastTxid: '99'.repeat(32) });
+    const ctrl = new SwapController(respRaceRec(), makeMultiDeps({ bch2 }, { durable }));
+    await expect(ctrl.refund()).rejects.toThrow(/missingorspent/i);
+    expect(await durable.get('bch2swap:refundbroadcast:rrace-1')).toBeFalsy(); // sentinel CLEARED (fix B1)
+  });
+
+  it('(B1) an AMBIGUOUS broadcast failure (timeout) KEEPS the refund sentinel (fail-safe — the refund may still confirm)', async () => {
+    class TimeoutClient extends MockElectrumClient { async broadcastTx(): Promise<string> { throw new Error('socket hang up / timed out'); } }
+    const durable = new InMemoryDurableStore();
+    const bch2 = new TimeoutClient({ height: OWN_LOCKTIME, utxos: legYUtxo, rawTxByTxid: { [OWN_FUND.txid]: OWN_FUND.rawTxHex }, history: [], broadcastTxid: '99'.repeat(32) });
+    const ctrl = new SwapController(respRaceRec(), makeMultiDeps({ bch2 }, { durable }));
+    await expect(ctrl.refund()).rejects.toThrow(/timed out|hang up/i);
+    expect(await durable.get('bch2swap:refundbroadcast:rrace-1')).toBe('1'); // sentinel KEPT (fail-safe)
+  });
+
+  it('(B2) resume() recovers a LOST refund race: the counterparty leg-Y claim reveals S -> sentinel cleared + phase reset to claimed', async () => {
+    const foreign = await makeLegYClaimSpend(S); // the initiator's leg-Y claim revealing S (our refund lost the race)
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:refundbroadcast:rrace-1', '1');
+    const ourRefundTxid = '77'.repeat(32);
+    await durable.set('bch2swap:refundtx:rrace-1', JSON.stringify({ txid: ourRefundTxid, rawTx: 'deadbeef', spent: { tx_hash: OWN_FUND.txid, tx_pos: 0 } }));
+    // leg Y (bch2): our refund never landed; the foreign claim (reveals S) is what spent the outpoint; UTXO set empty.
+    const bch2 = new MockElectrumClient({
+      height: OWN_LOCKTIME + 5, utxos: [],
+      history: [{ tx_hash: foreign.txid, height: OWN_LOCKTIME + 1 }],
+      rawTxByTxid: { [foreign.txid]: foreign.rawTx, [OWN_FUND.txid]: OWN_FUND.rawTxHex },
+      broadcastTxid: '99'.repeat(32),
+    });
+    const btc = fxClient(); // leg X client for the recovery claim
+    const ctrl = await SwapController.resume(respRaceRec({ phase: 'refunded', refundTx: { txid: ourRefundTxid, rawTx: 'deadbeef' } }), makeMultiDeps({ bch2, btc }, { durable }));
+    expect(await durable.get('bch2swap:refundbroadcast:rrace-1')).toBeFalsy(); // sentinel cleared (unblocks the claim)
+    expect(ctrl.getState().resumeGate).toBe('refund-race-recovered');
+    // Full automatic recovery: S recovered from the foreign leg-Y claim -> phase reset -> leg-X claim driven to completion.
+    expect(btc.broadcasts.length).toBe(1);                                    // the leg-X recovery claim was broadcast
+    expect(ctrl.getState().phase).toBe('completed');                          // claimWithKnownSecret advanced claimed->completed
+  });
+});
+
 // ── reorg-safe finalizers — never wipe on doubt; wipe only at reorg-safe SPV depth (§9.6) ─────────────────────
 function finalizeRefundRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
   return {

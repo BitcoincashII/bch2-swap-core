@@ -1,5 +1,26 @@
 # Changelog
 
+## 3.1.9
+
+### Fixed (fund-safety — HIGH, audit round 6)
+- **R-UTXO-REFUNDRACE-001** (HIGH): the UTXO refund path had no analogue of the EVM `recoverFromRefundRace`, so a
+  RESPONDER that broadcast a refund of its own leg Y but LOST the race to the initiator's secret-revealing claim of
+  that same outpoint was permanently wedged — it could never claim leg X (still claimable with the now-public S until
+  its longer timelock), forfeiting its entire funded leg while the initiator netted both legs. Two converging triggers,
+  both fixed:
+  - **(B1) definitive broadcast rejection**: `refund()` broadcast the refund with a bare `broadcastTx`, so a definitive
+    `bad-txns-inputs-missingorspent` (the counterparty already claimed the outpoint) threw with the `refundbroadcast`
+    sentinel stuck at `'1'` — permanently blocking `claimWithKnownSecret`. Now routed through a new
+    `broadcastRefundWithSentinelGuard` (symmetric with the claim path): a definitive rejection clears the sentinel; an
+    ambiguous/timeout failure keeps it (fail-safe).
+  - **(B2) lost mining race after a successful broadcast**: the refund entered the mempool (phase set to `'refunded'`)
+    then was orphaned when the initiator's claim won. New `recoverUtxoRefundRace()` (the UTXO analogue of
+    `recoverFromRefundRace`): on resume it detects leg Y's outpoint spent by a tx that is NOT our refund and that
+    reveals a preimage of our secretHash, recovers S, clears the refund sentinel, resets phase to `'claimed'`, and
+    drives `claimWithKnownSecret` on leg X. Fail-closed — pivots ONLY on a confirmed-public S; otherwise keeps all
+    recovery material. Wired into `resume()`'s refund-first branch. Regression tests added (definitive-clear,
+    ambiguous-keep, and a full resume-driven end-to-end recovery).
+
 ## 3.1.8
 
 ### Fixed (fund-safety — CRITICAL, audit round 6)

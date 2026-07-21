@@ -578,6 +578,30 @@ declare class SwapController {
      *  An AMBIGUOUS / timeout / post-broadcast failure (the tx MAY have reached a mempool) LEAVES the sentinel set
      *  (R201 fail-safe). The UTXO analogue of claimEvmWithSentinelGuard — same definitive-vs-ambiguous classification. */
     private broadcastClaimWithSentinelGuard;
+    /**
+     * R-UTXO-REFUNDRACE-001 (B1): the refund-path analogue of broadcastClaimWithSentinelGuard. A DEFINITIVE node
+     * rejection means no refund reached any mempool — critically 'bad-txns-inputs-missingorspent' (the counterparty
+     * already CLAIMED our leg Y, revealing S), where the refund can NEVER succeed. Without clearing the sentinel it
+     * would permanently block the responder's ONLY remaining payout — claimWithKnownSecret on leg X (still claimable
+     * with the now-public S). Clear it on a definitive rejection (a min-relay-fee rejection also clears safely: the
+     * outpoint is still unspent, so a refund retry re-arms and the claim cannot proceed while S is not yet public). An
+     * AMBIGUOUS / timeout failure KEEPS the sentinel — the refund may still confirm (fail-safe).
+     */
+    private broadcastRefundWithSentinelGuard;
+    /**
+     * R-UTXO-REFUNDRACE-001 (B2): the UTXO analogue of recoverFromRefundRace, for the case where the refund broadcast
+     * SUCCEEDED (so B1's definitive-rejection clear never fired and phase='refunded' was set) but the refund is later
+     * ORPHANED — the initiator won the mempool/mining race and CLAIMED our leg Y, revealing S. Without this the responder
+     * is permanently wedged: phase='refunded' (blocks claimWithKnownSecret at its phase gate) + the refundbroadcast
+     * sentinel (blocks its cross-guard), so leg X — still claimable with the now-PUBLIC S until its LONGER timelock — is
+     * forfeited, netting the strategic initiator BOTH legs. Detect the lost race (leg Y's HTLC output spent by a tx that
+     * is NOT our refund and that reveals a preimage of our secretHash), recover S, clear the refund sentinel, reset phase
+     * to 'claimed', and drive claimWithKnownSecret on leg X. Fail-closed: pivots ONLY on a confirmed-public S; otherwise
+     * returns false and KEEPS all recovery material (the refund may still be pending — never abandon while S may still be
+     * recoverable). RESPONDER-only (only the responder claims leg X with the counterparty's public secret).
+     * @returns true iff the lost race was detected and S recovered (the leg-X claim is then driven best-effort).
+     */
+    private recoverUtxoRefundRace;
     /** Broadcast an EVM claim, clearing the durable claimbroadcast sentinel ONLY on a PRE-broadcast throw (claimSwap tags
      *  pre-flight failures `preBroadcast:true` — no secret revealed), so a later call re-arms instead of adopting a
      *  never-broadcast claim (fix #3). A POST-broadcast / ambiguous failure LEAVES the sentinel set (R201 fail-safe). */
