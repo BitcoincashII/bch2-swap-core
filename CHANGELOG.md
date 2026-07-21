@@ -1,5 +1,25 @@
 # Changelog
 
+## 3.1.14
+
+### Fixed (fund-safety — HIGH, audit round 9 — EVM resume/recovery parity)
+- **R-EVMLOCK-RESUME-001** (HIGH): resume had no reconstruction for a CRASHED EVM own-leg lock. `lockEvm` commits
+  `lockpending`+`evmlocktx` the instant the lock broadcasts, but `funded`+`record.myEvmSwapId` are set only after
+  `tx.wait` resolves — a crash in that (up to 120s) window left the leg LOCKED on-chain with the record unable to
+  refund or watch it (`refundEvm`/`watchForClaimEvm` both require `myEvmSwapId`), and every resume path bailed
+  (`rebroadcastFundingIfMissing`/`rebroadcastRefundIfDropped` are UTXO-only; the refund/claim sentinels were unset).
+  The UTXO fund path self-heals via `reconstructMyHtlc` (it commits `fundedHtlcKey` BEFORE the broadcast); the EVM leg
+  had no equivalent. Fix: new `recoverEvmLockOnResume()` adopts the on-chain lock via `recoverLockFromTx` (reusing
+  `lockEvm`'s quorum-corroborated logic) and reconstructs `myEvmSwapId`/`funded` — no host re-lock, no counterparty
+  re-verification; fail-closed on `blocked`/`safe`/read error. Wired into resume. Regression test added.
+- **R-EVMCLAIM-RESUME-S-001** (HIGH — completeness gap in the round-6 `confirmClaimEvm` add): the orphaned-claim
+  re-drive (`reBroadcastOrphanedEvmClaim`) sourced S for a responder from the in-memory `this.secret`, which is null on
+  a fresh-process resume (S is never persisted). So an EVM↔EVM responder whose leg-X claim was reorg-orphaned could not
+  re-drive it after a restart. But S is PUBLIC in the responder's OWN leg Y (`myEvmSwapId`) on-chain Claimed event (the
+  initiator claimed leg Y). Fix: when `this.secret` is null on the responder path, re-extract S via
+  `readEvmClaimedSecret` over the leg-Y (myChain) provider (mirrors `recoverEvmRefundRaceOnResume`/`watchForClaimEvm`)
+  before re-broadcasting. Regression test added.
+
 ## 3.1.13
 
 ### Fixed (fund-safety — HIGH, audit round 8 — UTXO↔EVM recovery parity)

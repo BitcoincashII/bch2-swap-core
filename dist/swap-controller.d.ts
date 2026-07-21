@@ -676,6 +676,17 @@ declare class SwapController {
      */
     private finalizeOrResubmitEvmRefund;
     /**
+     * R-EVMLOCK-RESUME-001: reconstruct a crashed EVM own-leg lock on resume — the EVM parity of the UTXO
+     * reconstructMyHtlc self-heal. lockEvm commits lockpending+evmlocktx the instant the lock BROADCASTS (onBroadcast),
+     * but funded=swapId + record.myEvmSwapId are set only AFTER tx.wait resolves; a crash in that window leaves the leg
+     * LOCKED on-chain with the record unable to refund/watch it (refundEvm/watchForClaimEvm both require myEvmSwapId).
+     * Adopt the on-chain lock via recoverLockFromTx (reusing lockEvm's own quorum-corroborated logic): on 'locked',
+     * commit the funded sentinel + reconstruct myEvmSwapId/myFundingTxid/funded so the own-leg payout paths work with NO
+     * host re-lock and NO counterparty-leg re-verification. Fail-closed: no reconstruction on 'blocked' (retry later) /
+     * 'safe' (never landed — the fund gate re-drives) / any read error. Returns true iff the lock was adopted.
+     */
+    private recoverEvmLockOnResume;
+    /**
      * THE REFUND-RACE PIVOT body (fix #7). Recover S from OUR OWN EVM lock's on-chain `Claimed` event, corroborated
      * across quorum>=2 leaves, verify sha256(S)===hashLock, then claim the OTHER (counterparty) leg with the now-public
      * S so we are made whole. If S is not YET extractable (a lagging/pruned leaf), we KEEP the refund sentinel and throw

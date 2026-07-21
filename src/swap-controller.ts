@@ -1589,6 +1589,13 @@ export class SwapController {
       return;
     }
 
+    // (4-EVM) R-EVMLOCK-RESUME-001: reconstruct a CRASHED EVM own-leg lock. A crash during lockEvm's tx.wait leaves
+    // lockpending+evmlocktx set with funded UNSET and myEvmSwapId undefined, and nothing else on resume rebuilds it
+    // (rebroadcastFundingIfMissing/rebroadcastRefundIfDropped bail for EVM; the refund/claim sentinels are unset). This
+    // is the EVM parity of the UTXO reconstructMyHtlc self-heal (fundedHtlcKey committed BEFORE the UTXO broadcast).
+    // Adopt the on-chain lock via recoverLockFromTx (quorum-corroborated) so refundEvm/watchForClaimEvm/confirmClaimEvm
+    // become operable with NO host re-lock + NO counterparty-leg re-verification.
+    if (await this.recoverEvmLockOnResume()) { this.setResumeGate('post-funding'); return; }
     // (4) If the durable 'funded' sentinel/txid is set but the funding tx is NOT on-chain, rebroadcast the durable raw
     // funding tx (bch2swap:fundedtx) IDEMPOTENTLY (same txid) rather than re-selecting inputs (which would diverge).
     await this.rebroadcastFundingIfMissing();
@@ -2624,7 +2631,22 @@ export class SwapController {
    */
   private async reBroadcastOrphanedEvmClaim(leg: { htlcAddr: string; swapId: string; evmChainId: EvmChainId }): Promise<void> {
     const rec = this.record;
-    const secret = rec.role === 'initiator' ? await this.loadInitiatorSecret() : this.secret;
+    let secret = rec.role === 'initiator' ? await this.loadInitiatorSecret() : this.secret;
+    // R-EVMCLAIM-RESUME-S-001: on a FRESH-process resume the responder's in-memory this.secret is null (it is never
+    // persisted). But S is PUBLIC in the responder's OWN EVM leg Y's on-chain Claimed event (the initiator claimed leg
+    // Y — the very reason we are re-driving the counterparty leg-X claim). Re-extract it (mirrors
+    // recoverEvmRefundRaceOnResume / watchForClaimEvm) so the orphaned claim can be re-broadcast after a restart.
+    if ((!secret || secret.length !== 32) && rec.role === 'responder' && (chainConfigs[this.myChain] as { isEvm?: boolean } | undefined)?.isEvm) {
+      const mySwapId = (rec.myEvmSwapId ?? '').toLowerCase();
+      const hashLockHex = (rec.offer.secretHash ?? '').toLowerCase().replace(/^0x/, '');
+      if (BYTES32_0X.test(mySwapId) && HEX64.test(hashLockHex)) {
+        try {
+          const { htlcAddr: myHtlcAddr } = this.evmCfgFor(this.myChain);
+          const recovered = await this.readEvmClaimedSecret(this.evmProvider(this.myChain), myHtlcAddr, mySwapId, hashLockHex);
+          if (recovered && recovered.length === 32) { if (this.secret) this.secret.fill(0); this.secret = recovered; secret = recovered; }
+        } catch { /* leave null — throw below; a later resume retries once the Claimed event is readable */ }
+      }
+    }
     if (!secret || secret.length !== 32) throw new Error('reBroadcastOrphanedEvmClaim: S unavailable to re-drive the orphaned EVM claim');
     const signer = this.evmSigner(this.theirChain);
     const lockName = `bch2swap:claim:${rec.id}`;
@@ -2806,6 +2828,50 @@ export class SwapController {
       await this.persistRecord();
       return true;
     } catch { return false; } // still pending / ambiguous — KEEP the sentinel; a later resume retries
+  }
+
+  /**
+   * R-EVMLOCK-RESUME-001: reconstruct a crashed EVM own-leg lock on resume — the EVM parity of the UTXO
+   * reconstructMyHtlc self-heal. lockEvm commits lockpending+evmlocktx the instant the lock BROADCASTS (onBroadcast),
+   * but funded=swapId + record.myEvmSwapId are set only AFTER tx.wait resolves; a crash in that window leaves the leg
+   * LOCKED on-chain with the record unable to refund/watch it (refundEvm/watchForClaimEvm both require myEvmSwapId).
+   * Adopt the on-chain lock via recoverLockFromTx (reusing lockEvm's own quorum-corroborated logic): on 'locked',
+   * commit the funded sentinel + reconstruct myEvmSwapId/myFundingTxid/funded so the own-leg payout paths work with NO
+   * host re-lock and NO counterparty-leg re-verification. Fail-closed: no reconstruction on 'blocked' (retry later) /
+   * 'safe' (never landed — the fund gate re-drives) / any read error. Returns true iff the lock was adopted.
+   */
+  private async recoverEvmLockOnResume(): Promise<boolean> {
+    const rec = this.record;
+    if (!(chainConfigs[this.myChain] as { isEvm?: boolean } | undefined)?.isEvm) return false; // own leg is EVM
+    if (rec.funded || (await this.deps.durable.get(fundedKey(rec.id)))) return false; // already funded / reconstructed
+    const pendingMarker = await this.deps.durable.get(lockPendingKey(rec.id));
+    if (!pendingMarker) return false; // no in-flight lock marker
+    const markedHash = await this.deps.durable.get(evmLockTxKey(rec.id));
+    const lockTxHash = (markedHash && BYTES32_0X.test(markedHash.toLowerCase())) ? markedHash.toLowerCase()
+      : (BYTES32_0X.test(pendingMarker.toLowerCase()) ? pendingMarker.toLowerCase() : null);
+    if (!lockTxHash) return false; // pre-broadcast sentinel, no tx hash yet — nothing to adopt; KEEP
+    let htlcAddr: string;
+    try { ({ htlcAddr } = this.evmCfgFor(this.myChain)); } catch { return false; }
+    const recipient = (rec.counterpartyEvmAddress ?? '');
+    if (!ethers.isAddress(recipient)) return false;
+    let hashLock: string;
+    try { hashLock = this.hashLock0x('recoverEvmLockOnResume'); } catch { return false; }
+    let amount: bigint;
+    try { amount = this.evmAmountBaseUnits(this.role === 'initiator' ? rec.offer.sendAmount : rec.offer.receiveAmount, 'recoverEvmLockOnResume'); } catch { return false; }
+    let sender = '';
+    try { sender = await this.evmSigner(this.myChain).getAddress(); } catch { sender = ''; }
+    let recovery: { kind: 'locked'; swapId: string } | { kind: 'safe' | 'blocked' };
+    try {
+      recovery = await recoverLockFromTx(htlcAddr, lockTxHash, this.evmProvider(this.myChain), { sender, hashLock, recipient, minAmount: amount, fromBlock: rec.evmLockBlock });
+    } catch { return false; } // can't tell — KEEP (a later resume retries)
+    if (recovery.kind !== 'locked') return false; // 'blocked' -> retry later; 'safe' -> never landed, fund gate re-drives
+    await this.deps.durable.commit([[fundedKey(rec.id), recovery.swapId.toLowerCase()]]);
+    await this.deps.durable.remove(lockPendingKey(rec.id));
+    this.record = { ...this.record, myEvmSwapId: recovery.swapId, myFundingTxid: recovery.swapId, funded: true };
+    this.setPhase(this.role === 'initiator' ? 'initiator_funded' : 'responder_funded');
+    await this.persistRecord();
+    this.status('recoverEvmLockOnResume:adopted');
+    return true;
   }
 
   /**

@@ -1505,6 +1505,31 @@ describe('SwapController.lockEvm() — fix #2 re-mint FRESH at the choke point',
   it('(fix #1 compile) lockEvm STRUCTURALLY requires a FundProof — no-arg / RevealAuthorization do not compile', () => {
     expect(typeof _lockEvmCompileCheck).toBe('function');
   });
+
+  it('R-EVMLOCK-RESUME-001: resume() reconstructs a CRASHED EVM own-leg lock (lockpending+evmlocktx set, funded unset) -> myEvmSwapId + funded restored', async () => {
+    // Crash during lockEvm's tx.wait: the lock BROADCAST (onBroadcast committed lockpending+evmlocktx) but funded +
+    // record.myEvmSwapId were never set. The leg IS locked on-chain. Before the fix, resume left it un-refundable /
+    // un-watchable ('pre-funding'); now recoverEvmLockOnResume adopts it via recoverLockFromTx.
+    const LOCK_TX_HASH = '0x' + 'cd'.repeat(32);
+    const BASE_HTLC = getEvmConfig(84532)!.htlcAddress; // OUR own EVM leg ('base') deployed HTLC
+    const lockedLog = htlcInterface.encodeEventLog('Locked', [EVM_SWAP_ID, EVM_RECIP, EVM_CP_ADDR, ZERO_ADDRESS, EVM_AMT, EVM_HASHLOCK, 1_900_000_000n]);
+    const receipt = { status: 1, blockNumber: 10, logs: [{ address: BASE_HTLC, topics: lockedLog.topics, data: lockedLog.data }] };
+    const onChainSwap = makeSwap({ initiator: EVM_RECIP, recipient: EVM_CP_ADDR, token: ZERO_ADDRESS, amount: EVM_AMT, hashLock: EVM_HASHLOCK, timeLock: 1_900_000_000n });
+    const baseQuorum = new MockEvmProvider({ swap: onChainSwap, leafProviders: [new MockEvmProvider({ receipt }), new MockEvmProvider({ receipt })], blockNumber: 5000 });
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:lockpending:evmfund-1', LOCK_TX_HASH); // lock broadcast; funded never committed (crash)
+    await durable.set('bch2swap:evmlocktx:evmfund-1', LOCK_TX_HASH);
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP);
+    const ctrl = await SwapController.resume(evmFundRecord(), makeEvmDeps({
+      evmProviderFor: (chain) => P(chain === 'base' ? baseQuorum : evmLegProvider()),
+      evmSignerFor: () => SG(signer),
+      durable,
+    }));
+    expect((await durable.get('bch2swap:funded:evmfund-1'))?.toLowerCase()).toBe(EVM_SWAP_ID.toLowerCase()); // funded sentinel restored
+    expect(await durable.get('bch2swap:lockpending:evmfund-1')).toBeNull();                                  // pending marker cleared
+    expect(ctrl.getState().phase).toBe('responder_funded');                                                 // reconstructed to the funded state
+    expect(ctrl.getState().resumeGate).toBe('post-funding');
+  });
 });
 
 // ── (iii) revealAndClaimEvm(auth) — fix #3 role + fix #2 re-mint ──────────────────────────────────────────
@@ -1605,6 +1630,30 @@ describe('R-EVMCLAIM-REORG-001 EVM claim reorg corroboration', () => {
       evmProviderFor: () => P(claimProvider), evmSignerFor: () => SG(signer), durable,
     }));
     expect(signer.broadcastCount).toBe(1);                    // the orphaned claim was re-broadcast (auto-recovery)
+    expect(ctrl.getState().resumeGate).toBe('claim-in-flight');
+  });
+
+  it('R-EVMCLAIM-RESUME-S-001: a RESPONDER (EVM<->EVM) re-drives an orphaned leg-X claim on FRESH resume — S re-extracted from leg Y Claimed event', async () => {
+    // The narrow completeness gap in the round-6 confirmClaimEvm add: on a fresh-process resume the responder's
+    // in-memory this.secret is null, so the orphan re-drive (reBroadcastOrphanedEvmClaim) used to throw 'S unavailable'.
+    // But S is PUBLIC in the responder's OWN leg Y (myEvmSwapId) Claimed event — re-extract it and re-broadcast leg X.
+    const MY_SWAP_ID = '0x' + 'ce'.repeat(32); // our OWN EVM leg Y swapId (claimed by the initiator -> S public)
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:claimbroadcast:evmfund-1', '1'); // a leg-X claim was in flight (via the refund-race pivot)
+    // leg X (theirChain=arb): the 1-conf claim was orphaned — claimed=false, lock still funded.
+    const orphan = makeSwap({ initiator: EVM_CP_ADDR, recipient: EVM_RECIP, hashLock: EVM_HASHLOCK, token: ZERO_ADDRESS, amount: EVM_AMT, timeLock: 1_900_000_000n, claimed: false, refunded: false });
+    const arbProvider = new MockEvmProvider({ swap: orphan, safeSwap: orphan, block: { timestamp: EVM_CHAIN_NOW }, blockNumber: 5000, chainId: 42161n });
+    // leg Y (myChain=base): our own leg was CLAIMED by the initiator -> S public in leg Y's Claimed(MY_SWAP_ID, S).
+    const claimedLog = htlcInterface.encodeEventLog('Claimed', [MY_SWAP_ID, ethers.hexlify(S)]);
+    const leaf = () => new MockEvmProvider({ logs: [{ topics: claimedLog.topics, data: claimedLog.data, blockNumber: 10 }] });
+    const baseProvider = new MockEvmProvider({ leafProviders: [leaf(), leaf()], blockNumber: 5000 });
+    const signer = new MockSigner(arbProvider, EVM_RECIP, { mode: 'ok' }); // leg-X re-broadcast on arb
+    const ctrl = await SwapController.resume(
+      evmFundRecord({ role: 'responder', phase: 'claimed', myEvmSwapId: MY_SWAP_ID }),
+      makeEvmDeps({ evmProviderFor: (chain) => P(chain === 'arb' ? arbProvider : baseProvider), evmSignerFor: () => SG(signer), durable }),
+    );
+    expect(ctrl.getState().hasSecret).toBe(true);             // S re-extracted from leg Y's Claimed event on a fresh resume
+    expect(signer.broadcastCount).toBe(1);                    // the orphaned leg-X claim was re-broadcast
     expect(ctrl.getState().resumeGate).toBe('claim-in-flight');
   });
 });
