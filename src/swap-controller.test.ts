@@ -35,6 +35,7 @@ import { hexToBytes, bytesToHex, hash160, sha256, createHTLCRedeemScript } from 
 import { claimHTLC } from './swap-flow';
 import { swapSecretFromKss } from './seed-secret';
 import { __setSpvConfigForTests, __resetSpvCacheForTests } from './spv-verifier';
+import { _clearFeeRateCache } from './fee-rate';
 import { blockHashInternal, checkPoW, hash256, type AsertParams } from './spv';
 import {
   assertRevealSafe as gateAssertRevealSafe,
@@ -551,6 +552,31 @@ describe('SwapController.revealAndClaim() — the initiator secret reveal (fix #
     expect(btc.broadcasts.length).toBe(1);            // secret revealed exactly once
     expect(ctrl.getState().phase).toBe('claimed');
     expect(txid).toBeTruthy();
+  });
+
+  it('R-FEE-DEADLINE-001: the secret-revealing claim consults the LIVE fee rate (the deadline-aware fee module is WIRED, not dead code)', async () => {
+    _clearFeeRateCache(); // fetchFeeRate caches per chain 45s — clear so THIS claim actually queries estimatefee
+    let estimateFeeAsked = 0;
+    class FeeAwareClient extends MockElectrumClient {
+      async request<T = unknown>(method: string, params: unknown[]): Promise<T> {
+        if (method === 'blockchain.estimatefee') { estimateFeeAsked++; return { satPerByte: 40 } as unknown as T; } // a high live rate
+        return super.request<T>(method, params); // headers.subscribe etc.
+      }
+    }
+    const btc = new FeeAwareClient({
+      headersByHeight: FX.headersByHeight,
+      merkleProof: { block_height: FX.fundHeight, merkle: [], pos: 0 },
+      utxos: [{ tx_hash: FX.fundTxid, tx_pos: 0, value: 100000, height: FX.fundHeight }],
+      rawTxByTxid: { [FX.fundTxid]: FX.fundRawHex },
+      height: FX.tip, tipHeaderHex: FX.headersByHeight[FX.tip], broadcastTxid: '00'.repeat(31) + 'aa',
+    });
+    const ctrl = new SwapController(revealRecord(), makeMultiDeps({ btc }));
+    const auth = await ctrl.verifyCounterpartyLegForReveal();
+    const { txid } = await ctrl.revealAndClaim(auth);
+    expect(txid).toBeTruthy();
+    // Before the fix, buildSecretClaim called claimHTLC with NO feeRate → the fee module was never consulted (dead
+    // code). Now the claim builds at the live, deadline-aware rate, so estimatefee is queried during the claim.
+    expect(estimateFeeAsked).toBeGreaterThan(0);
   });
 
   it('(fix #3) revealAndClaim with a RESPONDER-role authorization THROWS and broadcasts NOTHING', async () => {

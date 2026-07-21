@@ -177,9 +177,10 @@ var InProcessMutex = class {
     await this.settle();
     if (await store.get(key) !== stamp) throw new MutexBusyError(name, "cross-process");
     let hb;
+    let hbInFlight = Promise.resolve();
     try {
       hb = setInterval(() => {
-        void (async () => {
+        hbInFlight = (async () => {
           try {
             if (_parseCas(await store.get(key))?.token === this.token) await store.set(key, `${this.token}@${this.now()}`);
           } catch {
@@ -196,6 +197,10 @@ var InProcessMutex = class {
           clearInterval(hb);
         } catch {
         }
+      }
+      try {
+        await hbInFlight;
+      } catch {
       }
       try {
         if (_parseCas(await store.get(key))?.token === this.token) await store.remove(key);

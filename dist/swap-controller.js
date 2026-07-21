@@ -241,6 +241,8 @@ var MAX_FEE_RATE_SAT_PER_BYTE = {
 function maxFeeRate(chain) {
   return MAX_FEE_RATE_SAT_PER_BYTE[chain] || 1;
 }
+var FEE_URGENCY_MAX_MULT = 3;
+var FEE_URGENCY_START_FACTOR = 4;
 function getChainConfig(chain) {
   const cfg = chainConfigs[chain];
   if (!cfg) throw new Error(`getChainConfig: unknown chain '${chain}'`);
@@ -537,7 +539,7 @@ function minClaimableHtlcAmount(chain) {
   return Math.max(dustThreshold * 5, estClaimFee + dustThreshold);
 }
 function resolveClampedFeeRate(feeRate, configRate, chain) {
-  const r = configRate ?? 1;
+  const r = feeRate ?? configRate ?? 1;
   return Number.isFinite(r) ? Math.min(r, maxFeeRate(chain)) : r;
 }
 async function buildHTLCFundingTx(inputs, htlcScriptPubKey, amount, changeScriptPubKey, chain, feeRate) {
@@ -1671,6 +1673,48 @@ async function getChainTimeSec(client) {
   } catch {
     return null;
   }
+}
+
+// src/fee-rate.ts
+var FEE_CACHE_TTL_MS = 45e3;
+var _cache = /* @__PURE__ */ new Map();
+function configFloor(chain) {
+  const f = getChainConfig(chain).feePerByte;
+  return typeof f === "number" && Number.isFinite(f) && f > 0 ? f : 1;
+}
+async function fetchFeeRate(chain, estimate, force = false) {
+  const floor = configFloor(chain);
+  const cap = maxFeeRate(chain);
+  const cached = _cache.get(chain);
+  if (!force && cached && Date.now() - cached.at < FEE_CACHE_TTL_MS) return cached.rate;
+  let rate = floor;
+  try {
+    const live = await estimate();
+    if (typeof live === "number" && Number.isFinite(live) && live > 0) {
+      rate = Math.max(floor, Math.min(Math.ceil(live), cap));
+    }
+  } catch {
+  }
+  _cache.set(chain, { rate, at: Date.now() });
+  return rate;
+}
+function deadlineAwareFeeRate(chain, baseRate, remainingSec, marginSec) {
+  const floor = configFloor(chain);
+  const cap = maxFeeRate(chain);
+  const base = Math.max(floor, Math.min(Number.isFinite(baseRate) ? baseRate : floor, cap));
+  let mult = 1;
+  if (Number.isFinite(remainingSec) && Number.isFinite(marginSec) && marginSec > 0) {
+    if (remainingSec <= marginSec) {
+      mult = FEE_URGENCY_MAX_MULT;
+    } else {
+      const startAt = marginSec * FEE_URGENCY_START_FACTOR;
+      if (remainingSec < startAt) {
+        const frac = (startAt - remainingSec) / (startAt - marginSec);
+        mult = 1 + frac * (FEE_URGENCY_MAX_MULT - 1);
+      }
+    }
+  }
+  return Math.max(floor, Math.min(Math.ceil(base * mult), cap));
 }
 
 // src/timelock-gates.ts
@@ -3744,7 +3788,8 @@ var SwapController = class _SwapController {
       );
       if (!(authed.value > 0)) throw new Error("refund: HTLC funding output failed re-authentication \u2014 not signing the refund");
       this.status("refund:building");
-      const refundTx = await buildHTLCRefundTx(authed, redeemScript, locktime, sk.privateKey, sk.publicKey, destScriptPubKey, this.myChain);
+      const feeRate = await this.legAwareFeeRate(client, this.myChain, redeemScript);
+      const refundTx = await buildHTLCRefundTx(authed, redeemScript, locktime, sk.privateKey, sk.publicKey, destScriptPubKey, this.myChain, feeRate);
       const refundRec = { txid: refundTx.txid, rawTx: refundTx.rawTx, spent: { tx_hash: selected.tx_hash, tx_pos: selected.tx_pos } };
       this.status("refund:committing");
       await this.deps.durable.commit([
@@ -4290,6 +4335,42 @@ var SwapController = class _SwapController {
    * raw tx before signing (never trusts the proxy listunspent value). Signs with the seed-derived key on `chain`
    * (whose hash160 is the HTLC recipient pkh) and sweeps to that same pkh. THROWS on no claimable/authenticatable UTXO.
    */
+  /**
+   * R-FEE-DEADLINE-001: the LIVE, deadline-aware sat/vByte for a UTXO claim/refund (wires the previously-inert
+   * fee-rate module into the fund-critical paths). (1) live base rate via fetchFeeRate — the proxy's
+   * blockchain.estimatefee (max(mempoolminfee, estimatesmartfee)), floored to the config rate + clamped to
+   * maxFeeRate, fail-safe to the floor on any error. (2) scaled UP by deadlineAwareFeeRate as the leg's refund
+   * runway (from the AUTHENTICATED redeemScript CLTV + a best-effort tip) approaches CLAIM_MARGIN; a stale/
+   * under-reported tip only shrinks the multiplier toward the live base, never below it (a lying proxy can't
+   * underprice below the live network rate). Without this the tx builds at the STATIC config rate and, on a
+   * fee-volatile chain (BTC/BCH) during a sustained spike, the secret-revealing claim can enter the mempool but
+   * not confirm inside the reveal margin → the counterparty refunds one leg and claims the other = double-loss.
+   */
+  async legAwareFeeRate(client, chain, redeemScript) {
+    const base = await fetchFeeRate(chain, async () => {
+      try {
+        const r = await client.request("blockchain.estimatefee", []);
+        return r && typeof r.satPerByte === "number" ? r.satPerByte : null;
+      } catch {
+        return null;
+      }
+    });
+    let remainingSec;
+    try {
+      const cpLock = parseHtlcCltv(redeemScript);
+      if (cpLock != null) {
+        const hdr = await client.request("blockchain.headers.subscribe", []);
+        if (cpLock >= 5e8) {
+          const now = parseHeaderTimeSec(hdr?.hex ?? "");
+          if (now != null) remainingSec = cpLock - now;
+        } else if (hdr && Number.isInteger(hdr.height)) {
+          remainingSec = (cpLock - hdr.height) * (chainConfigs[chain]?.avgBlockTimeSec ?? 600);
+        }
+      }
+    } catch {
+    }
+    return remainingSec != null && Number.isFinite(remainingSec) ? deadlineAwareFeeRate(chain, base, remainingSec, CLAIM_MARGIN_SEC) : base;
+  }
   async buildSecretClaim(chain, redeemScript, secret, preferOutpoint) {
     const client = this.deps.chainClientFor(chain);
     const scripthash = getHTLCScripthash(redeemScript);
@@ -4311,7 +4392,8 @@ var SwapController = class _SwapController {
     }
     const sk = await this.deps.seedVault.signingKey(chain);
     const destPkh = hash160(sk.publicKey);
-    const tx = await claimHTLC(authed, redeemScript, secret, sk.privateKey, sk.publicKey, destPkh, chain);
+    const feeRate = await this.legAwareFeeRate(client, chain, redeemScript);
+    const tx = await claimHTLC(authed, redeemScript, secret, sk.privateKey, sk.publicKey, destPkh, chain, feeRate);
     return { txid: tx.txid, rawTx: tx.rawTx, spent: { tx_hash: chosen.tx_hash, tx_pos: chosen.tx_pos } };
   }
   /**

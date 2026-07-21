@@ -1,5 +1,21 @@
 # Changelog
 
+## 3.1.5
+
+### Fixed (fund-safety — audit round 3)
+- **R-FEE-DEADLINE-001** (HIGH; MEDIUM for a BCH2↔EVM-only deployment): the deadline-aware fee module
+  (`fee-rate.ts`) was inert dead code — `buildSecretClaim` + the refund path called `claimHTLC`/`buildHTLCRefundTx`
+  with NO `feeRate`, so both built at the STATIC config rate, while `index.ts` advertised "deadline-aware fees" as
+  a delivered property. On a fee-volatile UTXO chain (BTC/BCH) during a sustained spike, the secret-revealing claim
+  could enter the mempool (secret public) but not confirm inside the reveal margin → the counterparty refunds one
+  leg and claims the other = initiator double-loss. Now wired: a live `fetchFeeRate` base (proxy `blockchain.estimatefee`,
+  floored to config + clamped, fail-safe) scaled UP by `deadlineAwareFeeRate` as the leg's runway approaches the
+  claim margin, threaded into the claim + refund builders. The advertised property is now real. Regression added.
+- **R-MUTEX-HB-001** (LOW): the InProcessMutex CAS heartbeat's in-flight renew tick (a fire-and-forget async IIFE)
+  could complete its `store.set` AFTER `release()`, resurrecting the lock sentinel and stranding a peer instance for
+  up to `ttlMs` (240s). The finally now drains the in-flight tick before releasing, so the release is the last write.
+  Availability only (no fund impact — a durable single-flight sentinel already prevents double-fund/lock).
+
 ## 3.1.4
 
 ### Fixed (fund-safety — HIGH, found by the no-stone-unturned gates review)

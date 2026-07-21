@@ -462,6 +462,18 @@ declare class SwapController {
      * raw tx before signing (never trusts the proxy listunspent value). Signs with the seed-derived key on `chain`
      * (whose hash160 is the HTLC recipient pkh) and sweeps to that same pkh. THROWS on no claimable/authenticatable UTXO.
      */
+    /**
+     * R-FEE-DEADLINE-001: the LIVE, deadline-aware sat/vByte for a UTXO claim/refund (wires the previously-inert
+     * fee-rate module into the fund-critical paths). (1) live base rate via fetchFeeRate — the proxy's
+     * blockchain.estimatefee (max(mempoolminfee, estimatesmartfee)), floored to the config rate + clamped to
+     * maxFeeRate, fail-safe to the floor on any error. (2) scaled UP by deadlineAwareFeeRate as the leg's refund
+     * runway (from the AUTHENTICATED redeemScript CLTV + a best-effort tip) approaches CLAIM_MARGIN; a stale/
+     * under-reported tip only shrinks the multiplier toward the live base, never below it (a lying proxy can't
+     * underprice below the live network rate). Without this the tx builds at the STATIC config rate and, on a
+     * fee-volatile chain (BTC/BCH) during a sustained spike, the secret-revealing claim can enter the mempool but
+     * not confirm inside the reveal margin → the counterparty refunds one leg and claims the other = double-loss.
+     */
+    private legAwareFeeRate;
     private buildSecretClaim;
     /**
      * Greedy FIFO UTXO selection — ported from prepareFundingTx (~5431-5457): oldest-confirmed-first (immature

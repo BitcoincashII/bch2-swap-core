@@ -45,9 +45,11 @@ import {
 import { hexToBytes, bytesToHex, hash160, sha256, maxPlausibleBlockHeight, buildHTLCRefundTx, createHTLC } from './htlc-builder';
 import { p2pkhScripthash } from './address-codec';
 import { chainConfigs, isSwapPairSuspended } from './chain-config';
-import { spvSupported, verifyFundingHeight, verifyConfirmations } from './spv-verifier';
+import { spvSupported, verifyFundingHeight, verifyConfirmations, parseHeaderTimeSec } from './spv-verifier';
+import { fetchFeeRate, deadlineAwareFeeRate } from './fee-rate';
+import { CLAIM_MARGIN_SEC } from './timelock-gates';
 import {
-  assertLegBuriedForFunding, assertRevealSafe, assertEvmLegBuriedForFunding, assertEvmRevealSafe,
+  assertLegBuriedForFunding, assertRevealSafe, assertEvmLegBuriedForFunding, assertEvmRevealSafe, parseHtlcCltv,
   type FundProof, type RevealAuthorization,
 } from './gates';
 import type { HTLCDetails, HTLCParams, Utxo } from './swap-types';
@@ -1286,7 +1288,10 @@ export class SwapController {
 
       // Build the refund tx (nSequence 0xfffffffe + nLockTime=locktime set inside buildHTLCRefundTx). No secret.
       this.status('refund:building');
-      const refundTx = await buildHTLCRefundTx(authed, redeemScript, locktime, sk.privateKey, sk.publicKey, destScriptPubKey, this.myChain);
+      // R-FEE-DEADLINE-001: refund at the live, deadline-aware rate too — a stuck refund past its own timelock is a
+      // fund-recovery failure on a fee-volatile chain.
+      const feeRate = await this.legAwareFeeRate(client, this.myChain, redeemScript);
+      const refundTx = await buildHTLCRefundTx(authed, redeemScript, locktime, sk.privateKey, sk.publicKey, destScriptPubKey, this.myChain, feeRate);
       const refundRec = { txid: refundTx.txid, rawTx: refundTx.rawTx, spent: { tx_hash: selected.tx_hash, tx_pos: selected.tx_pos } };
 
       // R280-H1 / fix #4 durable-before-broadcast: persist the raw refund tx + the sentinel ATOMICALLY BEFORE the
@@ -1825,6 +1830,42 @@ export class SwapController {
    * raw tx before signing (never trusts the proxy listunspent value). Signs with the seed-derived key on `chain`
    * (whose hash160 is the HTLC recipient pkh) and sweeps to that same pkh. THROWS on no claimable/authenticatable UTXO.
    */
+  /**
+   * R-FEE-DEADLINE-001: the LIVE, deadline-aware sat/vByte for a UTXO claim/refund (wires the previously-inert
+   * fee-rate module into the fund-critical paths). (1) live base rate via fetchFeeRate — the proxy's
+   * blockchain.estimatefee (max(mempoolminfee, estimatesmartfee)), floored to the config rate + clamped to
+   * maxFeeRate, fail-safe to the floor on any error. (2) scaled UP by deadlineAwareFeeRate as the leg's refund
+   * runway (from the AUTHENTICATED redeemScript CLTV + a best-effort tip) approaches CLAIM_MARGIN; a stale/
+   * under-reported tip only shrinks the multiplier toward the live base, never below it (a lying proxy can't
+   * underprice below the live network rate). Without this the tx builds at the STATIC config rate and, on a
+   * fee-volatile chain (BTC/BCH) during a sustained spike, the secret-revealing claim can enter the mempool but
+   * not confirm inside the reveal margin → the counterparty refunds one leg and claims the other = double-loss.
+   */
+  private async legAwareFeeRate(client: SwapChainClient, chain: Chain, redeemScript: Uint8Array): Promise<number> {
+    const base = await fetchFeeRate(chain, async () => {
+      try {
+        const r = await client.request<{ satPerByte?: number }>('blockchain.estimatefee', []);
+        return (r && typeof r.satPerByte === 'number') ? r.satPerByte : null;
+      } catch { return null; }
+    });
+    let remainingSec: number | undefined;
+    try {
+      const cpLock = parseHtlcCltv(redeemScript);
+      if (cpLock != null) {
+        const hdr = await client.request<{ height: number; hex: string }>('blockchain.headers.subscribe', []);
+        if (cpLock >= 500_000_000) {
+          const now = parseHeaderTimeSec(hdr?.hex ?? '');
+          if (now != null) remainingSec = cpLock - now;
+        } else if (hdr && Number.isInteger(hdr.height)) {
+          remainingSec = (cpLock - hdr.height) * (chainConfigs[chain]?.avgBlockTimeSec ?? 600);
+        }
+      }
+    } catch { /* best-effort ramp: on any read failure keep the live base rate (already the primary protection) */ }
+    return (remainingSec != null && Number.isFinite(remainingSec))
+      ? deadlineAwareFeeRate(chain, base, remainingSec, CLAIM_MARGIN_SEC)
+      : base;
+  }
+
   private async buildSecretClaim(
     chain: Chain,
     redeemScript: Uint8Array,
@@ -1858,7 +1899,10 @@ export class SwapController {
 
     const sk = await this.deps.seedVault.signingKey(chain);
     const destPkh = hash160(sk.publicKey); // sweep to the recipient pkh committed in the HTLC (our own claim key)
-    const tx = await claimHTLC(authed, redeemScript, secret, sk.privateKey, sk.publicKey, destPkh, chain);
+    // R-FEE-DEADLINE-001: build the secret-revealing claim at the LIVE, deadline-aware rate (not the static config
+    // rate) so it confirms inside the reveal margin during a fee spike.
+    const feeRate = await this.legAwareFeeRate(client, chain, redeemScript);
+    const tx = await claimHTLC(authed, redeemScript, secret, sk.privateKey, sk.publicKey, destPkh, chain, feeRate);
     return { txid: tx.txid, rawTx: tx.rawTx, spent: { tx_hash: chosen.tx_hash, tx_pos: chosen.tx_pos } };
   }
 

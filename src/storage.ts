@@ -260,9 +260,14 @@ export class InProcessMutex implements Mutex {
     // EXPIRED by a peer instance sharing the store, which would steal the lock and run a SECOND concurrent holder on
     // the single-flight fund/lock path. Only re-write while the sentinel is still ours; cleared in finally.
     let hb: ReturnType<typeof setInterval> | undefined;
+    // R-MUTEX-HB-001: track the LATEST heartbeat tick's promise. A tick is a fire-and-forget async IIFE, so
+    // clearInterval() in the finally stops FUTURE ticks but cannot cancel one already mid-flight — and that tick's
+    // late store.set() would RESURRECT the sentinel AFTER our release(), stranding a peer for up to ttlMs. We await
+    // this before releasing so the release (remove) is guaranteed to be the last write.
+    let hbInFlight: Promise<void> = Promise.resolve();
     try {
       hb = setInterval(() => {
-        void (async () => {
+        hbInFlight = (async () => {
           try {
             if (_parseCas(await store.get(key))?.token === this.token) await store.set(key, `${this.token}@${this.now()}`);
           } catch { /* ignore a transient store error; the next tick retries */ }
@@ -273,6 +278,7 @@ export class InProcessMutex implements Mutex {
       return await fn();
     } finally {
       if (hb) { try { clearInterval(hb); } catch { /* ignore */ } }
+      try { await hbInFlight; } catch { /* R-MUTEX-HB-001: drain the in-flight tick so its renew can't post-date our release */ }
       // Release only if the sentinel is still ours (a peer that reclaimed a TTL-expired lock keeps its own).
       try { if (_parseCas(await store.get(key))?.token === this.token) await store.remove(key); } catch { /* ignore */ }
     }
