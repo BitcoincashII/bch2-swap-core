@@ -2,9 +2,9 @@ export { DurableHTLC, DurableSwapRecord, MnemonicSeedVault, Outpoint, RecordPhas
 export { FundProof, GateDisposition, GateFailure, RevealAuthorization } from './gates.js';
 export { BrowserMutex, DurableStore, DurableStoreInconsistentError, InMemoryDurableStore, InMemorySessionStore, InProcessMutex, LocalStorageDurableStore, Mutex, MutexBusyError, MutexUnavailableError, SessionStore, StorageLike, WebLocksLike, WindowSessionStore } from './storage.js';
 export { UtxoReservationRegistry } from './utxo-reservation.js';
-export { CentralizedOrderBook, Chain, MockOrderBook, OrderBook, OrderFilter, OrderStatus, PostOrderRequest, SwapOrder, SwapProposal, TakeOrderResult } from './order-book/index.js';
+export { CentralizedOrderBook, Chain, MockOrderBook, OrderBook, OrderFilter, OrderStatus, PostOrderRequest, SwapOrder, SwapProposal, TakeOrderResult, bookChainToOffer, offerChainToBook, offerToProposal, orderToOffer, proposalToOffer } from './order-book/index.js';
 export { bc1AddressToScripthash, decodeBase58, decodeBech32, decodeBech32m, decodeCashAddr, decodeLegacyAddress, decodeWIF, encodeBase58, encodeBech32, encodeBech32m, encodeCashAddr, encodeLegacyAddress, encodeWIF, hash160, isBech32Address, p2pkScripthash, p2pkhScripthash, p2shP2wpkhScripthash, p2trScripthash, p2wpkhScripthash, pubkeyToBC2Address, pubkeyToBCH2Address, pubkeyToBCHAddress, pubkeyToBTCAddress, pubkeyToBech32Address, pubkeyToP2SHP2WPKHAddress, xonlyPubkeyToP2TRAddress } from './address-codec.js';
 export { EncryptedData, MAX_PBKDF2_ITERATIONS, MIN_PBKDF2_ITERATIONS, PBKDF2_ITERATIONS, decryptMnemonic, encryptMnemonic, resolveIterations, validatePassword } from './key-encryption.js';
-import './swap-types-CbNzOsAe.js';
+import './swap-types-CsSbca8_.js';
 import 'ethers';
 import './chain-client.js';

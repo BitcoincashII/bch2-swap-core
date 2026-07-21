@@ -9,11 +9,11 @@
 //     the Electrum client in ./electrum-node-client.mjs and the live CentralizedOrderBook.
 //   • When you run it with a FUNDED wallet and BCH2_SWAP_LIVE=1, it drives REAL
 //     on-chain funds. Atomic swaps are IRREVERSIBLE. TEST ON TESTNET/REGTEST FIRST.
-//   • The CentralizedOrderBook talks to the LIVE proxy. This file does NOT
-//     independently re-verify the order-book ↔ proxy API contract (proposal/offer
-//     field mapping, take semantics) — that is tracked separately. The bits that
-//     depend on it are marked `COORDINATION SEAM` and FAIL CLOSED (they stop the bot
-//     BEFORE any irreversible action rather than fund/reveal on a guess).
+//   • The CentralizedOrderBook talks to the LIVE proxy. The order↔offer FIELD MAPPING
+//     is the SDK's documented adapter (offerToProposal / orderToOffer — types match the
+//     live proxy). What remains a COORDINATION SEAM is the out-of-band delivery of the
+//     counterparty's published HTLC; those bits FAIL CLOSED (they stop the bot BEFORE any
+//     irreversible action rather than fund/reveal on a guess).
 //   • Fund-safety lives INSIDE the SwapController (SPV depth gates, timelock ordering,
 //     secret lifecycle, single-flight, durable-before-broadcast). This bot only
 //     injects I/O + signing and calls the methods in order. It cannot make the swap
@@ -46,11 +46,14 @@ import {
   InProcessMutex,
   UtxoReservationRegistry,
 } from '../dist/index.js';
-import { CentralizedOrderBook } from '../dist/order-book/index.js';
+import {
+  CentralizedOrderBook, offerToProposal, orderToOffer, offerChainToBook, bookChainToOffer,
+} from '../dist/order-book/index.js';
 import { deriveKeyForSigning, deriveAddresses, validateMnemonic } from '../dist/wallet-core.js';
 import { deriveSwapSecret, generateSwapNonce, SWAP_SECRET_SCHEME } from '../dist/seed-secret.js';
 import { chainConfigs, isSwapPairSuspended } from '../dist/chain-config.js';
 import { hash160, sha256, bytesToHex, hexToBytes, htlcScripthash } from '../dist/htlc-builder.js';
+import { decodeCashAddr, decodeLegacyAddress } from '../dist/address-codec.js';
 import { makeElectrumChainClient } from './electrum-node-client.mjs';
 import { createRequire } from 'node:module';
 
@@ -198,53 +201,30 @@ function buildMakerOffer(sendChain, recvChain, amount, mnemonic) {
 }
 
 // -----------------------------------------------------------------------------
-// Order-book bridge  (COORDINATION SEAM — not re-verified vs the live proxy here)
+// Order-book ↔ execution mapping — now the SDK's DOCUMENTED adapter (matches the live proxy).
 //
-// The order-book's SwapProposal/SwapOrder discovery model and the SwapController's SwapOffer execution
-// model are DIFFERENT shapes. Mapping between them (and the exact proposal field semantics the live proxy
-// expects) is application-specific. The mappings below are a best-effort reference; treat the on-the-wire
-// contract as authoritative and validate against your deployment before trusting it with funds.
+// The order-book's SwapProposal/SwapOrder TRANSPORT model and the SwapController's SwapOffer EXECUTION model
+// are different shapes. The SDK exports the verified bridge (see @bch2/swap-core/order-book → ./adapter):
+//   • offerToProposal(offer)  — build a resting proposal to POST (maker)
+//   • orderToOffer(order)      — turn a live order off the book into a responder SwapOffer (taker)
+//   • offerChainToBook / bookChainToOffer — UPPER 'BCH2' ⇄ lower 'bch2' chain codes
+// The responder does NOT derive S (it learns it on-chain); orderToOffer carries the maker's committed
+// secretHash + chains + amounts, and the SwapController derives the responder's own claim/refund keys from
+// the seed vault, so no responder addresses need to be injected onto the offer.
+//
+// NOTE: take() semantics + out-of-band delivery of the counterparty HTLC remain COORDINATION SEAMS
+// (see resolveCounterpartyHtlc below) — the field mapping is verified; the coordination glue is your job.
 // -----------------------------------------------------------------------------
-const toBookChain = (c) => c.toUpperCase();   // 'bch2' → 'BCH2'
-const fromBookChain = (c) => String(c).toLowerCase();
 
-function proposalFromOffer(offer, mnemonic) {
-  const sendPub = deriveKeyForSigning(mnemonic, walletChainFor(offer.sendChain)).publicKey; // leg-X refund pubkey
-  return {
-    swapID: offer.id,
-    hashLock: offer.secretHash,
-    initiatorPubKey: bytesToHex(sendPub),
-    initiatorCSV: 216, // LOCKTIME_BLOCKS.initiator — advisory; the controller sets the real CLTV at build time
-    initiatorAmountSat: Number(offer.sendAmount),
-    responderAmountSat: Number(offer.receiveAmount),
-    minConfirmations: chainConfigs[offer.receiveChain]?.requiredConfirmations ?? 6,
-    feeSatoshis: 1000,
-  };
-}
-
-/** Reconstruct a responder-side SwapOffer from a taken order. The responder does NOT derive S (no nonce/scheme
- *  needed) — it only needs the chains, amounts, and the hashLock the maker committed. */
-function offerFromOrder(order, mnemonic) {
-  const sendChain = fromBookChain(order.offerChain);
-  const recvChain = fromBookChain(order.wantChain);
-  const nowSec = Math.floor(Date.now() / 1000);
-  return {
-    id: order.id,
-    sendChain,
-    receiveChain: recvChain,
-    sendAmount: order.proposal.initiatorAmountSat,
-    receiveAmount: order.proposal.responderAmountSat,
-    secretHash: order.proposal.hashLock, // authenticates S; responder re-checks sha256(S)==hashLock on-chain
-    secretScheme: SWAP_SECRET_SCHEME,    // advisory for the responder (it learns S on-chain)
-    initiatorSendAddress: '',
-    initiatorReceiveAddress: '',
-    status: 'taken',
-    createdAt: nowSec,
-    expiresAt: nowSec + 3600,
-    // responder's own addresses on the two legs
-    _responderReceiveAddress: deriveKeyForSigning(mnemonic, walletChainFor(sendChain)).address,
-    _responderSendAddress: deriveKeyForSigning(mnemonic, walletChainFor(recvChain)).address,
-  };
+/** The pkh that may CLAIM a UTXO leg — decoded from the counterparty's on-chain receive address on that leg
+ *  (P2PKH CashAddr for bch2/bch, Base58 for btc/bc2). Fails closed on anything that isn't a 20-byte P2PKH. */
+function claimPkhFromAddress(addr) {
+  if (!addr) throw new Error('claimPkhFromAddress: no counterparty receive address on the order yet');
+  const ca = decodeCashAddr(addr);
+  if (ca && ca.type === 0 && ca.hash?.length === 20) return bytesToHex(ca.hash);
+  const legacy = decodeLegacyAddress(addr);
+  if (legacy && legacy.length === 20) return bytesToHex(legacy);
+  throw new Error(`claimPkhFromAddress: '${addr}' is not a P2PKH CashAddr / Base58 address`);
 }
 
 // -----------------------------------------------------------------------------
@@ -305,23 +285,24 @@ async function runMaker(sendChain, recvChain, amount, deps, mnemonic) {
   // (1) POST the resting offer (nothing on-chain happens here).
   log(`Maker: posting offer ${offer.id}  ${sendChain} ${amount} → ${recvChain}`);
   const orderId = await book.postOrder({
-    proposal: proposalFromOffer(offer, mnemonic),
-    offerChain: toBookChain(sendChain),
-    wantChain: toBookChain(recvChain),
+    proposal: offerToProposal(offer),   // SDK adapter → the live-proxy proposal shape
+    offerChain: offerChainToBook(sendChain),
+    wantChain: offerChainToBook(recvChain),
     ttlSeconds: 3600,
   });
   log(`Maker: order live as ${orderId}. Waiting for a taker…`);
 
-  // (2) POLL the book until the order is taken (a real bot would subscribeToOrders and react).
+  // (2) POLL the book until the order is taken (a real bot would subscribeToOrders and react). The maker needs
+  //     the taker's leg-X receive address (who claims leg X with S) — present once the order is taken.
   const taken = await pollFor(async () => {
     const [o] = await book.queryOrders({}).then((os) => os.filter((x) => x.id === orderId));
-    return o && o.status === 'taken' && o.takerPubKey ? o : null;
+    return o && o.status === 'taken' && o.responderReceiveAddress ? o : null;
   }, { intervalMs: 3000, timeoutMs: 3600_000, label: 'await-take' });
   if (!taken) return die('Maker: order expired before it was taken.', 0);
-  log(`Maker: taken by ${taken.takerPubKey}`);
+  log(`Maker: taken (taker auth ${taken.takerAuthPub}); taker claims leg X to ${taken.responderReceiveAddress}`);
 
-  // The taker's pubkey (on YOUR send/leg-X chain) is who may claim your leg X with S.
-  const counterpartyClaimPkh = claimPkhFromPubkeyHex(taken.takerPubKey);
+  // The taker's receive address on YOUR send/leg-X chain identifies who may claim your leg X with S.
+  const counterpartyClaimPkh = claimPkhFromAddress(taken.responderReceiveAddress);
 
   // (3) FUND stage controller: prepare + fundLegX.
   const fundRecord = { id: offer.id, role: 'initiator', offer, phase: 'taken', counterpartyClaimPkh };
@@ -371,14 +352,16 @@ async function runTaker(orderId, deps, mnemonic) {
   // takerPubKey = the taker's pubkey on the maker's OFFER chain (leg X) — who may claim leg X with S.
   const [order] = await book.queryOrders({}).then((os) => os.filter((o) => o.id === orderId));
   if (!order) return die(`Taker: order ${orderId} not found on the book.`, 1);
-  const sendChain = fromBookChain(order.offerChain);   // maker sells this (leg X); taker claims it
-  const recvChain = fromBookChain(order.wantChain);    // maker buys this (leg Y); taker funds it
+  const sendChain = bookChainToOffer(order.offerChain);   // maker sells this (leg X); taker claims it
+  const recvChain = bookChainToOffer(order.wantChain);    // maker buys this (leg Y); taker funds it
   const takerPub = bytesToHex(deriveKeyForSigning(mnemonic, walletChainFor(sendChain)).publicKey);
 
   const take = await book.takeOrder(orderId, takerPub);
   log(`Taker: took ${orderId}. Maker sells ${sendChain}; I fund leg Y on ${recvChain}.`);
 
-  const offer = offerFromOrder({ ...order, ...take }, mnemonic);
+  // SDK adapter → responder SwapOffer (carries the maker's committed secretHash + chains + amounts). The
+  // responder learns S on-chain; the SwapController derives its own claim/refund keys from the seed vault.
+  const offer = orderToOffer({ ...order, proposal: take.proposal ?? order.proposal });
 
   // The maker's receive pubkey (on YOUR receive/leg-Y chain) is who may claim your leg Y with S — SEAM.
   const cpClaimPubHex = process.env.BCH2_SWAP_CP_CLAIM_PUBKEY;

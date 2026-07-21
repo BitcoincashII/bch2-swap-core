@@ -72,7 +72,7 @@ export class MockOrderBook implements OrderBook {
   async cancelOrder(orderId: string, makerPubKey: string): Promise<void> {
     const order = this.orders.get(orderId);
     if (!order) throw new Error(`order-book: order not found: ${orderId}`);
-    if (order.proposal.initiatorPubKey !== makerPubKey) {
+    if (order.proposal.authPub !== makerPubKey) {
       throw new Error('order-book: cancelOrder: pubKey does not match order maker');
     }
     if (order.status !== 'open') {
@@ -96,9 +96,9 @@ export class MockOrderBook implements OrderBook {
     }
     this.orders.set(orderId, {
       ...order,
-      status:      'taken',
-      takerPubKey: takerPubKey,
-      takenAt:     now,
+      status:       'taken',
+      takerAuthPub: takerPubKey,   // the identity presented to takeOrder (real proxy field)
+      takenAt:      now,
     });
     this.notify();
     return {

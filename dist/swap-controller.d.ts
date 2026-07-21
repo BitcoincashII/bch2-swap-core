@@ -1,4 +1,4 @@
-import { S as SwapOffer, C as Chain } from './swap-types-CbNzOsAe.js';
+import { S as SwapOffer, C as Chain } from './swap-types-CsSbca8_.js';
 import { GateChainClient, FundProof, RevealAuthorization } from './gates.js';
 import { DurableStore, SessionStore, Mutex } from './storage.js';
 import { UtxoReservationRegistry } from './utxo-reservation.js';

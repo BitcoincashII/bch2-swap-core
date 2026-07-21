@@ -1,4 +1,4 @@
-import { E as EvmChainId } from './swap-types-CbNzOsAe.js';
+import { E as EvmChainId } from './swap-types-CsSbca8_.js';
 
 interface EvmToken {
     symbol: string;

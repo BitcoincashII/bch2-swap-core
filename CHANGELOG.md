@@ -1,5 +1,32 @@
 # Changelog
 
+## 3.1.1
+
+### Fixed (order-book client ↔ live proxy)
+- The `CentralizedOrderBook` client's **types now match the live proxy** (`GET /api/orders` →
+  `{ success, data: SwapOrder[] }`). The stale `SwapProposal` (`swapID`/`initiatorPubKey`/`initiatorAmountSat`/…,
+  a shape the proxy never returned) is replaced by the REAL proposal shape — `offerChain`/`wantChain` chain codes,
+  base-unit (sats/wei) `sendAmount`/`receiveAmount`, `secretHash`/`secretNonce`/`secretScheme`, `makerIdPub`/`makerSig`/
+  `authPub`, the initiator addresses, `evmInfo`/`evmAddress`, and `hashLock`. `SwapOrder` now carries the real
+  top-level lifecycle + responder-coordination fields (`takenAt`, `responderLocktime`, `evmSwapId`,
+  `initiatorTxid`/`responderTxid`, `responderSendAddress`/`responderReceiveAddress`, `takerAuthPub`). Runtime
+  behavior is unchanged (the client always parsed dynamically); the TYPES no longer mislead a TS integrator.
+- **New documented `SwapOffer` adapter** (`@bch2/swap-core/order-book` → `./adapter`): `offerToProposal(offer)`,
+  `proposalToOffer(proposal)` / `orderToOffer(order)`, and the `offerChainToBook` / `bookChainToOffer` chain-code
+  mappers (UPPER `'BCH2'` ⇄ lower `'bch2'`). This makes the transport ⇄ execution mapping explicit and tested
+  (round-trip), replacing the reference bot's ad-hoc, not-proxy-verified bridge. The reference bot
+  (`examples/reference-bot.mjs`) now uses the exported adapter to map a live order to a `SwapOffer`.
+- **Amount-unit docs corrected**: `SwapProposal.sendAmount`/`receiveAmount` are documented as the chain's
+  BASE UNIT (sats for a UTXO chain, wei/token base units for EVM) as decimal strings — NOT human units. The
+  live proxy returns e.g. a BCH2 `"1290788219"` (= 12.90788219 BCH2), and `SwapController` consumes base
+  units directly; the prior "human unit (e.g. 1.5)" comment would have mis-sized an integrator's amount.
+
+### Added
+- **`examples/TESTNET-SWAP.md`** — the operator runbook for driving a REAL on-chain swap through the reference
+  bot + `SwapController` (testnet/small-value first): dry-validate → two parties → verify on a block explorer →
+  refund path → resume-after-crash → the production durable-store/mutex hardening + a pre-mainnet checklist.
+
+
 ## 3.1.0
 
 ### Added (integration surface, P2)
@@ -13,11 +40,6 @@
   so it connects/broadcasts nothing until an operator explicitly opts in; test on testnet first.
 - **`examples/WALLET-INTEGRATION.md`** — the signing-boundary guide: the wallet keeps the seed, injects a narrow
   `SeedVault` capability (optionally per-signature approval), and must not undermine the §9 fund-safety invariants.
-
-### Known (tracked)
-- The `CentralizedOrderBook` client's `proposal` type is stale vs the live proxy (parses at runtime; the types
-  mislead). The reference bot maps order→offer with a documented, not-yet-proxy-verified bridge. Fix tracked for
-  a follow-up.
 
 
 ## 3.0.1

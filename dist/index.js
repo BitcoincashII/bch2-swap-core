@@ -5758,6 +5758,101 @@ var UtxoReservationRegistry = class {
   }
 };
 
+// src/order-book/adapter.ts
+var BOOK_TO_OFFER = {
+  BCH2: "bch2",
+  BCH: "bch",
+  BTC: "btc",
+  BC2: "bc2",
+  ETH: "eth",
+  BASE: "base",
+  ARB: "arb",
+  POLY: "poly"
+};
+var OFFER_TO_BOOK = {
+  bch2: "BCH2",
+  bch: "BCH",
+  btc: "BTC",
+  bc2: "BC2",
+  eth: "ETH",
+  base: "BASE",
+  arb: "ARB",
+  poly: "POLY"
+};
+function bookChainToOffer(code) {
+  const upper = String(code).toUpperCase();
+  const mapped = BOOK_TO_OFFER[upper];
+  if (!mapped) throw new Error(`bookChainToOffer: unknown order-book chain code '${code}'`);
+  return mapped;
+}
+function offerChainToBook(chain) {
+  const lower = String(chain).toLowerCase();
+  const mapped = OFFER_TO_BOOK[lower];
+  if (!mapped) throw new Error(`offerChainToBook: unknown SwapOffer chain '${chain}'`);
+  return mapped;
+}
+function proposalToOffer(proposal, overrides) {
+  const offer = {
+    id: "",
+    sendChain: bookChainToOffer(proposal.offerChain),
+    receiveChain: bookChainToOffer(proposal.wantChain),
+    sendAmount: proposal.sendAmount,
+    // base-unit decimal string (sats/wei), carried through verbatim
+    receiveAmount: proposal.receiveAmount,
+    secretHash: proposal.secretHash,
+    secretNonce: proposal.secretNonce || void 0,
+    secretScheme: proposal.secretScheme || void 0,
+    makerIdPub: proposal.makerIdPub || void 0,
+    makerSig: proposal.makerSig || void 0,
+    authPub: proposal.authPub || void 0,
+    // initiator (maker) addresses: prefer the explicit fields, fall back to the mirrored refund/receive names
+    initiatorSendAddress: proposal.initiatorSendAddress || proposal.refundAddress || "",
+    initiatorReceiveAddress: proposal.initiatorReceiveAddress || proposal.receiveAddress || "",
+    status: "open",
+    createdAt: 0,
+    expiresAt: 0
+  };
+  if (proposal.evmInfo !== void 0) offer.evmInfo = proposal.evmInfo;
+  if (proposal.evmAddress !== void 0) offer.evmAddress = proposal.evmAddress;
+  return overrides ? { ...offer, ...overrides } : offer;
+}
+function orderToOffer(order, overrides) {
+  const base = proposalToOffer(order.proposal, {
+    id: order.id,
+    status: order.status,
+    createdAt: order.createdAt,
+    expiresAt: order.expiresAt,
+    // chains come from the proposal, but the order-level codes are authoritative if they ever diverge
+    sendChain: bookChainToOffer(order.offerChain),
+    receiveChain: bookChainToOffer(order.wantChain)
+  });
+  if (order.takerAuthPub !== void 0) base.takerAuthPub = order.takerAuthPub;
+  return overrides ? { ...base, ...overrides } : base;
+}
+function offerToProposal(offer, overrides) {
+  const proposal = {
+    offerChain: offerChainToBook(offer.sendChain),
+    wantChain: offerChainToBook(offer.receiveChain),
+    sendAmount: String(offer.sendAmount),
+    receiveAmount: String(offer.receiveAmount),
+    secretHash: offer.secretHash,
+    secretNonce: offer.secretNonce ?? "",
+    secretScheme: offer.secretScheme ?? "",
+    makerIdPub: offer.makerIdPub ?? "",
+    makerSig: offer.makerSig ?? "",
+    authPub: offer.authPub ?? "",
+    refundAddress: offer.initiatorSendAddress,
+    receiveAddress: offer.initiatorReceiveAddress,
+    initiatorSendAddress: offer.initiatorSendAddress,
+    initiatorReceiveAddress: offer.initiatorReceiveAddress,
+    hashLock: offer.secretHash
+    // the HTLC hash lock is the secret hash
+  };
+  if (offer.evmInfo !== void 0) proposal.evmInfo = offer.evmInfo;
+  if (offer.evmAddress !== void 0) proposal.evmAddress = offer.evmAddress;
+  return overrides ? { ...proposal, ...overrides } : proposal;
+}
+
 // src/order-book/mock.ts
 var _nextId = 1;
 function nextId() {
@@ -5812,7 +5907,7 @@ var MockOrderBook = class {
   async cancelOrder(orderId, makerPubKey) {
     const order = this.orders.get(orderId);
     if (!order) throw new Error(`order-book: order not found: ${orderId}`);
-    if (order.proposal.initiatorPubKey !== makerPubKey) {
+    if (order.proposal.authPub !== makerPubKey) {
       throw new Error("order-book: cancelOrder: pubKey does not match order maker");
     }
     if (order.status !== "open") {
@@ -5836,7 +5931,8 @@ var MockOrderBook = class {
     this.orders.set(orderId, {
       ...order,
       status: "taken",
-      takerPubKey,
+      takerAuthPub: takerPubKey,
+      // the identity presented to takeOrder (real proxy field)
       takenAt: now
     });
     this.notify();
@@ -6031,4 +6127,4 @@ function validatePassword(password) {
   return { valid: true };
 }
 
-export { BrowserMutex, CentralizedOrderBook, DurableStoreInconsistentError, GateFailure, InMemoryDurableStore, InMemorySessionStore, InProcessMutex, LocalStorageDurableStore, MAX_PBKDF2_ITERATIONS, MIN_PBKDF2_ITERATIONS, MnemonicSeedVault, MockOrderBook, MutexBusyError, MutexUnavailableError, PBKDF2_ITERATIONS, SwapController, UtxoReservationRegistry, WindowSessionStore, bc1AddressToScripthash, decodeBase58, decodeBech32, decodeBech32m, decodeCashAddr, decodeLegacyAddress, decodeWIF, decryptMnemonic, encodeBase582 as encodeBase58, encodeBech32, encodeBech32m, encodeCashAddr2 as encodeCashAddr, encodeLegacyAddress, encodeWIF, encryptMnemonic, hash1602 as hash160, isBech32Address, p2pkScripthash, p2pkhScripthash, p2shP2wpkhScripthash, p2trScripthash, p2wpkhScripthash, pubkeyToBC2Address, pubkeyToBCH2Address, pubkeyToBCHAddress, pubkeyToBTCAddress, pubkeyToBech32Address, pubkeyToP2SHP2WPKHAddress, resolveIterations, validatePassword, xonlyPubkeyToP2TRAddress };
+export { BrowserMutex, CentralizedOrderBook, DurableStoreInconsistentError, GateFailure, InMemoryDurableStore, InMemorySessionStore, InProcessMutex, LocalStorageDurableStore, MAX_PBKDF2_ITERATIONS, MIN_PBKDF2_ITERATIONS, MnemonicSeedVault, MockOrderBook, MutexBusyError, MutexUnavailableError, PBKDF2_ITERATIONS, SwapController, UtxoReservationRegistry, WindowSessionStore, bc1AddressToScripthash, bookChainToOffer, decodeBase58, decodeBech32, decodeBech32m, decodeCashAddr, decodeLegacyAddress, decodeWIF, decryptMnemonic, encodeBase582 as encodeBase58, encodeBech32, encodeBech32m, encodeCashAddr2 as encodeCashAddr, encodeLegacyAddress, encodeWIF, encryptMnemonic, hash1602 as hash160, isBech32Address, offerChainToBook, offerToProposal, orderToOffer, p2pkScripthash, p2pkhScripthash, p2shP2wpkhScripthash, p2trScripthash, p2wpkhScripthash, proposalToOffer, pubkeyToBC2Address, pubkeyToBCH2Address, pubkeyToBCHAddress, pubkeyToBTCAddress, pubkeyToBech32Address, pubkeyToP2SHP2WPKHAddress, resolveIterations, validatePassword, xonlyPubkeyToP2TRAddress };

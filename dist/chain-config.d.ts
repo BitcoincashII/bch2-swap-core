@@ -1,4 +1,4 @@
-import { C as Chain, a as ChainConfig } from './swap-types-CbNzOsAe.js';
+import { C as Chain, a as ChainConfig } from './swap-types-CsSbca8_.js';
 
 declare const chainConfigs: Record<Chain, ChainConfig>;
 declare const LOCKTIME_BLOCKS: {

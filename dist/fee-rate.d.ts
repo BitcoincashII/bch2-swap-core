@@ -1,4 +1,4 @@
-import { C as Chain } from './swap-types-CbNzOsAe.js';
+import { C as Chain } from './swap-types-CsSbca8_.js';
 
 /**
  * Live network BASE fee rate (sat/vByte) for a chain. `estimate` performs the proxy round-trip

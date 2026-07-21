@@ -18,25 +18,51 @@
  *      prepare → fund → verifyCounterpartyLeg → reveal/claim → refund/resume. The order book only
  *      COORDINATES discovery + params; the fund-safety gates run INSIDE the controller, fed by these
  *      params, never around them.
+ *
+ * Transport vs execution model:
+ *   The shapes below (SwapProposal / SwapOrder) are the order-book's ON-THE-WIRE discovery/transport
+ *   contract — they mirror EXACTLY what the live proxy returns from GET /api/orders. The swap-EXECUTION
+ *   model is `SwapOffer` (../swap-types), which the `SwapController` consumes. Convert between the two with
+ *   the adapter in ./adapter (`proposalToOffer` / `orderToOffer` / `offerToProposal`).
  */
+
+import type { EvmSwapInfo } from '../swap-types';
 
 /**
- * A maker's swap proposal — the public parameters an order advertises. Defined here (relocated from the removed
- * stale swap-engine in v3) so the order-book client owns its own transport contract. The SwapController +
- * SwapOffer (swap-types) are the swap-EXECUTION model; this is the order-book's discovery/transport shape.
+ * A maker's swap proposal — the public parameters an order advertises.
+ *
+ * This is the REAL shape the live proxy returns inside each order's `proposal` field (verified against
+ * swap.bch2.org/api/orders). All amounts are decimal STRINGS of the chain's BASE UNIT — sats for a UTXO chain,
+ * wei / token base units for an EVM chain — NOT human units. (E.g. a BCH2 amount of "1290788219" is 12.90788219
+ * BCH2.) The adapter carries them through verbatim; the SwapController consumes base units directly.
+ *
+ * `hashLock` is the HTLC hash lock and equals `secretHash` (both sha256(secret)); the proxy carries both
+ * names. `refundAddress`/`receiveAddress` are the initiator's refund (offerChain) / claim (wantChain)
+ * addresses, duplicated by `initiatorSendAddress`/`initiatorReceiveAddress` in the proxy payload.
  */
 export interface SwapProposal {
-  swapID:              string;       // 32 hex chars
-  hashLock:            string;       // 64 hex chars
-  initiatorPubKey:     string;       // 66 hex chars
-  initiatorCSV:        number;
-  initiatorAmountSat:  number;
-  responderAmountSat:  number;
-  minConfirmations:    number;
-  feeSatoshis:         number;
+  offerChain:              Chain;   // chain the maker sells from (chain code, e.g. "POLY")
+  wantChain:               Chain;   // chain the maker buys into
+  sendAmount:              string;  // base-unit amount (sats for UTXO, wei/token base units for EVM) as a decimal string
+  receiveAmount:           string;  // base-unit amount (sats for UTXO, wei/token base units for EVM) as a decimal string
+  secretHash:              string;  // hex, sha256 of the initiator's secret
+  secretNonce:             string;  // 32-hex — public nonce for the SEED-DERIVED hmac-v1 secret
+  secretScheme:            string;  // e.g. 'hmac-v1' (S re-derivable from the seed)
+  makerIdPub:              string;  // 66-hex seed-derived maker-identity pubkey (own-offer detection only)
+  makerSig:                string;  // 128-hex ECDSA authorship signature over the secretHash
+  authPub:                 string;  // 66-hex seed-derived API-auth pubkey (initiator's) — authenticates PATCH/DELETE
+  refundAddress:           string;  // initiator's refund address on offerChain
+  receiveAddress:          string;  // initiator's receive address on wantChain
+  initiatorSendAddress:    string;  // initiator's address on offerChain (refund) — mirrors refundAddress
+  initiatorReceiveAddress: string;  // initiator's address on wantChain (claim) — mirrors receiveAddress
+  evmInfo?:                EvmSwapInfo; // present when either leg is an EVM chain
+  evmAddress?:             string;  // the EVM address (0x…) that will send/receive tokens
+  hashLock:                string;  // hex — the HTLC hash lock (== secretHash)
 }
 
-export type Chain = 'BCH2' | 'BCH' | 'BTC' | 'BC2';
+/** Order-book TRANSPORT chain codes (UPPERCASE) as the proxy emits them. The swap-EXECUTION model
+ *  (SwapOffer, ../swap-types) uses the lowercase equivalents; ./adapter maps between the two. */
+export type Chain = 'BCH2' | 'BCH' | 'BTC' | 'BC2' | 'ETH' | 'BASE' | 'ARB' | 'POLY';
 
 export type OrderStatus =
   | 'open'       // accepting takers
@@ -46,32 +72,38 @@ export type OrderStatus =
   | 'expired';   // TTL elapsed before taken
 
 /**
- * An order posted by a maker advertising a swap.
+ * An order posted by a maker advertising a swap — the REAL top-level shape the live proxy returns from
+ * GET /api/orders (each element of `{ success, data: SwapOrder[] }`).
  *
- * The proposal field is the output of engine.prepare() for the Initiator role.
- * It contains the maker's hashLock and pubKey — everything a taker needs to
- * construct their Responder SwapParams. No funds touch the order book; the order
- * is an advertisement only.
+ * The nested `proposal` carries the maker's hashLock + terms + addresses. The top-level fields carry the
+ * order's lifecycle + the responder's coordinates (set once the order is taken). No funds touch the order
+ * book; the order is an advertisement + coordination record only.
  */
 export interface SwapOrder {
-  id:           string;
-  proposal:     SwapProposal;   // maker's prepared proposal (hashLock + makerPubKey + terms)
-  offerChain:   Chain;          // chain the maker is selling from
-  wantChain:    Chain;          // chain the maker is buying into
-  status:       OrderStatus;
-  createdAt:    number;         // unix ms
-  expiresAt:    number;         // unix ms — server refuses to match past this
-  takenAt?:     number;         // unix ms — set when taken
-  takerPubKey?: string;         // 66 hex chars — set when taken; maker reads this to set counterPubKey
+  id:                       string;
+  offerChain:               Chain;        // chain the maker is selling from
+  wantChain:                Chain;        // chain the maker is buying into
+  status:                   OrderStatus;
+  createdAt:                number;        // unix ms
+  expiresAt:                number;        // unix ms — server refuses to match past this
+  takenAt?:                 number;        // unix ms — set when taken
+  responderLocktime?:       number;        // responder-leg CLTV, set once the responder funds
+  evmSwapId?:               string;        // bytes32 hex — the EVM HTLC swapId, when a leg is EVM
+  initiatorTxid?:           string;        // funding txid of the initiator (leg X) HTLC
+  responderTxid?:           string;        // funding txid of the responder (leg Y) HTLC
+  responderSendAddress?:    string;        // responder's address on wantChain (its refund)
+  responderReceiveAddress?: string;        // responder's address on offerChain (where it claims leg X)
+  takerAuthPub?:            string;        // 66-hex responder seed-derived API-auth pubkey — present once taken
+  proposal:                 SwapProposal;  // maker's advertised proposal (hashLock + terms + addresses)
 }
 
 /**
  * Request body for postOrder.
- * The maker generates the proposal by running engine.prepare() first,
- * which establishes the hashLock and makerPubKey without broadcasting anything.
+ * The maker builds the proposal (hashLock + terms + addresses) from its SwapOffer via
+ * `offerToProposal` (./adapter), which establishes the hashLock without broadcasting anything.
  */
 export interface PostOrderRequest {
-  proposal:    SwapProposal;    // from engine.prepare()
+  proposal:    SwapProposal;    // built from a SwapOffer via offerToProposal()
   offerChain:  Chain;
   wantChain:   Chain;
   ttlSeconds?: number;          // validity window; default 3600 (1 hour)
@@ -90,16 +122,16 @@ export interface OrderFilter {
 /**
  * Result of takeOrder — everything both parties need to begin the swap:
  *
- *   Taker (Responder): construct SwapParams from proposal + takerPubKey
- *   Maker (Initiator): call engine.setCounterPubKey(fromHex(takerPubKey))
+ *   Taker (Responder): construct the responder SwapOffer from proposal via proposalToOffer/orderToOffer
+ *   Maker (Initiator): read the taker's coordinates from the polled order (responderReceiveAddress + takerAuthPub)
  *
- * From here the full verify→fund→claim flow takes over. The order book's job
- * is done; it hands off to the engine and does not touch settlement.
+ * From here the full verify→fund→claim flow takes over inside the SwapController. The order book's job is
+ * done; it hands off to the controller and does not touch settlement.
  */
 export interface TakeOrderResult {
   orderId:     string;
-  proposal:    SwapProposal;   // maker's proposal (taker constructs Responder params from this)
-  takerPubKey: string;         // 66 hex chars (maker sets this as their counterPubKey)
+  proposal:    SwapProposal;   // maker's proposal (taker constructs its responder offer from this)
+  takerPubKey: string;         // 66 hex chars — the identity the taker presented to takeOrder
   offerChain:  Chain;
   wantChain:   Chain;
 }
@@ -127,7 +159,8 @@ export interface OrderBook {
 
   /**
    * Maker withdraws an open order.
-   * makerPubKey must match the order's proposal.initiatorPubKey (proves ownership).
+   * makerPubKey must match the order's proposal.authPub (proves ownership; the proxy authenticates DELETE
+   * against the maker's seed-derived API-auth pubkey).
    */
   cancelOrder(orderId: string, makerPubKey: string): Promise<void>;
 
