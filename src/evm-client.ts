@@ -333,7 +333,7 @@ export async function recoverLockFromTx(
   // would return 'safe' and permit a re-lock (double-lock + strand). When `scan` is supplied, before returning
   // 'safe' we scan for a matching on-chain Locked from this sender and adopt it (fail-closed on any RPC error).
   scan?: { sender: string; hashLock: string; recipient?: string; minAmount?: bigint; fromBlock?: number },
-): Promise<{ kind: 'locked'; swapId: string } | { kind: 'safe' | 'blocked' }> {
+): Promise<{ kind: 'locked'; swapId: string; blockNumber?: number } | { kind: 'safe' | 'blocked' }> {
   // R224-RECOVER-QUORUM-001: the 'safe' verdict CLEARS the lockpending marker and authorizes a fresh IRREVERSIBLE
   // re-lock, so it must NOT trust a single quorum=1 FallbackProvider first-responder null. An honest-but-lagging /
   // pruned / rate-limited RPC answering not-found FIRST (no throw) would otherwise yield a false 'safe' -> a SECOND
@@ -349,7 +349,7 @@ export async function recoverLockFromTx(
 
   // The original single-provider not-found logic, now run against ONE leaf. Returns 'safe' only on a definitive
   // not-found on THAT leaf (receipt + tx + sender-scan all succeeded and showed nothing); any error -> 'blocked'.
-  const checkOneLeaf = async (p: Provider): Promise<{ kind: 'locked'; swapId: string } | { kind: 'safe' | 'blocked' }> => {
+  const checkOneLeaf = async (p: Provider): Promise<{ kind: 'locked'; swapId: string; blockNumber?: number } | { kind: 'safe' | 'blocked' }> => {
     const htlc = new Contract(htlcAddr, HTLC_ABI, p);
     let receipt: ethers.TransactionReceipt | null;
     try { receipt = await p.getTransactionReceipt(txHash); }
@@ -373,7 +373,7 @@ export async function recoverLockFromTx(
             const okHash = !scan?.hashLock || String(a.hashLock).toLowerCase() === scan.hashLock.toLowerCase();
             const okRcpt = !scan?.recipient || String(a.recipient).toLowerCase() === scan.recipient.toLowerCase();
             const okAmt = scan?.minAmount === undefined || (a.amount as bigint) >= scan.minAmount;
-            if (okHash && okRcpt && okAmt) return { kind: 'locked', swapId: parsed.args[0] as string };
+            if (okHash && okRcpt && okAmt) return { kind: 'locked', swapId: parsed.args[0] as string, blockNumber: receipt.blockNumber }; // R-EVMLOCKBLOCK-ADOPT-001: surface the lock block for the lossless [lockBlock, tip] Claimed-event scan
             // a Locked event whose hashLock != ours (a lying RPC, or an unrelated swap in the same tx) -> do NOT
             // adopt a foreign swapId; keep scanning the remaining logs.
           }
@@ -409,7 +409,7 @@ export async function recoverLockFromTx(
             const okHash = String(a.hashLock).toLowerCase() === scan.hashLock.toLowerCase();
             const okRcpt = !scan.recipient || String(a.recipient).toLowerCase() === scan.recipient.toLowerCase();
             const okAmt = scan.minAmount === undefined || (a.amount as bigint) >= scan.minAmount;
-            if (okHash && okRcpt && okAmt) return { kind: 'locked', swapId: String(a.id) };
+            if (okHash && okRcpt && okAmt) return { kind: 'locked', swapId: String(a.id), blockNumber: (ev as ethers.EventLog).blockNumber }; // R-EVMLOCKBLOCK-ADOPT-001: surface the lock block
           }
           if (from <= start) break;
         }
@@ -429,7 +429,7 @@ export async function recoverLockFromTx(
   // fields). Adopt a candidate swapId ONLY if QUORUM-corroborated by getSwap over the aggregating `provider`: a
   // fabricated id does not exist on-chain (initiator==0 / timeLock==0 → getSwap returns null), and one leaf cannot
   // make the quorum read agree. Iterate every candidate so a hostile leaf ordered first cannot mask the real lock.
-  const lockedCandidates = results.filter((r): r is { kind: 'locked'; swapId: string } => r.kind === 'locked');
+  const lockedCandidates = results.filter((r): r is { kind: 'locked'; swapId: string; blockNumber?: number } => r.kind === 'locked');
   for (const cand of lockedCandidates) {
     let s: SwapData | null;
     try { s = await getSwap(htlcAddr, cand.swapId, provider); } catch { continue; } // quorum read failed → try next

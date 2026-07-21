@@ -2305,7 +2305,7 @@ export class SwapController {
         const readProvider = this.evmProvider(this.myChain);
         let sender = '';
         try { sender = await signer.getAddress(); } catch { sender = ''; }
-        let recovery: { kind: 'locked'; swapId: string } | { kind: 'safe' | 'blocked' };
+        let recovery: { kind: 'locked'; swapId: string; blockNumber?: number } | { kind: 'safe' | 'blocked' };
         try {
           recovery = await recoverLockFromTx(htlcAddr, lockTxHash, readProvider, {
             sender, hashLock, recipient, minAmount: amount, fromBlock: rec.evmLockBlock,
@@ -2313,6 +2313,10 @@ export class SwapController {
         } catch { recovery = { kind: 'blocked' }; }
         if (recovery.kind === 'locked') {
           // The prior lock is on-chain (authenticated Locked event, quorum-corroborated) — ADOPT it, no second lock.
+          // R-EVMLOCKBLOCK-ADOPT-001: capture the lock's block so the record update below persists evmLockBlock — else
+          // the Claimed-event scan floors at tip-90000 (~6.25h on a sub-second chain) and a responder offline past that
+          // window ages out S and forfeits the leg (the seam R-EVMLOCK-RESUME-001/R-EVMLOCKBLOCK-001 left).
+          if (recovery.blockNumber != null && Number.isInteger(recovery.blockNumber)) lockBlockNum = recovery.blockNumber;
           await this.deps.durable.commit([[fundedKey(rec.id), recovery.swapId.toLowerCase()]]);
           await this.deps.durable.remove(lockPendingKey(rec.id));
           return { swapId: recovery.swapId, txHash: lockTxHash, adopted: true };
@@ -2889,14 +2893,19 @@ export class SwapController {
     try { amount = this.evmAmountBaseUnits(this.role === 'initiator' ? rec.offer.sendAmount : rec.offer.receiveAmount, 'recoverEvmLockOnResume'); } catch { return false; }
     let sender = '';
     try { sender = await this.evmSigner(this.myChain).getAddress(); } catch { sender = ''; }
-    let recovery: { kind: 'locked'; swapId: string } | { kind: 'safe' | 'blocked' };
+    let recovery: { kind: 'locked'; swapId: string; blockNumber?: number } | { kind: 'safe' | 'blocked' };
     try {
       recovery = await recoverLockFromTx(htlcAddr, lockTxHash, this.evmProvider(this.myChain), { sender, hashLock, recipient, minAmount: amount, fromBlock: rec.evmLockBlock });
     } catch { return false; } // can't tell — KEEP (a later resume retries)
     if (recovery.kind !== 'locked') return false; // 'blocked' -> retry later; 'safe' -> never landed, fund gate re-drives
     await this.deps.durable.commit([[fundedKey(rec.id), recovery.swapId.toLowerCase()]]);
     await this.deps.durable.remove(lockPendingKey(rec.id));
-    this.record = { ...this.record, myEvmSwapId: recovery.swapId, myFundingTxid: recovery.swapId, funded: true };
+    // R-EVMLOCKBLOCK-ADOPT-001: persist evmLockBlock from the adopted lock so readEvmClaimedSecret scans the lossless
+    // [lockBlock, tip] window — NOT the tip-90000 floor that ages out S on a sub-second chain for an offline responder.
+    this.record = {
+      ...this.record, myEvmSwapId: recovery.swapId, myFundingTxid: recovery.swapId, funded: true,
+      ...(recovery.blockNumber != null && Number.isInteger(recovery.blockNumber) ? { evmLockBlock: recovery.blockNumber } : {}),
+    };
     this.setPhase(this.role === 'initiator' ? 'initiator_funded' : 'responder_funded');
     await this.persistRecord();
     this.status('recoverEvmLockOnResume:adopted');

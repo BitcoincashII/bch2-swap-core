@@ -359,7 +359,7 @@ async function recoverLockFromTx(htlcAddr, txHash, provider, scan) {
             const okHash = !scan?.hashLock || String(a.hashLock).toLowerCase() === scan.hashLock.toLowerCase();
             const okRcpt = !scan?.recipient || String(a.recipient).toLowerCase() === scan.recipient.toLowerCase();
             const okAmt = scan?.minAmount === void 0 || a.amount >= scan.minAmount;
-            if (okHash && okRcpt && okAmt) return { kind: "locked", swapId: parsed.args[0] };
+            if (okHash && okRcpt && okAmt) return { kind: "locked", swapId: parsed.args[0], blockNumber: receipt.blockNumber };
           }
         } catch {
         }
@@ -387,7 +387,7 @@ async function recoverLockFromTx(htlcAddr, txHash, provider, scan) {
             const okHash = String(a.hashLock).toLowerCase() === scan.hashLock.toLowerCase();
             const okRcpt = !scan.recipient || String(a.recipient).toLowerCase() === scan.recipient.toLowerCase();
             const okAmt = scan.minAmount === void 0 || a.amount >= scan.minAmount;
-            if (okHash && okRcpt && okAmt) return { kind: "locked", swapId: String(a.id) };
+            if (okHash && okRcpt && okAmt) return { kind: "locked", swapId: String(a.id), blockNumber: ev.blockNumber };
           }
           if (from <= start) break;
         }

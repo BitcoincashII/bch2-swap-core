@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.1.17
+
+### Fixed (fund-safety — HIGH, audit round 12 — fix-interaction seam)
+- **R-EVMLOCKBLOCK-ADOPT-001** (HIGH): a seam between two prior fixes — `recoverEvmLockOnResume` (v3.1.14) and
+  `lockEvm`'s in-lock adopt (fix #4) reconstructed `myEvmSwapId`/`funded` when adopting an on-chain EVM lock but did
+  NOT persist `evmLockBlock` (its sole writer was the normal-lock path). So after a crash-then-adopt, the field stayed
+  undefined, and `readEvmClaimedSecret` floored the Claimed-event `getLogs` scan at `tip - 90000` (~6.25h on Arbitrum's
+  sub-second blocks) instead of the lossless `[lockBlock, tip]` that `R-EVMLOCKBLOCK-001` established. A responder
+  offline > ~6.25h straddling the initiator's Claimed block would permanently age out the secret, never claim leg X,
+  and lose leg Y at its timelock — no adversary required (honest crash + honest offline stretch). Fix: `recoverLockFromTx`
+  now returns the Locked-event `blockNumber` on `'locked'`, and both adopt sites persist it as `evmLockBlock`, restoring
+  the lossless scan floor regardless of offline duration up to leg X's timelock. Regression assertions added to both
+  adopt tests.
+
 ## 3.1.16
 
 ### Hardening (defense-in-depth — audit round 11, UTXO↔EVM parity)

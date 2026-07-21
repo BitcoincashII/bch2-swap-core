@@ -2035,7 +2035,7 @@ async function recoverLockFromTx(htlcAddr, txHash, provider, scan) {
             const okHash = !scan?.hashLock || String(a.hashLock).toLowerCase() === scan.hashLock.toLowerCase();
             const okRcpt = !scan?.recipient || String(a.recipient).toLowerCase() === scan.recipient.toLowerCase();
             const okAmt = scan?.minAmount === void 0 || a.amount >= scan.minAmount;
-            if (okHash && okRcpt && okAmt) return { kind: "locked", swapId: parsed.args[0] };
+            if (okHash && okRcpt && okAmt) return { kind: "locked", swapId: parsed.args[0], blockNumber: receipt.blockNumber };
           }
         } catch {
         }
@@ -2063,7 +2063,7 @@ async function recoverLockFromTx(htlcAddr, txHash, provider, scan) {
             const okHash = String(a.hashLock).toLowerCase() === scan.hashLock.toLowerCase();
             const okRcpt = !scan.recipient || String(a.recipient).toLowerCase() === scan.recipient.toLowerCase();
             const okAmt = scan.minAmount === void 0 || a.amount >= scan.minAmount;
-            if (okHash && okRcpt && okAmt) return { kind: "locked", swapId: String(a.id) };
+            if (okHash && okRcpt && okAmt) return { kind: "locked", swapId: String(a.id), blockNumber: ev.blockNumber };
           }
           if (from <= start) break;
         }
@@ -4882,6 +4882,7 @@ var SwapController = class _SwapController {
           recovery = { kind: "blocked" };
         }
         if (recovery.kind === "locked") {
+          if (recovery.blockNumber != null && Number.isInteger(recovery.blockNumber)) lockBlockNum = recovery.blockNumber;
           await this.deps.durable.commit([[fundedKey(rec.id), recovery.swapId.toLowerCase()]]);
           await this.deps.durable.remove(lockPendingKey(rec.id));
           return { swapId: recovery.swapId, txHash: lockTxHash, adopted: true };
@@ -5479,7 +5480,13 @@ var SwapController = class _SwapController {
     if (recovery.kind !== "locked") return false;
     await this.deps.durable.commit([[fundedKey(rec.id), recovery.swapId.toLowerCase()]]);
     await this.deps.durable.remove(lockPendingKey(rec.id));
-    this.record = { ...this.record, myEvmSwapId: recovery.swapId, myFundingTxid: recovery.swapId, funded: true };
+    this.record = {
+      ...this.record,
+      myEvmSwapId: recovery.swapId,
+      myFundingTxid: recovery.swapId,
+      funded: true,
+      ...recovery.blockNumber != null && Number.isInteger(recovery.blockNumber) ? { evmLockBlock: recovery.blockNumber } : {}
+    };
     this.setPhase(this.role === "initiator" ? "initiator_funded" : "responder_funded");
     await this.persistRecord();
     this.status("recoverEvmLockOnResume:adopted");

@@ -70,6 +70,7 @@ declare function recoverLockFromTx(htlcAddr: string, txHash: string, provider: P
 }): Promise<{
     kind: 'locked';
     swapId: string;
+    blockNumber?: number;
 } | {
     kind: 'safe' | 'blocked';
 }>;

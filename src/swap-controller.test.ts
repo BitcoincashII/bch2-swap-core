@@ -1491,6 +1491,7 @@ describe('SwapController.lockEvm() — fix #2 re-mint FRESH at the choke point',
     expect((await durable.get('bch2swap:funded:evmfund-1'))?.toLowerCase()).toBe(EVM_SWAP_ID.toLowerCase()); // funded sentinel set
     expect(await durable.get('bch2swap:lockpending:evmfund-1')).toBeNull(); // pending marker cleared on adopt
     expect(ctrl.getState().phase).toBe('responder_funded');
+    expect(ctrl.getState().evmLockBlock).toBe(10);           // R-EVMLOCKBLOCK-ADOPT-001: lock block persisted on the in-lock adopt too
   });
 
   it('R-RECOVER-SWAPID-QUORUM-001: a lying leaf fabricating a Locked event with an attacker-chosen swapId is REJECTED (getSwap over the quorum cannot corroborate a non-existent id)', async () => {
@@ -1570,6 +1571,9 @@ describe('SwapController.lockEvm() — fix #2 re-mint FRESH at the choke point',
     expect(await durable.get('bch2swap:lockpending:evmfund-1')).toBeNull();                                  // pending marker cleared
     expect(ctrl.getState().phase).toBe('responder_funded');                                                 // reconstructed to the funded state
     expect(ctrl.getState().resumeGate).toBe('post-funding');
+    // R-EVMLOCKBLOCK-ADOPT-001: the adopt now persists the lock block (from the Locked-event receipt) so the Claimed-event
+    // scan floors at [lockBlock, tip] — NOT tip-90000, which ages out S for an offline responder on a sub-second chain.
+    expect(ctrl.getState().evmLockBlock).toBe(10);
   });
 });
 
