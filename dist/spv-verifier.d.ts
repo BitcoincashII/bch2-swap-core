@@ -31,6 +31,14 @@ declare const MAX_TIMING_TIP_STALENESS_SEC: number;
  * stale tip or unverifiable PoW. spvSupported chains only (callers gate on spvSupported). Returns the verified tip.
  */
 declare function spvVerifiedTipFresh(client: ChainClient, chain: string, claimedTip: number, maxStalenessSec?: number): Promise<number>;
+/**
+ * The nTime of the SPV/PoW-verified tip header (the SAME verified header `spvVerifiedTipFresh` checks), for
+ * anchoring a TIMESTAMP-CLTV reveal margin. Deflate-protected like the height branch: a proxy cannot present a
+ * valid-PoW header chain up to `claimedTip` whose tip nTime is arbitrarily old (consensus MTP bounds it), and the
+ * same staleness guard rejects a genuinely-old verified tip — so a proxy cannot deflate the chain time to overstate
+ * the responder's remaining refund runway. Throws (fail closed) if the chain cannot be SPV-verified.
+ */
+declare function spvVerifiedTipTimeSec(client: ChainClient, chain: string, claimedTip: number, maxStalenessSec?: number): Promise<number>;
 declare function parseHeaderTimeSec(headerHex: string): number | null;
 declare function getChainTimeSec(client: ChainClient): Promise<number | null>;
 /** Test-only: reset the in-memory verified-chain cache. */
@@ -40,4 +48,4 @@ declare function __setSpvConfigForTests(chain: string, params: AsertParams, chec
 /** Test-only: run just the header-chain verification and return the verified tip height. */
 declare function __getVerifiedTipForTests(client: ChainClient, chain: string, tipHeight: number): Promise<number>;
 
-export { MAX_TIMING_TIP_STALENESS_SEC, __getVerifiedTipForTests, __resetSpvCacheForTests, __setSpvConfigForTests, getChainTimeSec, parseHeaderTimeSec, spvSupported, spvVerifiedTipFresh, verifyConfirmations, verifyFundingHeight };
+export { MAX_TIMING_TIP_STALENESS_SEC, __getVerifiedTipForTests, __resetSpvCacheForTests, __setSpvConfigForTests, getChainTimeSec, parseHeaderTimeSec, spvSupported, spvVerifiedTipFresh, spvVerifiedTipTimeSec, verifyConfirmations, verifyFundingHeight };

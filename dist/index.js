@@ -2098,6 +2098,20 @@ async function spvVerifiedTipFresh(client, chain, claimedTip, maxStalenessSec = 
   }
   return v.tipHeight;
 }
+async function spvVerifiedTipTimeSec(client, chain, claimedTip, maxStalenessSec = MAX_TIMING_TIP_STALENESS_SEC) {
+  const cfg = SPV[chain];
+  if (!cfg) throw new Error(`SPV not supported for ${chain}`);
+  if (!Number.isInteger(claimedTip) || claimedTip <= cfg.checkpoint.height) {
+    throw new Error(`SPV: claimed tip ${claimedTip} at/below checkpoint ${cfg.checkpoint.height}`);
+  }
+  const v = await extendVerifiedChain(client, chain, claimedTip);
+  if (v.tipHeight < claimedTip) throw new Error(`SPV: verified tip ${v.tipHeight} below claimed ${claimedTip}`);
+  const stalenessSec = Math.floor(Date.now() / 1e3) - v.lastTime;
+  if (stalenessSec > maxStalenessSec) {
+    throw new Error(`SPV: verified tip is stale (${Math.floor(stalenessSec / 60)}min > ${Math.floor(maxStalenessSec / 60)}min) \u2014 possible proxy time under-reporting`);
+  }
+  return v.lastTime;
+}
 function parseHeaderTimeSec(headerHex) {
   if (typeof headerHex !== "string" || headerHex.length < 144) return null;
   const be = headerHex.slice(136, 144).match(/../g)?.reverse().join("");
@@ -3179,7 +3193,15 @@ async function assertRevealSafe(client, p) {
     let respRemainingSec;
     if (cpLock >= 15e8) {
       marginBasis = "timestamp-cltv";
-      respRemainingSec = cpLock - chainNow;
+      let tsNow = chainNow;
+      if (spvSupported(theirChain)) {
+        try {
+          tsNow = await spvVerifiedTipTimeSec(client, theirChain, buried.freshHeight);
+        } catch {
+          throw new GateFailure("reveal: could not SPV-verify the counterparty chain time (stale / under-reported) \u2014 not revealing the secret; retry", "rearm");
+        }
+      }
+      respRemainingSec = cpLock - tsNow;
     } else {
       marginBasis = "height-cltv";
       let spvHeight = buried.freshHeight;

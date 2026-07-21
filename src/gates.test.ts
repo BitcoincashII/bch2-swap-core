@@ -237,6 +237,19 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
     })).rejects.toMatchObject({ disposition: 'abort' });
   });
 
+  it('FAIL-CLOSED (R-CHAINTIME-DEFLATE-001): a STALE/deflated proxy tip time on the timestamp-CLTV branch throws (rearm), not an overstated margin', async () => {
+    // The counterparty leg is ~2h from refund (inside the 4h danger window) → an honest margin must abort. But a
+    // proxy that deflates the tip nTime by 3h would make (cpLock - staleTipTime) ≈ 5h > 4h and pass. With the fix
+    // the timestamp branch anchors to the SPV-verified tip whose staleness guard rejects the 3h-old tip → rearm.
+    const tsLock = Math.floor(Date.now() / 1000) + 2 * 3600;
+    const { ctx, redeem } = buildHtlcChain(tsLock, { tipAgeSec: 3 * 3600 });
+    useChain(ctx);
+    await expect(assertRevealSafe(utxoClient(ctx), {
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      recordedOutpoint: outpoint(ctx), counterpartyLocktime: tsLock,
+    })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
+  });
+
   it('FAIL-CLOSED: chain time unavailable (empty tip header) throws (rearm)', async () => {
     const client = utxoClient(CTX, { tipHeaderHex: '' });
     await expect(assertRevealSafe(client, {

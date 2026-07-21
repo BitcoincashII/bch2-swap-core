@@ -29,7 +29,7 @@
 import type { ChainClient } from './chain-client';
 import type { Chain } from './swap-types';
 import type { Provider } from 'ethers';
-import { verifyConfirmations, spvVerifiedTipFresh, getChainTimeSec, spvSupported } from './spv-verifier';
+import { verifyConfirmations, spvVerifiedTipFresh, spvVerifiedTipTimeSec, getChainTimeSec, spvSupported } from './spv-verifier';
 import { verifyAndAuthenticateUtxo, getHTLCScripthash } from './swap-flow';
 import { hash160, bytesToHex } from './htlc-builder';
 import { chainConfigs, minSecondsUntilRefund, LOCKTIME_BLOCKS } from './chain-config';
@@ -359,7 +359,19 @@ export async function assertRevealSafe(client: GateChainClient, p: RevealSafePar
       // TIMESTAMP-CLTV branch (EVM-init / UTXO-resp): a unix-timestamp CLTV is enforced by block time, so the
       // margin MUST anchor to chain time (a clock skewed BEHIND overstates remaining → reveal within the margin).
       marginBasis = 'timestamp-cltv';
-      respRemainingSec = cpLock - chainNow;
+      // R-CHAINTIME-DEFLATE-001: anchor to the SPV/PoW-verified tip's nTime (deflate-protected), matching the
+      // height branch's under-report guard. getChainTimeSec is an UNVERIFIED proxy header read; a proxy that
+      // deflates the tip nTime would overstate the responder's remaining refund runway and let us reveal inside
+      // the real danger window (lose BOTH legs). For an SPV-supported counterparty chain, use the verified tip
+      // time and fail closed if it can't be verified; non-SPV chains keep the accepted proxy-trust residual.
+      let tsNow = chainNow;
+      if (spvSupported(theirChain)) {
+        try { tsNow = await spvVerifiedTipTimeSec(client, theirChain, buried.freshHeight); }
+        catch {
+          throw new GateFailure('reveal: could not SPV-verify the counterparty chain time (stale / under-reported) — not revealing the secret; retry', 'rearm');
+        }
+      }
+      respRemainingSec = cpLock - tsNow;
     } else {
       // HEIGHT-CLTV branch (UTXO<->UTXO): SPV-verify + freshness-bound the tip (under-report guard) so a real-but-
       // STALE tip cannot understate how close the responder leg is to refundable. Fail closed if unverified.

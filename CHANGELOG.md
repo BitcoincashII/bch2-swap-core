@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.1.2
+
+### Fixed (fund-safety — reveal margin)
+- **R-CHAINTIME-DEFLATE-001**: the initiator's TIMESTAMP-CLTV reveal margin anchored to an UNVERIFIED proxy tip
+  header time (`getChainTimeSec`, range-checked only), while the height-CLTV branch already SPV-verifies + staleness-
+  guards its tip. A proxy that deflated the tip `nTime` could overstate the responder's remaining refund runway and
+  let the initiator reveal the secret inside the real danger window — losing BOTH legs. The timestamp branch now
+  anchors to the SPV/PoW-verified tip's `nTime` (new `spvVerifiedTipTimeSec`, same under-report/staleness guard as
+  the height branch) for SPV-supported counterparty chains, and fails closed (rearm) if it can't be verified.
+  Regression test added (a 3h-stale tip that would have passed now throws). Found by a post-deploy adversarial audit.
+
 ## 3.1.1
 
 ### Fixed (order-book client ↔ live proxy)

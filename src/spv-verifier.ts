@@ -227,6 +227,30 @@ export async function spvVerifiedTipFresh(
   return v.tipHeight;
 }
 
+/**
+ * The nTime of the SPV/PoW-verified tip header (the SAME verified header `spvVerifiedTipFresh` checks), for
+ * anchoring a TIMESTAMP-CLTV reveal margin. Deflate-protected like the height branch: a proxy cannot present a
+ * valid-PoW header chain up to `claimedTip` whose tip nTime is arbitrarily old (consensus MTP bounds it), and the
+ * same staleness guard rejects a genuinely-old verified tip — so a proxy cannot deflate the chain time to overstate
+ * the responder's remaining refund runway. Throws (fail closed) if the chain cannot be SPV-verified.
+ */
+export async function spvVerifiedTipTimeSec(
+  client: ChainClient, chain: string, claimedTip: number, maxStalenessSec: number = MAX_TIMING_TIP_STALENESS_SEC,
+): Promise<number> {
+  const cfg = SPV[chain];
+  if (!cfg) throw new Error(`SPV not supported for ${chain}`);
+  if (!Number.isInteger(claimedTip) || claimedTip <= cfg.checkpoint.height) {
+    throw new Error(`SPV: claimed tip ${claimedTip} at/below checkpoint ${cfg.checkpoint.height}`);
+  }
+  const v = await extendVerifiedChain(client, chain, claimedTip);
+  if (v.tipHeight < claimedTip) throw new Error(`SPV: verified tip ${v.tipHeight} below claimed ${claimedTip}`);
+  const stalenessSec = Math.floor(Date.now() / 1000) - v.lastTime;
+  if (stalenessSec > maxStalenessSec) {
+    throw new Error(`SPV: verified tip is stale (${Math.floor(stalenessSec / 60)}min > ${Math.floor(maxStalenessSec / 60)}min) — possible proxy time under-reporting`);
+  }
+  return v.lastTime;
+}
+
 // R261-CHAINTIME-001 (MEGASWEEP-2 A): UTXO chain time from the tip block header's nTime (4-byte LITTLE-ENDIAN field at
 // byte offset 68 = hex offset 136..144). A unix-timestamp CLTV is enforced on-chain by the block time (MTP/BIP113),
 // NOT the local wall clock — so a secret-reveal margin on a timestamp-CLTV leg MUST anchor to chain time, not Date.now()
