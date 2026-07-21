@@ -160,6 +160,8 @@ interface SwapSnapshot {
     myFundingTxid?: string;
     fundLocktime?: number;
     myHTLC?: DurableHTLC;
+    /** The EVM block at which our leg was locked — the lossless floor for the counterparty-secret scan (R-EVMLOCKBLOCK-001). */
+    evmLockBlock?: number;
     disposed: boolean;
     /** True iff an in-memory re-derivable 32-byte secret is currently loaded. */
     hasSecret: boolean;
@@ -369,6 +371,14 @@ declare class SwapController {
      * the recovery material. Never trusts a bare getUTXOs "empty" read to authorize the teardown.
      */
     private ownLegSpendReorgSafe;
+    /**
+     * §9.6 reorg-safe proof that OUR claim of the RECEIVE leg (theirChain) is buried at >= requiredConfirmations
+     * SPV-VERIFIED depth. Mirrors confirmClaim's proof (find our claim txid in the counterparty HTLC-scripthash history
+     * + spvReorgSafe against the recorded rawTx). FAIL CLOSED (false) on any doubt: a transient read error, a 0-conf /
+     * short-depth claim, a pruned/unprovable SPV read, or the absence of our claim in history all KEEP the material.
+     * Used by trySettleIfBothLegsSpent to gate the wipe of the receive-leg claim material (secret + claimTx).
+     */
+    private claimBuriedReorgSafe;
     /**
      * Rehydrate a swap from a durable record: re-derive S, RECONSTRUCT + on-chain-AUTHENTICATE myHTLC, run the
      * FINALIZERS-FIRST (refund-first short-circuit), rebroadcast a funded-but-missing funding tx idempotently, and

@@ -257,6 +257,8 @@ export interface SwapSnapshot {
   myFundingTxid?: string;
   fundLocktime?: number;
   myHTLC?: DurableHTLC;
+  /** The EVM block at which our leg was locked — the lossless floor for the counterparty-secret scan (R-EVMLOCKBLOCK-001). */
+  evmLockBlock?: number;
   disposed: boolean;
   /** True iff an in-memory re-derivable 32-byte secret is currently loaded. */
   hasSecret: boolean;
@@ -479,6 +481,7 @@ export class SwapController {
       theirChain: this.theirChain,
       myFundingTxid: this.record.myFundingTxid,
       fundLocktime: this.record.fundLocktime,
+      evmLockBlock: this.record.evmLockBlock,
       myHTLC: this.record.myHTLC ? Object.freeze({ ...this.record.myHTLC }) : undefined,
       disposed: this.disposed,
       hasSecret: !!(this.secret && this.secret.length === 32),
@@ -1420,7 +1423,13 @@ export class SwapController {
       // (the SAME provenTxid-bound proof confirmClaim / confirmRefund require) before wiping — never wipe on a bare
       // getUTXOs read. Fail closed: KEEP on any doubt (0-conf spend / short depth / pruned SPV / read error).
       if (!(await this.ownLegSpendReorgSafe(myClient, myRedeem))) return false;
-      // BOTH legs spent + our leg's spend is reorg-safe -> terminal. Safe to wipe + finalize.
+      // R-TRYSETTLE-RECV-001 (§9.6): ALSO require OUR claim of the RECEIVE leg (theirChain) to be buried at reorg-safe
+      // depth before wiping its claim material. A bare cpUtxos "empty" read is satisfied at 1 confirmation, so a
+      // shallow reorg on the receive leg AFTER the wipe would strand our re-claim (the secret + claimTx we just
+      // destroyed). ownLegSpendReorgSafe above only proves OUR FUNDED leg's spend; this proves the RECEIVE leg's.
+      // Mirrors confirmClaim; fail closed (KEEP) on any doubt.
+      if (!(await this.claimBuriedReorgSafe())) return false;
+      // BOTH legs spent + BOTH spends reorg-safe -> terminal. Safe to wipe + finalize.
       if (this.secret) { this.secret.fill(0); this.secret = null; }
       await this.wipeDurable([claimTxKey(rec.id), claimBroadcastKey(rec.id), durableSecretKey(rec.id), recordKey(rec.id)]);
       this.setPhase('completed');
@@ -1452,6 +1461,31 @@ export class SwapController {
       if (await this.spvReorgSafe(client, this.myChain, txid, h.height, undefined, reqConf)) return true;
     }
     return false;
+  }
+
+  /**
+   * §9.6 reorg-safe proof that OUR claim of the RECEIVE leg (theirChain) is buried at >= requiredConfirmations
+   * SPV-VERIFIED depth. Mirrors confirmClaim's proof (find our claim txid in the counterparty HTLC-scripthash history
+   * + spvReorgSafe against the recorded rawTx). FAIL CLOSED (false) on any doubt: a transient read error, a 0-conf /
+   * short-depth claim, a pruned/unprovable SPV read, or the absence of our claim in history all KEEP the material.
+   * Used by trySettleIfBothLegsSpent to gate the wipe of the receive-leg claim material (secret + claimTx).
+   */
+  private async claimBuriedReorgSafe(): Promise<boolean> {
+    const rec = this.record;
+    const claimTxid = (rec.myClaimTxid ?? rec.claimTx?.txid ?? '').toLowerCase();
+    const cp = rec.counterpartyHTLC;
+    if (!HEX64.test(claimTxid) || !cp || typeof cp.redeemScript !== 'string' || !/^[0-9a-f]+$/i.test(cp.redeemScript)) return false;
+    const cfg = chainConfigs[this.theirChain];
+    if (!cfg || (cfg as { isEvm?: boolean }).isEvm) return false;
+    const redeemScript = hexToBytes(cp.redeemScript.toLowerCase());
+    const client = this.deps.chainClientFor(this.theirChain);
+    const reqConf = Math.max(1, cfg.requiredConfirmations ?? 6);
+    let history: Array<{ tx_hash: string; height: number }>;
+    try { history = await client.getHistory(getHTLCScripthash(redeemScript), 'a914' + bytesToHex(hash160(redeemScript)) + '87'); }
+    catch { return false; } // transient read error — never wipe
+    const entry = history.find((h) => typeof h?.tx_hash === 'string' && h.tx_hash.toLowerCase() === claimTxid && Number.isInteger(h.height) && h.height > 0);
+    if (!entry) return false; // 0-conf / absent — KEEP
+    return this.spvReorgSafe(client, this.theirChain, claimTxid, entry.height, rec.claimTx?.rawTx, reqConf);
   }
 
   // ── resume() — rehydrate a stalled / crashed / new-device swap from durable state (fix #10) ──────────────────
@@ -2069,6 +2103,7 @@ export class SwapController {
     const targetPhase: 'initiator_funded' | 'responder_funded' = this.role === 'initiator' ? 'initiator_funded' : 'responder_funded';
 
     const lockName = `bch2swap:fund:${rec.id}`;
+    let lockBlockNum: number | null = null; // R-EVMLOCKBLOCK-001: captured inside the lock closure, read by the record update (stays null on the adopt path)
     const outcome = await this.deps.mutex.withLock(lockName, async (): Promise<{ swapId: string; txHash: string; adopted: boolean }> => {
       // Adopt a prior on-chain lock (the durable funded sentinel holds the bytes32 swapId) rather than double-locking.
       const prior = (await this.deps.durable.get(fundedKey(rec.id)))?.toLowerCase();
@@ -2122,6 +2157,7 @@ export class SwapController {
       try {
         const b = await (signer.provider as Provider | null)?.getBlock('latest');
         if (b && Number.isFinite(b.timestamp)) nowSec = Number(b.timestamp);
+        if (b && Number.isInteger(b.number)) lockBlockNum = Number(b.number);
       } catch { nowSec = null; }
       if (nowSec === null) throw new Error('lockEvm: could not read the EVM chain clock to set the lock timeLock — not locking; retry');
       const timeLock = BigInt(nowSec + evmLockSecondsForRole(cfg, this.role));
@@ -2158,7 +2194,13 @@ export class SwapController {
       return { swapId, txHash: finalHash, adopted: false };
     });
 
-    this.record = { ...this.record, myEvmSwapId: outcome.swapId, myFundingTxid: outcome.swapId, funded: true };
+    this.record = {
+      ...this.record, myEvmSwapId: outcome.swapId, myFundingTxid: outcome.swapId, funded: true,
+      // R-EVMLOCKBLOCK-001: persist the lock's block floor so readEvmClaimedSecret scans [lockBlock, tip] instead of
+      // the tip-anchored [tip-90000, tip] window — the latter is only ~6-7h on a sub-second chain (Arbitrum) and
+      // would slide past an early Claimed event, stranding the responder's secret recovery.
+      ...(lockBlockNum !== null ? { evmLockBlock: lockBlockNum } : {}),
+    };
     this.setPhase(targetPhase);
     this.status('lockEvm:locked');
     await this.persistRecord();

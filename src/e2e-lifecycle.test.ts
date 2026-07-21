@@ -352,7 +352,7 @@ class SharedEvmProvider extends MockEvmProvider {
     return [new SharedEvmProvider(this.evm, { chainId: this.cfg.chainId }), new SharedEvmProvider(this.evm, { chainId: this.cfg.chainId })];
   }
   async getBlockNumber(): Promise<number> { return this.evm.tip; }
-  async getBlock(): Promise<{ timestamp: number }> { return { timestamp: this.evm.nowSec }; }
+  async getBlock(): Promise<{ timestamp: number; number: number }> { return { timestamp: this.evm.nowSec, number: this.evm.tip }; }
   async getNetwork(): Promise<{ chainId: bigint }> { return { chainId: this.cfg.chainId }; }
   async getCode(): Promise<string> { return '0x60006000'; }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -730,6 +730,9 @@ describe('e2e — HAPPY UTXO<->EVM (cross-chain secret flow through the on-chain
     const fundProof = await responder.verifyCounterpartyLegForFunding();
     const { swapId } = await responder.lockEvm(fundProof);
     expect(responder.getState().phase).toBe('responder_funded');
+    // R-EVMLOCKBLOCK-001: lockEvm captured the lock block as the scan floor (was never written before → the
+    // counterparty-secret scan fell back to the tip-anchored [tip-90000, tip] window that misses an early claim).
+    expect(responder.getState().evmLockBlock).toBeGreaterThan(0);
     expect(respEvmSigner.broadcastCount).toBe(1);
     expect(evm.getSwap(swapId)?.claimed).toBe(false);
 

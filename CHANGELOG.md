@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.1.3
+
+### Fixed (fund-safety — two HIGH, found by a no-stone-unturned audit)
+- **R-TRYSETTLE-RECV-001** (`swap-controller.ts` trySettleIfBothLegsSpent): the wipe of the RECEIVE-leg claim
+  material (secret + claimTx) proved reorg-safety only for OUR FUNDED leg, gating the receive leg on a bare 1-conf
+  `getUTXOs` emptiness read. A resume in the mined-but-not-reorg-safe window + a shallow reorg on the receive leg
+  then stranded our re-claim (lost the leg we were owed). Now ALSO requires OUR claim of the receive leg to be
+  buried at reorg-safe SPV depth before wiping (new `claimBuriedReorgSafe`, mirrors confirmClaim); fail closed.
+- **R-EVMLOCKBLOCK-001** (`swap-controller.ts` lockEvm): `rec.evmLockBlock` was declared + read but NEVER written,
+  so the counterparty-secret scan (`readEvmClaimedSecret`) fell back to a tip-anchored `[tip-90000, tip]` window —
+  only ~6-7h on a sub-second chain (Arbitrum), well under the 36h claim horizon. A responder with a monitoring gap
+  could slide past an early `Claimed` event and never recover the public secret → lose the initiator leg. lockEvm
+  now captures the lock block (`getBlock('latest').number`) so the scan anchors on a lossless floor. `evmLockBlock`
+  is also exposed on the state snapshot. Regression tests added for both.
+
 ## 3.1.2
 
 ### Fixed (fund-safety — reveal margin)

@@ -770,6 +770,19 @@ const OWN_HTLC = {
 };
 // A block whose single tx is the terminal (refund/claim) tx — merkleRoot == its txid so an empty-branch proof verifies.
 const RFX = buildFundSynthChain({ anchorHeight: 300000, count: 4, spacing: 600, bits: 0x20010000, fundSpkHex: OWN_P2SH_SPK });
+// R-TRYSETTLE-RECV-001: a DEEPER synthetic chain for the receive leg (bch2, requiredConfirmations=6). RFX (count 4)
+// is buried enough for btc's reqConf=2 but not for a reqConf-6 chain, so the receive-leg claim needs this.
+const RFX_DEEP = buildFundSynthChain({ anchorHeight: 300000, count: 12, spacing: 600, bits: 0x20010000, fundSpkHex: OWN_P2SH_SPK });
+function finClientDeep(): MockElectrumClient {
+  return new MockElectrumClient({
+    headersByHeight: RFX_DEEP.headersByHeight,
+    height: RFX_DEEP.tip,
+    history: [{ tx_hash: RFX_DEEP.fundTxid, height: RFX_DEEP.fundHeight }],
+    merkleProof: { block_height: RFX_DEEP.fundHeight, merkle: [], pos: 0 },
+    rawTxByTxid: { [RFX_DEEP.fundTxid]: RFX_DEEP.fundRawHex },
+    tipHeaderHex: RFX_DEEP.headersByHeight[RFX_DEEP.tip],
+  });
+}
 
 function refundableRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
   return {
@@ -1016,21 +1029,40 @@ function settleRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord 
 describe('SwapController.trySettleIfBothLegsSpent() — never wipe on doubt (§9.6 / fix #1)', () => {
   beforeEach(() => { __setSpvConfigForTests('btc', RFX.params, RFX.checkpoint); __resetSpvCacheForTests(); });
 
-  it('WIPES the secret + record ONLY when OUR OWN leg spend is buried at reorg-safe SPV depth (both legs empty)', async () => {
+  it('WIPES the secret + record ONLY when BOTH the funded-leg spend AND the receive-leg claim are reorg-safe (R-TRYSETTLE-RECV-001)', async () => {
+    __setSpvConfigForTests('bch2', RFX_DEEP.params, RFX_DEEP.checkpoint); // the RECEIVE leg (bch2) is now SPV-verified too
     const durable = new InMemoryDurableStore();
     await durable.set('bch2swap:claimbroadcast:settle-wipe', '1');
     await durable.set('bch2swap:encsecret:settle-wipe', bytesToHex(S));
     await durable.set('bch2swap:record:settle-wipe', '{}');
-    // OUR leg 'btc': getUTXOs empty + history=[RFX spend @ RFX.fundHeight], deep + Merkle-provable -> reorg-safe.
+    // OUR funded leg 'btc': getUTXOs empty + history=[RFX spend @ RFX.fundHeight], deep + Merkle-provable -> reorg-safe.
     const btc = finClient();
-    const bch2 = new MockElectrumClient({ utxos: [] }); // their leg empty
-    const ctrl = new SwapController(settleRecord({ id: 'settle-wipe' }), makeMultiDeps({ btc, bch2 }, { durable }));
+    // OUR RECEIVE leg 'bch2': empty + OUR claim (myClaimTxid) buried at reqConf-6 depth via RFX_DEEP (R-TRYSETTLE-RECV-001).
+    const bch2 = finClientDeep();
+    const ctrl = new SwapController(settleRecord({ id: 'settle-wipe', myClaimTxid: RFX_DEEP.fundTxid }), makeMultiDeps({ btc, bch2 }, { durable }));
     const settled = await ctrl.trySettleIfBothLegsSpent();
     expect(settled).toBe(true);
     expect(await durable.get('bch2swap:encsecret:settle-wipe')).toBeNull();      // secret wiped at reorg-safe depth
     expect(await durable.get('bch2swap:record:settle-wipe')).toBeNull();
     expect(await durable.get('bch2swap:claimbroadcast:settle-wipe')).toBeNull();
     expect(ctrl.getState().phase).toBe('completed');
+  });
+
+  it('KEEPS everything when the FUNDED leg is reorg-safe but the RECEIVE-leg claim is only shallow (R-TRYSETTLE-RECV-001)', async () => {
+    // The exact bug: before the fix, trySettle proved reorg-safety ONLY for our funded leg and wiped the receive-leg
+    // claim material off a bare 1-conf emptiness read — a shallow reorg on the receive leg then stranded the re-claim.
+    __setSpvConfigForTests('bch2', RFX.params, RFX.checkpoint); // receive leg on the SHALLOW RFX: depth ~3 < bch2 reqConf 6
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:claimbroadcast:settle-recvshallow', '1');
+    await durable.set('bch2swap:encsecret:settle-recvshallow', bytesToHex(S));
+    await durable.set('bch2swap:record:settle-recvshallow', '{}');
+    const btc = finClient();  // OUR funded leg reorg-safe (btc reqConf 2, RFX depth ~3)
+    const bch2 = finClient();  // OUR receive-leg claim present but only ~3 deep < bch2 reqConf 6 -> NOT reorg-safe
+    const ctrl = new SwapController(settleRecord({ id: 'settle-recvshallow', myClaimTxid: RFX.fundTxid }), makeMultiDeps({ btc, bch2 }, { durable }));
+    const settled = await ctrl.trySettleIfBothLegsSpent();
+    expect(settled).toBe(false); // before the fix this WIPED (only the funded leg was checked)
+    expect(await durable.get('bch2swap:encsecret:settle-recvshallow')).toBeTruthy(); // secret KEPT
+    expect(await durable.get('bch2swap:record:settle-recvshallow')).toBeTruthy();
   });
 
   it('KEEPS everything when OUR leg spend is only 0-conf (never wipe on a bare getUTXOs read)', async () => {
