@@ -335,6 +335,43 @@ describe('SwapController.fundLegX() — single-flight (fix #3)', () => {
 });
 
 // ============================================================================
+// (f0) fundLegX() — re-derivable-secret invariant on the FUNDING path (fix #5)
+//
+// prepare() refuses a non-hmac-v1 offer with no encrypted-at-rest durable S, and the file header claims fundLegX
+// enforces the same. A caller invoking fundLegX() DIRECTLY from 'taken' (skipping prepare) must not be able to fund a
+// swap whose secret a crash would strand.
+// ============================================================================
+describe('SwapController.fundLegX() — re-derivable-secret invariant on the funding path (fix #5)', () => {
+  it('THROWS on a non-hmac-v1 offer with NO durable S and broadcasts nothing (even called directly from taken)', async () => {
+    const deps = makeDeps();
+    const rec = makeRecord({ phase: 'taken' }, { secretScheme: 'random-v0', secretNonce: undefined });
+    const ctrl = new SwapController(rec, deps);
+    await expect(ctrl.fundLegX()).rejects.toThrow(/fix #5|not 'hmac-v1'|encrypted-at-rest/i);
+    expect(deps.client.broadcasts.length).toBe(0);                        // never funded
+    expect(await deps.durable.get('bch2swap:funded:offer-1')).toBeNull(); // no durable sentinel
+    expect(ctrl.getState().phase).toBe('taken');
+  });
+
+  it('an hmac-v1 offer still funds normally (the gate does not over-block)', async () => {
+    const deps = makeDeps();
+    const ctrl = new SwapController(makeRecord({ phase: 'taken' }), deps);
+    const { txid } = await ctrl.fundLegX();
+    expect(deps.client.broadcasts.length).toBe(1);
+    expect(txid).toBeTruthy();
+  });
+
+  it('a non-hmac-v1 offer WITH an encrypted-at-rest durable S funds (parity with prepare)', async () => {
+    const deps = makeDeps();
+    await deps.durable.set('bch2swap:encsecret:offer-1', bytesToHex(S));
+    const rec = makeRecord({ phase: 'taken' }, { secretScheme: 'random-v0', secretNonce: undefined });
+    const ctrl = new SwapController(rec, deps);
+    const { txid } = await ctrl.fundLegX();
+    expect(deps.client.broadcasts.length).toBe(1);
+    expect(txid).toBeTruthy();
+  });
+});
+
+// ============================================================================
 // STEP 5 — counterparty-leg verify minters + the two irreversible actions + the responder claim side.
 //
 // A FUND-BEARING synthetic PoW chain (verbatim gates.test.ts technique): the fund block is single-tx so its
@@ -663,6 +700,49 @@ describe('SwapController.watchForSecret() + claimWithKnownSecret() — the respo
 });
 
 // ============================================================================
+// (h2) claim broadcast — the poisoned-sentinel guard (fix #3)
+//
+// revealAndClaim / claimWithKnownSecret commit the claimbroadcast sentinel BEFORE the secret-bearing broadcast. If
+// broadcastTx throws a DEFINITIVE pre-broadcast node rejection (the secret never entered any mempool), the sentinel
+// must be CLEARED so a retry re-broadcasts — else a later call ADOPTS a claim that never happened and the swap wedges
+// (refund also refuses via the R181 cross-guard). An AMBIGUOUS / timeout failure LEAVES the sentinel set (fail-safe).
+// ============================================================================
+describe('SwapController claim broadcast — poisoned-sentinel guard (fix #3)', () => {
+  it('a DEFINITIVE pre-broadcast node rejection CLEARS the claimbroadcast sentinel so a retry can re-broadcast', async () => {
+    const spend = await makeLegYClaimSpend(S);
+    const bch2 = new MockElectrumClient({ history: [{ tx_hash: spend.txid, height: 12 }], rawTxByTxid: { [spend.txid]: spend.rawTx } });
+    const btc = fxClient();
+    btc.opts.broadcastThrows = true; // "broadcast rejected (broadcastThrows)" -> a definitive node-validation rejection
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(watchRecord(), makeMultiDeps({ bch2, btc }, { durable }));
+    await ctrl.watchForSecret();
+    await expect(ctrl.claimWithKnownSecret()).rejects.toThrow(/reject/i);
+    expect(await durable.get('bch2swap:claimbroadcast:watch-1')).toBeNull(); // fix #3: sentinel cleared for retry
+    expect(btc.broadcasts.length).toBe(1);                                   // the broadcast was attempted once
+  });
+
+  it('an AMBIGUOUS (timeout) broadcast failure KEEPS the claimbroadcast sentinel (fail-safe, R201)', async () => {
+    const spend = await makeLegYClaimSpend(S);
+    const bch2 = new MockElectrumClient({ history: [{ tx_hash: spend.txid, height: 12 }], rawTxByTxid: { [spend.txid]: spend.rawTx } });
+    class TimeoutBtc extends MockElectrumClient {
+      async broadcastTx(rawTx: string): Promise<string> { this.broadcasts.push(rawTx); throw new Error('broadcast timed out after 30s — tx may still propagate'); }
+    }
+    const btc = new TimeoutBtc({
+      headersByHeight: FX.headersByHeight,
+      merkleProof: { block_height: FX.fundHeight, merkle: [], pos: 0 },
+      utxos: [{ tx_hash: FX.fundTxid, tx_pos: 0, value: 100000, height: FX.fundHeight }],
+      rawTxByTxid: { [FX.fundTxid]: FX.fundRawHex },
+      height: FX.tip, tipHeaderHex: FX.headersByHeight[FX.tip], broadcastTxid: '00'.repeat(31) + 'aa',
+    });
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(watchRecord(), makeMultiDeps({ bch2, btc }, { durable }));
+    await ctrl.watchForSecret();
+    await expect(ctrl.claimWithKnownSecret()).rejects.toThrow(/timed out/i);
+    expect(await durable.get('bch2swap:claimbroadcast:watch-1')).toBe('1'); // fix #3: sentinel KEPT (fail-safe)
+  });
+});
+
+// ============================================================================
 // STEP 6 — refund() + canRefund() + reorg-safe finalizers + resume() (fix #10). UTXO-only.
 //
 // OWN_* = a REAL "own funded HTLC" whose refund branch pubkeyhash is hash160(PUB) (the seed vault's key), so
@@ -907,6 +987,92 @@ describe('SwapController finalizers — never wipe on doubt, wipe only at reorg-
   });
 });
 
+// ── trySettleIfBothLegsSpent() — §9.6 never-wipe: reorg-safe SPV proof before teardown (fix #1) ────────────────
+// OUR OWN leg lives on 'btc' (RFX SPV fixture); their leg on 'bch2'. The wipe destroys the NON-RECOVERABLE secret +
+// durable record, so a bare getUTXOs "both legs empty" read (a reorg / stale / lying proxy could show OUR still-funded
+// leg as empty) must NOT trigger it: require the SPENDING of OUR OWN leg buried at reorg-safe SPV depth, and honor the
+// fix #10 resume guard (irreversibleBlocked). PRE-FIX both-legs-empty alone wiped → these all fail against pre-fix code.
+function settleRecord(over: Partial<DurableSwapRecord> = {}): DurableSwapRecord {
+  return {
+    id: over.id ?? 'settle-1',
+    role: 'initiator',
+    offer: makeOffer({ id: over.id ?? 'settle-1', sendChain: 'btc', receiveChain: 'bch2' }),
+    phase: 'claimed',
+    counterpartyClaimPkh: CLAIM_PKH_HEX,
+    myHTLC: OWN_HTLC,                                              // our own leg X on 'btc'
+    myFundingTxid: OWN_FUND.txid,
+    counterpartyHTLC: { ...CP_HTLC, locktime: RFX.tip + 100 },
+    counterpartyFundingOutpoint: FX_OUTPOINT,
+    ...over,
+  };
+}
+
+describe('SwapController.trySettleIfBothLegsSpent() — never wipe on doubt (§9.6 / fix #1)', () => {
+  beforeEach(() => { __setSpvConfigForTests('btc', RFX.params, RFX.checkpoint); __resetSpvCacheForTests(); });
+
+  it('WIPES the secret + record ONLY when OUR OWN leg spend is buried at reorg-safe SPV depth (both legs empty)', async () => {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:claimbroadcast:settle-wipe', '1');
+    await durable.set('bch2swap:encsecret:settle-wipe', bytesToHex(S));
+    await durable.set('bch2swap:record:settle-wipe', '{}');
+    // OUR leg 'btc': getUTXOs empty + history=[RFX spend @ RFX.fundHeight], deep + Merkle-provable -> reorg-safe.
+    const btc = finClient();
+    const bch2 = new MockElectrumClient({ utxos: [] }); // their leg empty
+    const ctrl = new SwapController(settleRecord({ id: 'settle-wipe' }), makeMultiDeps({ btc, bch2 }, { durable }));
+    const settled = await ctrl.trySettleIfBothLegsSpent();
+    expect(settled).toBe(true);
+    expect(await durable.get('bch2swap:encsecret:settle-wipe')).toBeNull();      // secret wiped at reorg-safe depth
+    expect(await durable.get('bch2swap:record:settle-wipe')).toBeNull();
+    expect(await durable.get('bch2swap:claimbroadcast:settle-wipe')).toBeNull();
+    expect(ctrl.getState().phase).toBe('completed');
+  });
+
+  it('KEEPS everything when OUR leg spend is only 0-conf (never wipe on a bare getUTXOs read)', async () => {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:claimbroadcast:settle-0conf', '1');
+    await durable.set('bch2swap:encsecret:settle-0conf', bytesToHex(S));
+    await durable.set('bch2swap:record:settle-0conf', '{}');
+    const btc = finClient({ entryHeight: 0 }); // the spend is in history at height 0 -> not mined -> not reorg-safe
+    const bch2 = new MockElectrumClient({ utxos: [] });
+    const ctrl = new SwapController(settleRecord({ id: 'settle-0conf' }), makeMultiDeps({ btc, bch2 }, { durable }));
+    const settled = await ctrl.trySettleIfBothLegsSpent();
+    expect(settled).toBe(false);
+    expect(await durable.get('bch2swap:encsecret:settle-0conf')).toBeTruthy(); // secret KEPT
+    expect(await durable.get('bch2swap:record:settle-0conf')).toBeTruthy();
+  });
+
+  it('KEEPS everything at a SHORT SPV depth (< reqConf) even with both legs empty', async () => {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:claimbroadcast:settle-short', '1');
+    await durable.set('bch2swap:encsecret:settle-short', bytesToHex(S));
+    await durable.set('bch2swap:record:settle-short', '{}');
+    const btc = finClient({ height: RFX.fundHeight }); // tip == fundHeight -> depth 1 < btc reqConf 2
+    const bch2 = new MockElectrumClient({ utxos: [] });
+    const ctrl = new SwapController(settleRecord({ id: 'settle-short' }), makeMultiDeps({ btc, bch2 }, { durable }));
+    const settled = await ctrl.trySettleIfBothLegsSpent();
+    expect(settled).toBe(false);
+    expect(await durable.get('bch2swap:encsecret:settle-short')).toBeTruthy();
+    expect(await durable.get('bch2swap:record:settle-short')).toBeTruthy();
+  });
+
+  it('(fix #10) KEEPS everything when a resume left irreversibleBlocked set (non-ok myHTLC auth)', async () => {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:claimbroadcast:settle-blocked', '1');
+    await durable.set('bch2swap:encsecret:settle-blocked', bytesToHex(S));
+    await durable.set('bch2swap:record:settle-blocked', '{}');
+    // OUR leg 'btc': funding NOT unspent + getTx ambiguous + funding IS in history -> resume auth 'indeterminate'
+    // -> irreversibleBlocked = true. Both legs read empty, so PRE-FIX would wipe the non-recoverable secret.
+    const btc = new MockElectrumClient({ height: RFX.tip, utxos: [], history: [{ tx_hash: OWN_FUND.txid, height: 300002 }], getTxThrows: true });
+    const bch2 = new MockElectrumClient({ utxos: [] });
+    const ctrl = await SwapController.resume(settleRecord({ id: 'settle-blocked' }), makeMultiDeps({ btc, bch2 }, { durable }));
+    expect(ctrl.getState().resumeAuth).toBe('indeterminate');
+    const settled = await ctrl.trySettleIfBothLegsSpent();
+    expect(settled).toBe(false);
+    expect(await durable.get('bch2swap:encsecret:settle-blocked')).toBeTruthy(); // secret KEPT (irreversibleBlocked)
+    expect(await durable.get('bch2swap:record:settle-blocked')).toBeTruthy();
+  });
+});
+
 // ── resume() — rehydrate a stalled / crashed / new-device swap (fix #10) ──────────────────────────────────────
 describe('SwapController.resume() — fix #10 + funding rebroadcast + S re-derivation + idempotent adopt', () => {
   beforeEach(() => { __setSpvConfigForTests('btc', FX.params, FX.checkpoint); __resetSpvCacheForTests(); });
@@ -1143,6 +1309,34 @@ describe('SwapController.lockEvm() — fix #2 re-mint FRESH at the choke point',
     expect(ctrl.getState().phase).toBe('taken');        // never advanced
   });
 
+  it('(fix #4) lockEvm ADOPTS a prior in-flight lock (lockpending/evmlocktx pre-set) instead of re-locking', async () => {
+    // The funded sentinel is written only AFTER the lock resolves, but the lockpending/evmlocktx recovery markers are
+    // written the instant the lock is broadcast. A re-call after the broadcast but before the funded sentinel lands
+    // must ADOPT the prior lock (recoverLockFromTx over the recorded tx hash), NOT re-lock (which strands the first).
+    const LOCK_TX_HASH = '0x' + 'cd'.repeat(32);
+    const BASE_HTLC = getEvmConfig(84532)!.htlcAddress; // OUR own EVM leg ('base' == chainId 84532) deployed HTLC
+    // Stage the on-chain Locked(id, initiator, recipient, token, amount, hashLock, timeLock) event the prior lock emitted.
+    const lockedLog = htlcInterface.encodeEventLog('Locked', [EVM_SWAP_ID, EVM_RECIP, EVM_CP_ADDR, ZERO_ADDRESS, EVM_AMT, EVM_HASHLOCK, 1_900_000_000n]);
+    const receipt = { status: 1, blockNumber: 10, logs: [{ address: BASE_HTLC, topics: lockedLog.topics, data: lockedLog.data }] };
+    const baseQuorum = new MockEvmProvider({ leafProviders: [new MockEvmProvider({ receipt }), new MockEvmProvider({ receipt })], blockNumber: 5000 });
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:lockpending:evmfund-1', LOCK_TX_HASH); // a prior lock is in-flight (broadcast; funded-key not yet written)
+    await durable.set('bch2swap:evmlocktx:evmfund-1', LOCK_TX_HASH);
+    const goodProof = await gateAssertEvmLegBuriedForFunding(P(evmLegProvider()), FUND_GATE_PARAMS);
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP); // throw-mode: a SECOND lock would broadcast + throw
+    const ctrl = new SwapController(evmFundRecord(), makeEvmDeps({
+      evmProviderFor: (chain) => P(chain === 'base' ? baseQuorum : evmLegProvider()),
+      evmSignerFor: () => SG(signer),
+      durable,
+    }));
+    const { swapId } = await ctrl.lockEvm(goodProof);
+    expect(swapId).toBe(EVM_SWAP_ID);                        // adopted the prior lock's swapId
+    expect(signer.broadcastCount).toBe(0);                   // fix #4: NO second lock broadcast
+    expect((await durable.get('bch2swap:funded:evmfund-1'))?.toLowerCase()).toBe(EVM_SWAP_ID.toLowerCase()); // funded sentinel set
+    expect(await durable.get('bch2swap:lockpending:evmfund-1')).toBeNull(); // pending marker cleared on adopt
+    expect(ctrl.getState().phase).toBe('responder_funded');
+  });
+
   it('(fix #1 compile) lockEvm STRUCTURALLY requires a FundProof — no-arg / RevealAuthorization do not compile', () => {
     expect(typeof _lockEvmCompileCheck).toBe('function');
   });
@@ -1339,6 +1533,33 @@ describe('SwapController.refundEvm() — refund own EVM lock + the refund-race s
     // both markers cleared once S is recovered + the other leg is claimed
     expect(await durable.get('bch2swap:refundracepending:evmrefund-1')).toBeNull();
     expect(await durable.get('bch2swap:refundbroadcast:evmrefund-1')).toBeNull();
+  });
+
+  it('(fix #5) a TRANSIENT pre-broadcast failure in refundEvm CLEARS the refundbroadcast sentinel so a retry re-arms', async () => {
+    // callThrows makes refundSwap's pre-flight getSwap read throw BEFORE htlc.refund() — a pre-broadcast failure the
+    // message-based sentinel-clear allowlist does NOT match. refundSwap now tags it preBroadcast=true so refundEvm
+    // clears the sentinel it set; PRE-FIX it stays set (the allowlist misses the message) and WEDGES the refund.
+    const unreachable = new MockEvmProvider({ callThrows: true });
+    const signer = new MockSigner(unreachable, EVM_RECIP, { mode: 'ok' }); // 'ok' -> only the pre-flight read fails it
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(refundEvmRecord(), makeEvmDeps({ evmSignerFor: () => SG(signer), durable }));
+    await expect(ctrl.refundEvm()).rejects.toThrow(/unreachable|callThrows|RPC/i);
+    expect(signer.broadcastCount).toBe(0);                                        // never reached the refund broadcast
+    expect(await durable.get('bch2swap:refundbroadcast:evmrefund-1')).toBeNull(); // fix #5: sentinel cleared for retry
+  });
+
+  it('(fix #5) a POST-broadcast / ambiguous refundEvm failure KEEPS the refundbroadcast sentinel (fail-safe)', async () => {
+    // Healthy pre-flight (swap exists, initiator matches, timelock expired) so refundSwap REACHES the refund broadcast,
+    // where the throw-mode signer throws at submission (ambiguous — the tx may have been submitted). Sentinel stays SET.
+    const okProvider = new MockEvmProvider({
+      swap: makeSwap({ initiator: EVM_RECIP, claimed: false, refunded: false, timeLock: 1_699_000_000n, amount: EVM_AMT }),
+      block: { timestamp: 1_700_000_000 }, blockNumber: 5000, chainId: 8453n,
+    });
+    const signer = new MockSigner(okProvider, EVM_RECIP); // throw-mode: htlc.refund() submission throws (post broadcastReached)
+    const durable = new InMemoryDurableStore();
+    const ctrl = new SwapController(refundEvmRecord(), makeEvmDeps({ evmSignerFor: () => SG(signer), durable }));
+    await expect(ctrl.refundEvm()).rejects.toThrow(/BROADCAST ATTEMPTED|sendTransaction/i);
+    expect(await durable.get('bch2swap:refundbroadcast:evmrefund-1')).toBe('1'); // KEPT (fail-safe)
   });
 });
 

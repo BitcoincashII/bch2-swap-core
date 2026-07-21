@@ -362,6 +362,14 @@ declare class SwapController {
      */
     trySettleIfBothLegsSpent(): Promise<boolean>;
     /**
+     * §9.6 reorg-safe proof that OUR OWN leg's HTLC funding output has been SPENT and that spend is buried at
+     * >= requiredConfirmations SPV-VERIFIED depth (the same anchor confirmClaim / confirmRefund use). The spend is the
+     * confirmed HTLC-scripthash history tx that is NOT our own funding tx. FAIL CLOSED (returns false): a transient read
+     * error, a 0-conf / short-depth spend, a pruned/unprovable SPV read, or the absence of any confirmed spend all KEEP
+     * the recovery material. Never trusts a bare getUTXOs "empty" read to authorize the teardown.
+     */
+    private ownLegSpendReorgSafe;
+    /**
      * Rehydrate a swap from a durable record: re-derive S, RECONSTRUCT + on-chain-AUTHENTICATE myHTLC, run the
      * FINALIZERS-FIRST (refund-first short-circuit), rebroadcast a funded-but-missing funding tx idempotently, and
      * re-enter the correct gate from CHAIN truth (isResumableSwapState), NOT the persisted status. FIX #10 (critical): a
@@ -542,6 +550,12 @@ declare class SwapController {
      *  getSwap over the given provider and returns `!!swap.refunded`; fail-closed to `false` on any read error / missing
      *  provider (a not-yet-confirmed / dropped refund must never be finalized as a completed 'refunded'). */
     private evmSwapIsRefunded;
+    /** Broadcast a UTXO claim, clearing the durable claimbroadcast sentinel ONLY on a DEFINITIVE pre-broadcast node
+     *  rejection (the node validated + refused the tx — it never entered any mempool, so the secret is not public and a
+     *  retry can rebuild + re-broadcast), so a later call re-arms instead of ADOPTING a never-broadcast claim (fix #3).
+     *  An AMBIGUOUS / timeout / post-broadcast failure (the tx MAY have reached a mempool) LEAVES the sentinel set
+     *  (R201 fail-safe). The UTXO analogue of claimEvmWithSentinelGuard — same definitive-vs-ambiguous classification. */
+    private broadcastClaimWithSentinelGuard;
     /** Broadcast an EVM claim, clearing the durable claimbroadcast sentinel ONLY on a PRE-broadcast throw (claimSwap tags
      *  pre-flight failures `preBroadcast:true` — no secret revealed), so a later call re-arms instead of adopting a
      *  never-broadcast claim (fix #3). A POST-broadcast / ambiguous failure LEAVES the sentinel set (R201 fail-safe). */

@@ -9,6 +9,18 @@ interface DurableStore {
     remove(key: string): Promise<void>;
     commit(entries: Array<[string, string]>): Promise<void>;
 }
+declare class DurableStoreInconsistentError extends Error {
+    readonly commitError: unknown;
+    readonly rollbackErrors: Array<{
+        key: string;
+        error: unknown;
+    }>;
+    readonly storeInconsistent: true;
+    constructor(message: string, commitError: unknown, rollbackErrors: Array<{
+        key: string;
+        error: unknown;
+    }>);
+}
 declare class InMemoryDurableStore implements DurableStore {
     private readonly m;
     get(key: string): Promise<string | null>;
@@ -49,6 +61,10 @@ declare class MutexBusyError extends Error {
     readonly mutexBusy: true;
     constructor(name: string, scope: 'in-process' | 'cross-process' | 'cross-tab');
 }
+declare class MutexUnavailableError extends Error {
+    readonly mutexUnavailable: true;
+    constructor(name: string);
+}
 declare class InProcessMutex implements Mutex {
     private readonly tails;
     private readonly store?;
@@ -83,4 +99,4 @@ declare class BrowserMutex implements Mutex {
     withLock<T>(name: string, fn: () => Promise<T> | T): Promise<T>;
 }
 
-export { BrowserMutex, type DurableStore, InMemoryDurableStore, InMemorySessionStore, InProcessMutex, LocalStorageDurableStore, type Mutex, MutexBusyError, type SessionStore, type StorageLike, type WebLocksLike, WindowSessionStore };
+export { BrowserMutex, type DurableStore, DurableStoreInconsistentError, InMemoryDurableStore, InMemorySessionStore, InProcessMutex, LocalStorageDurableStore, type Mutex, MutexBusyError, MutexUnavailableError, type SessionStore, type StorageLike, type WebLocksLike, WindowSessionStore };

@@ -20,7 +20,7 @@ export type { FundProof, RevealAuthorization, GateDisposition } from './gates';
 // ── Injected storage + single-flight seams (with in-process defaults + browser adapters) ─────────────────
 export {
   InMemoryDurableStore, LocalStorageDurableStore, InMemorySessionStore, WindowSessionStore,
-  InProcessMutex, BrowserMutex, MutexBusyError,
+  InProcessMutex, BrowserMutex, MutexBusyError, MutexUnavailableError, DurableStoreInconsistentError,
 } from './storage';
 export type { DurableStore, SessionStore, Mutex, StorageLike, WebLocksLike } from './storage';
 

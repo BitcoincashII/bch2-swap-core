@@ -825,80 +825,107 @@ async function refundSwap(htlcAddr, swapId, signer) {
   const provider = signer.provider;
   if (!provider) throw new Error("Signer has no provider attached");
   const htlc = new Contract(htlcAddr, HTLC_ABI, signer);
-  let preflight15Id;
-  const swapData = await Promise.race([
-    getSwap(htlcAddr, swapId, provider),
-    new Promise((_, reject) => {
-      preflight15Id = setTimeout(() => reject(new Error("[refundSwap] getSwap timed out after 15s")), 15e3);
-    })
-  ]).finally(() => clearTimeout(preflight15Id));
-  if (!swapData) throw new Error("Swap not found \u2014 may not be funded yet");
-  const signerAddress = (await Promise.race([
-    signer.getAddress(),
-    new Promise((_, rej) => setTimeout(() => rej(new Error("getAddress timed out")), 15e3))
-  ])).toLowerCase();
-  if (swapData.initiator.toLowerCase() !== signerAddress) {
-    throw new Error(
-      `refundSwap: caller ${signerAddress} is not the HTLC initiator (${swapData.initiator}). Only the initiator can trigger a refund.`
-    );
-  }
-  if (swapData.claimed) throw new Error("Swap already claimed \u2014 initiator revealed the secret on-chain");
-  if (swapData.refunded || swapData.amount === 0n) throw new Error("Swap already refunded");
-  if (swapData.timeLock === 0n) {
-    throw new Error("[refundSwap] timeLock is zero \u2014 invalid swap data from contract.");
-  }
-  if (swapData.timeLock < 1000000000n || swapData.timeLock > 100000000000n) {
-    throw new Error(`[refundSwap] timeLock value ${swapData.timeLock} is not a plausible unix timestamp (expected ~1.7e9). Contract invariant violated.`);
-  }
-  let _blockTimeoutId;
-  const latestForRefund = await Promise.race([
-    provider.getBlock("latest"),
-    new Promise((_, rej) => {
-      _blockTimeoutId = setTimeout(() => rej(new Error("[refundSwap] getBlock timed out after 15s")), 15e3);
-    })
-  ]).finally(() => clearTimeout(_blockTimeoutId));
-  if (!latestForRefund || !Number.isFinite(latestForRefund.timestamp)) {
-    throw new Error("[refundSwap] could not read latest block timestamp \u2014 cannot verify timelock expiry.");
-  }
-  const nowSec = BigInt(latestForRefund.timestamp);
-  if (nowSec <= swapData.timeLock) {
-    const rawDelta = swapData.timeLock - nowSec;
-    const secsLeft = rawDelta > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(rawDelta);
-    throw new Error(`Timelock has not expired yet. ~${Math.ceil(secsLeft / 60).toLocaleString()} minutes remaining.`);
-  }
-  const tx = await Promise.race([
-    htlc.refund(swapId, { gasLimit: 150000n, ...await bumpedTxFees(signer) }),
-    new Promise((_, rej) => setTimeout(() => rej(new Error("[refundSwap] refund() submission timed out after 30s")), 3e4))
-  ]);
-  let receipt;
+  let broadcastReached = false;
   try {
-    let refundWaitId;
-    receipt = await Promise.race([
-      tx.wait(),
+    let preflight15Id;
+    const swapData = await Promise.race([
+      getSwap(htlcAddr, swapId, provider),
       new Promise((_, reject) => {
-        refundWaitId = setTimeout(() => reject(new Error("[refundSwap] tx.wait timed out after 120s \u2014 tx may still confirm")), 12e4);
+        preflight15Id = setTimeout(() => reject(new Error("[refundSwap] getSwap timed out after 15s")), 15e3);
       })
-    ]).finally(() => clearTimeout(refundWaitId));
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    const _re = e;
-    if (_re.code === "TRANSACTION_REPLACED") {
-      if (_re.reason === "cancelled" || _re.cancelled) {
-        throw new Error("refundSwap: refund was cancelled in the wallet \u2014 retry the refund.");
+    ]).finally(() => clearTimeout(preflight15Id));
+    if (!swapData) throw new Error("Swap not found \u2014 may not be funded yet");
+    const signerAddress = (await Promise.race([
+      signer.getAddress(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("getAddress timed out")), 15e3))
+    ])).toLowerCase();
+    if (swapData.initiator.toLowerCase() !== signerAddress) {
+      throw new Error(
+        `refundSwap: caller ${signerAddress} is not the HTLC initiator (${swapData.initiator}). Only the initiator can trigger a refund.`
+      );
+    }
+    if (swapData.claimed) throw new Error("Swap already claimed \u2014 initiator revealed the secret on-chain");
+    if (swapData.refunded || swapData.amount === 0n) throw new Error("Swap already refunded");
+    if (swapData.timeLock === 0n) {
+      throw new Error("[refundSwap] timeLock is zero \u2014 invalid swap data from contract.");
+    }
+    if (swapData.timeLock < 1000000000n || swapData.timeLock > 100000000000n) {
+      throw new Error(`[refundSwap] timeLock value ${swapData.timeLock} is not a plausible unix timestamp (expected ~1.7e9). Contract invariant violated.`);
+    }
+    let _blockTimeoutId;
+    const latestForRefund = await Promise.race([
+      provider.getBlock("latest"),
+      new Promise((_, rej) => {
+        _blockTimeoutId = setTimeout(() => rej(new Error("[refundSwap] getBlock timed out after 15s")), 15e3);
+      })
+    ]).finally(() => clearTimeout(_blockTimeoutId));
+    if (!latestForRefund || !Number.isFinite(latestForRefund.timestamp)) {
+      throw new Error("[refundSwap] could not read latest block timestamp \u2014 cannot verify timelock expiry.");
+    }
+    const nowSec = BigInt(latestForRefund.timestamp);
+    if (nowSec <= swapData.timeLock) {
+      const rawDelta = swapData.timeLock - nowSec;
+      const secsLeft = rawDelta > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(rawDelta);
+      throw new Error(`Timelock has not expired yet. ~${Math.ceil(secsLeft / 60).toLocaleString()} minutes remaining.`);
+    }
+    broadcastReached = true;
+    const tx = await Promise.race([
+      htlc.refund(swapId, { gasLimit: 150000n, ...await bumpedTxFees(signer) }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("[refundSwap] refund() submission timed out after 30s")), 3e4))
+    ]);
+    let receipt;
+    try {
+      let refundWaitId;
+      receipt = await Promise.race([
+        tx.wait(),
+        new Promise((_, reject) => {
+          refundWaitId = setTimeout(() => reject(new Error("[refundSwap] tx.wait timed out after 120s \u2014 tx may still confirm")), 12e4);
+        })
+      ]).finally(() => clearTimeout(refundWaitId));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const _re = e;
+      if (_re.code === "TRANSACTION_REPLACED") {
+        if (_re.reason === "cancelled" || _re.cancelled) {
+          throw new Error("refundSwap: refund was cancelled in the wallet \u2014 retry the refund.");
+        }
+        if (!_re.receipt) {
+          throw new Error("refundSwap: refund tx was sped up; the replacement is on-chain \u2014 reload to confirm the refund.");
+        }
+        receipt = _re.receipt;
+      } else if (msg.includes("CALL_EXCEPTION")) {
+        try {
+          let _ceGsTimer;
+          const postRevert = await Promise.race([
+            getSwap(htlcAddr, swapId, provider),
+            new Promise((_, rej) => {
+              _ceGsTimer = setTimeout(() => rej(new Error("[refundSwap] CALL_EXCEPTION getSwap timed out")), 15e3);
+            })
+          ]).finally(() => clearTimeout(_ceGsTimer));
+          if (postRevert?.claimed) {
+            throw new Error("Swap was claimed before refund executed \u2014 secret is on-chain, check Claimed events");
+          }
+        } catch (checkErr) {
+          const checkMsg = checkErr instanceof Error ? checkErr.message : String(checkErr);
+          if (checkMsg.includes("Swap was claimed")) throw checkErr;
+        }
+        throw new Error("Refund rejected by contract \u2014 timelock may not have expired yet");
+      } else {
+        throw e;
       }
-      if (!_re.receipt) {
-        throw new Error("refundSwap: refund tx was sped up; the replacement is on-chain \u2014 reload to confirm the refund.");
-      }
-      receipt = _re.receipt;
-    } else if (msg.includes("CALL_EXCEPTION")) {
+    }
+    if (receipt === null) {
+      throw new Error("Refund transaction was dropped from mempool \u2014 may need to rebroadcast");
+    }
+    if (receipt.status !== 1) {
       try {
-        let _ceGsTimer;
+        let _postRefundGsTimer;
         const postRevert = await Promise.race([
           getSwap(htlcAddr, swapId, provider),
           new Promise((_, rej) => {
-            _ceGsTimer = setTimeout(() => rej(new Error("[refundSwap] CALL_EXCEPTION getSwap timed out")), 15e3);
+            _postRefundGsTimer = setTimeout(() => rej(new Error("[refundSwap] post-revert getSwap timed out")), 15e3);
           })
-        ]).finally(() => clearTimeout(_ceGsTimer));
+        ]).finally(() => clearTimeout(_postRefundGsTimer));
         if (postRevert?.claimed) {
           throw new Error("Swap was claimed before refund executed \u2014 secret is on-chain, check Claimed events");
         }
@@ -907,30 +934,15 @@ async function refundSwap(htlcAddr, swapId, signer) {
         if (checkMsg.includes("Swap was claimed")) throw checkErr;
       }
       throw new Error("Refund rejected by contract \u2014 timelock may not have expired yet");
-    } else {
-      throw e;
     }
-  }
-  if (receipt === null) {
-    throw new Error("Refund transaction was dropped from mempool \u2014 may need to rebroadcast");
-  }
-  if (receipt.status !== 1) {
-    try {
-      let _postRefundGsTimer;
-      const postRevert = await Promise.race([
-        getSwap(htlcAddr, swapId, provider),
-        new Promise((_, rej) => {
-          _postRefundGsTimer = setTimeout(() => rej(new Error("[refundSwap] post-revert getSwap timed out")), 15e3);
-        })
-      ]).finally(() => clearTimeout(_postRefundGsTimer));
-      if (postRevert?.claimed) {
-        throw new Error("Swap was claimed before refund executed \u2014 secret is on-chain, check Claimed events");
+  } catch (refundErr) {
+    if (!broadcastReached && refundErr instanceof Error && !refundErr.preBroadcast) {
+      try {
+        refundErr.preBroadcast = true;
+      } catch {
       }
-    } catch (checkErr) {
-      const checkMsg = checkErr instanceof Error ? checkErr.message : String(checkErr);
-      if (checkMsg.includes("Swap was claimed")) throw checkErr;
     }
-    throw new Error("Refund rejected by contract \u2014 timelock may not have expired yet");
+    throw refundErr;
   }
 }
 async function getSwap(htlcAddr, swapId, provider, blockTag) {

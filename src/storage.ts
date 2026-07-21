@@ -42,6 +42,18 @@ export interface DurableStore {
   commit(entries: Array<[string, string]>): Promise<void>;
 }
 
+// Thrown when a commit failed partway AND a rollback restore ALSO threw, so the store could NOT be returned to its prior
+// state — it is left partially written. Signals the caller that the store is in an INCONSISTENT state and MUST NOT
+// proceed (do not treat this as a clean/atomic failed commit). Carries the original commit error and every rollback
+// error for observability.
+export class DurableStoreInconsistentError extends Error {
+  readonly storeInconsistent = true as const;
+  constructor(message: string, readonly commitError: unknown, readonly rollbackErrors: Array<{ key: string; error: unknown }>) {
+    super(message);
+    this.name = 'DurableStoreInconsistentError';
+  }
+}
+
 // Map-backed default — trivially atomic (an in-process Map write cannot partially fail). Still honors the commit
 // contract (stage → apply → read-back) so it is a faithful stand-in for the mainnet adapter in tests.
 export class InMemoryDurableStore implements DurableStore {
@@ -101,12 +113,26 @@ export class LocalStorageDurableStore implements DurableStore {
         if (this.s.getItem(k) !== v) throw new Error(`LocalStorageDurableStore.commit read-back mismatch for ${k}`);
       }
     } catch (e) {
-      // All-or-nothing: restore every key we touched to its prior value (remove if it had none).
+      const commitError = e instanceof Error ? e : new Error(String(e));
+      // All-or-nothing: restore every key we touched to its prior value (remove if it had none). If ANY restore ALSO
+      // throws, the store could NOT be returned to its prior state — it is left partially written. Attempt every
+      // restore first, then surface the inconsistency LOUDLY (never swallow and rethrow as if it were a clean atomic
+      // failure), so the caller knows the store is untrustworthy and must not proceed.
+      const rollbackErrors: Array<{ key: string; error: unknown }> = [];
       for (const k of written) {
         const p = prior.get(k) ?? null;
-        try { if (p === null) this.s.removeItem(k); else this.s.setItem(k, p); } catch { /* best-effort rollback */ }
+        try { if (p === null) this.s.removeItem(k); else this.s.setItem(k, p); }
+        catch (re) { rollbackErrors.push({ key: k, error: re }); }
       }
-      throw e instanceof Error ? e : new Error(String(e));
+      if (rollbackErrors.length > 0) {
+        const keys = rollbackErrors.map((r) => r.key).join(', ');
+        throw new DurableStoreInconsistentError(
+          `LocalStorageDurableStore.commit rollback FAILED for [${keys}] after a commit error (${commitError.message}) — the store is in an INCONSISTENT partial-write state and must not be trusted.`,
+          commitError,
+          rollbackErrors,
+        );
+      }
+      throw commitError;
     }
   }
 }
@@ -160,6 +186,18 @@ export class MutexBusyError extends Error {
   }
 }
 
+// Raised when NO cross-tab lock medium is available (the Web Locks API is absent AND localStorage is unusable) so the
+// browser single-flight path CANNOT provide a lock. It fails CLOSED — throwing this rather than running the irreversible
+// fund/lock body with no cross-tab mutex. Distinct from MutexBusyError (a retryable "another holder has it"): this
+// signals a degraded ENVIRONMENT and is not retryable there, so a host must surface it rather than spin.
+export class MutexUnavailableError extends Error {
+  readonly mutexUnavailable = true as const;
+  constructor(name: string) {
+    super(`No cross-tab lock medium available for "${name}" (Web Locks API absent and localStorage unusable) — refusing to run the fund/lock body without a cross-tab lock.`);
+    this.name = 'MutexUnavailableError';
+  }
+}
+
 const _randToken = (): string => `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 10)}`;
 const _CAS_PREFIX = 'bch2swap:mutexcas:';
 interface CasToken { token: string; ts: number; }
@@ -206,21 +244,37 @@ export class InProcessMutex implements Mutex {
   // back (a racing peer that overwrote us => throw), run fn, release only if the sentinel is still ours.
   private async guarded<T>(name: string, fn: () => Promise<T> | T): Promise<T> {
     if (!this.store) return await fn(); // no durable backstop available (in-process serialization only)
+    const store = this.store;
     const key = _CAS_PREFIX + name;
     const now = this.now();
-    const existing = _parseCas(await this.store.get(key));
+    const existing = _parseCas(await store.get(key));
     if (existing && existing.token !== this.token && (now - existing.ts) < this.ttlMs) {
       throw new MutexBusyError(name, 'cross-process');
     }
     const stamp = `${this.token}@${now}`;
-    await this.store.set(key, stamp);
+    await store.set(key, stamp);
     await this.settle(); // jittered settle so a near-simultaneous peer's write lands before our read-back
-    if ((await this.store.get(key)) !== stamp) throw new MutexBusyError(name, 'cross-process'); // a peer raced and won
+    if ((await store.get(key)) !== stamp) throw new MutexBusyError(name, 'cross-process'); // a peer raced and won
+    // LIVE-HOLDER HEARTBEAT (mirrors BrowserMutex): renew our CAS stamp with a fresh timestamp every ~ttlMs/3 while fn
+    // runs. Without this, a body that outlasts ttlMs (realistic for an EVM lock tx.wait + RPC retries) is seen as
+    // EXPIRED by a peer instance sharing the store, which would steal the lock and run a SECOND concurrent holder on
+    // the single-flight fund/lock path. Only re-write while the sentinel is still ours; cleared in finally.
+    let hb: ReturnType<typeof setInterval> | undefined;
+    try {
+      hb = setInterval(() => {
+        void (async () => {
+          try {
+            if (_parseCas(await store.get(key))?.token === this.token) await store.set(key, `${this.token}@${this.now()}`);
+          } catch { /* ignore a transient store error; the next tick retries */ }
+        })();
+      }, Math.max(1, Math.floor(this.ttlMs / 3)));
+    } catch { /* environment without setInterval: fall through without renewal (degrades to prior behavior) */ }
     try {
       return await fn();
     } finally {
+      if (hb) { try { clearInterval(hb); } catch { /* ignore */ } }
       // Release only if the sentinel is still ours (a peer that reclaimed a TTL-expired lock keeps its own).
-      try { if (_parseCas(await this.store.get(key))?.token === this.token) await this.store.remove(key); } catch { /* ignore */ }
+      try { if (_parseCas(await store.get(key))?.token === this.token) await store.remove(key); } catch { /* ignore */ }
     }
   }
 }
@@ -261,12 +315,16 @@ export class BrowserMutex implements Mutex {
     // ran the irreversible fund/lock body with NO cross-tab mutex, re-opening the R154/R170 double-lock/double-fund
     // class. Best-effort localStorage compare-and-set lock below.
     const s = this.ls;
-    if (!s) return await fn(); // storage unavailable: best-effort, no lock (matches app fallback)
+    // No Web Locks AND no localStorage => no cross-tab lock medium at all. FAIL CLOSED (never run the irreversible
+    // fund/lock body with no lock — that re-opens the R154/R170 double-lock/double-fund class).
+    if (!s) throw new MutexUnavailableError(name);
     const key = `bch2swap:xtlock:${name}`;
     const readTok = (): CasToken | null => { try { return _parseCas(s.getItem(key)); } catch { return null; } };
     const peerHeld = (): boolean => { const t = readTok(); return !!t && t.token !== this.token && (Date.now() - t.ts) < this.ttlMs; };
     if (peerHeld()) throw new MutexBusyError(name, 'cross-tab');
-    try { s.setItem(key, `${this.token}@${Date.now()}`); } catch { return await fn(); /* storage unavailable: best-effort, no lock */ }
+    // localStorage is present but the acquiring write failed (quota/disabled) => we cannot hold a cross-tab lock. FAIL
+    // CLOSED rather than run the fund/lock body unlocked.
+    try { s.setItem(key, `${this.token}@${Date.now()}`); } catch { throw new MutexUnavailableError(name); }
     // Jittered settle so two near-simultaneous acquirers' write/read-back windows do not align (last writer wins).
     await new Promise<void>((res) => { setTimeout(res, 30 + Math.floor(Math.random() * 90)); });
     const after = readTok();

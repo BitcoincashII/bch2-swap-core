@@ -54,7 +54,7 @@ import type { HTLCDetails, HTLCParams, Utxo } from './swap-types';
 // ── EVM parity (P1b step 7) — the injected quorum>=2 read provider + Node ethers.Wallet signer seams, plus the
 // proven on-chain handlers (lockETH/lockTokens/claimSwap/refundSwap/getSwap) and the EVM leg config lookups. ──
 import { ethers, type Provider, type Signer } from 'ethers';
-import { lockETH, lockTokens, claimSwap, refundSwap, getSwap, HTLC_ABI } from './evm-client';
+import { lockETH, lockTokens, claimSwap, refundSwap, getSwap, recoverLockFromTx, HTLC_ABI } from './evm-client';
 import { getEvmConfig, isNativeToken, evmLockSecondsForRole, NATIVE_ETH_ADDRESS, type EvmChainId, type EvmChainConfig } from './evm-config';
 
 /** The zero address (native-asset sentinel), lowercased — an HTLC config still pinned to it means "not deployed". */
@@ -336,6 +336,26 @@ function evmLeaves(provider: Provider): Provider[] {
 }
 /** One shared Interface for parsing Claimed logs (built from the SAME HTLC_ABI the SUT + mocks use — no ABI drift). */
 const HTLC_IFACE = new ethers.Interface(HTLC_ABI);
+
+/**
+ * FIX #3 (poisoned claim sentinel): classify a UTXO `broadcastTx` failure into DEFINITIVE-node-rejection vs AMBIGUOUS
+ * — the UTXO analogue of the EVM claimSwap `preBroadcast` distinction. A DEFINITIVE rejection means the node VALIDATED
+ * the tx and refused it, so it never entered ANY mempool: the secret in the claim scriptSig is NOT public and a retry
+ * can rebuild + re-broadcast (the caller CLEARS the claimbroadcast sentinel). An AMBIGUOUS failure (timeout / connection
+ * drop / already-known / anything unrecognized) means the tx MAY have reached a mempool — the secret MAY be public — so
+ * the caller KEEPS the sentinel and a later call ADOPTS instead of re-revealing (fail-safe, R201). Fail-safe DEFAULT is
+ * ambiguous (return false): a transport/timeout signal ALWAYS wins, and only a recognized node-validation rejection clears.
+ */
+function isDefinitiveBroadcastRejection(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err ?? '')).toLowerCase();
+  if (!msg) return false;
+  // AMBIGUOUS transport/timeout/liveness signals ALWAYS win (the tx may already be in some node's mempool) → KEEP.
+  if (/tim(e|ed)\s?out|timeout|econnreset|econnrefused|etimedout|socket hang up|network|unreachable|fetch failed|abort|websocket|\b1006\b|disconnect|no (response|reply)|already (in|known)|txn-already-known|in block chain|mempool/i.test(msg)) {
+    return false;
+  }
+  // DEFINITIVE node-validation rejections: the node examined the tx and refused it (not in any mempool) → CLEAR.
+  return /reject|bad-txns|missing ?inputs|missingorspent|min relay fee|insufficient (fee|priority)|mandatory-script-verify|non-mandatory-script-verify|scriptsig|dust|non-?final|absurdly-high-fee|belowout|verify (flag|failed)|invalid|malformed|^\s*(16|64|18|256):\s/i.test(msg);
+}
 
 // ============================================================================
 // Ported pure helpers (step 6) — the availability + resume decision logic, brought into the SDK from the app so the
@@ -682,6 +702,22 @@ export class SwapController {
       throw new Error(`${label}: counterpartyClaimPkh (the counterparty receive pkh on the own leg) is missing — cannot build the HTLC`);
     }
 
+    // FIX #5 (fund-safety, INITIATOR / leg-X only): NEVER fund a swap whose secret a crash would strand. The initiator's
+    // secret must be RE-DERIVABLE — either the offer is hmac-v1 (S = swapSecretFromKss on any device) OR an
+    // encrypted-at-rest durable S is present. prepare() enforces this at ~508-517, and the file header (lines 16-17)
+    // claims fundLegX enforces it too — but a caller invoking fundLegX() DIRECTLY from 'taken' (skipping prepare) would
+    // otherwise bypass it. The responder (leg Y) learns S on-chain, so it is exempt (gated on expectRole 'initiator').
+    if (expectRole === 'initiator') {
+      const isHmacV1 = rec.offer.secretScheme === SWAP_SECRET_SCHEME;
+      const durableSecretHex = await this.deps.durable.get(durableSecretKey(rec.id));
+      if (!isHmacV1 && !durableSecretHex) {
+        throw new Error(
+          `${label}: offer secretScheme '${rec.offer.secretScheme ?? 'none'}' is not '${SWAP_SECRET_SCHEME}' and no ` +
+          `encrypted-at-rest durable secret is present — refusing to fund a swap whose secret a crash would strand (fix #5)`,
+        );
+      }
+    }
+
     const client = this.deps.chainClientFor(this.myChain);
 
     // (1) H1-LOCKTIME-PROXY-001: SPV-verify the build height is a REAL PoW block before it becomes the refund CLTV
@@ -990,7 +1026,11 @@ export class SwapController {
       ]);
 
       this.status('revealAndClaim:broadcasting');
-      await client.broadcastTx(claimTx.rawTx);
+      // FIX #3: a DEFINITIVE pre-broadcast node rejection (the node validated + refused the tx — the secret never
+      // entered any mempool) CLEARS the claimbroadcast sentinel we just set so a retry can rebuild + re-broadcast;
+      // an ambiguous / timeout failure LEAVES it set (fail-safe, R201). Without this, a stale sentinel makes a later
+      // call ADOPT a claim that never happened, wedging the swap (refund also refuses via the R181 cross-guard).
+      await this.broadcastClaimWithSentinelGuard(client, claimTx.rawTx, rec.id);
       return claimTx.txid.toLowerCase();
     });
 
@@ -1135,7 +1175,9 @@ export class SwapController {
         [claimBroadcastKey(rec.id), '1'],
       ]);
       this.status('claimWithKnownSecret:broadcasting');
-      await client.broadcastTx(claimTx.rawTx);
+      // FIX #3: clear the claimbroadcast sentinel on a DEFINITIVE pre-broadcast node rejection (retry can re-broadcast),
+      // keep it on an ambiguous / timeout failure (fail-safe, R201) — same poisoned-sentinel guard as revealAndClaim.
+      await this.broadcastClaimWithSentinelGuard(client, claimTx.rawTx, rec.id);
       return claimTx.txid.toLowerCase();
     });
 
@@ -1355,6 +1397,9 @@ export class SwapController {
    */
   async trySettleIfBothLegsSpent(): Promise<boolean> {
     this.assertLive();
+    // FIX #10 (§9.6 never-wipe): a resume whose myHTLC on-chain authentication was NOT a DEFINITIVE 'ok' must KEEP all
+    // non-recoverable material — never tear down the secret/record off a possibly-untrustworthy chain read.
+    if (this.irreversibleBlocked) return false;
     const rec = this.record;
     if (!(await this.deps.durable.get(claimBroadcastKey(rec.id)))) return false; // no in-flight winning claim
     const myHtlc = rec.myHTLC; const cpHtlc = rec.counterpartyHTLC;
@@ -1369,13 +1414,44 @@ export class SwapController {
       const myClient = this.deps.chainClientFor(this.myChain);
       const myUtxos = (await myClient.getUTXOs(getHTLCScripthash(myRedeem), 'a914' + bytesToHex(hash160(myRedeem)) + '87')) as GateUtxo[];
       if (myUtxos.some((u) => Number.isFinite(u.value) && u.value > 0)) return false; // OUR leg still funded -> refundable -> KEEP
-      // BOTH legs spent -> terminal. Safe to wipe + finalize.
+      // FIX (§9.6 never-wipe): a bare getUTXOs "both legs empty" read is NOT sufficient to destroy the non-recoverable
+      // secret + durable record. A reorg, or a stale / incorrect proxy read that shows OUR still-funded leg as empty,
+      // would trigger an unrecoverable teardown. Require the SPENDING of OUR OWN leg to be buried at reorg-safe SPV depth
+      // (the SAME provenTxid-bound proof confirmClaim / confirmRefund require) before wiping — never wipe on a bare
+      // getUTXOs read. Fail closed: KEEP on any doubt (0-conf spend / short depth / pruned SPV / read error).
+      if (!(await this.ownLegSpendReorgSafe(myClient, myRedeem))) return false;
+      // BOTH legs spent + our leg's spend is reorg-safe -> terminal. Safe to wipe + finalize.
       if (this.secret) { this.secret.fill(0); this.secret = null; }
       await this.wipeDurable([claimTxKey(rec.id), claimBroadcastKey(rec.id), durableSecretKey(rec.id), recordKey(rec.id)]);
       this.setPhase('completed');
       this.status('trySettle:finalized');
       return true;
     } catch { return false; } // inconclusive (e.g. getUTXOs at-capacity throw) -> caller runs the normal resume
+  }
+
+  /**
+   * §9.6 reorg-safe proof that OUR OWN leg's HTLC funding output has been SPENT and that spend is buried at
+   * >= requiredConfirmations SPV-VERIFIED depth (the same anchor confirmClaim / confirmRefund use). The spend is the
+   * confirmed HTLC-scripthash history tx that is NOT our own funding tx. FAIL CLOSED (returns false): a transient read
+   * error, a 0-conf / short-depth spend, a pruned/unprovable SPV read, or the absence of any confirmed spend all KEEP
+   * the recovery material. Never trusts a bare getUTXOs "empty" read to authorize the teardown.
+   */
+  private async ownLegSpendReorgSafe(client: SwapChainClient, myRedeem: Uint8Array): Promise<boolean> {
+    const rec = this.record;
+    const cfg = chainConfigs[this.myChain];
+    if (!cfg || (cfg as { isEvm?: boolean }).isEvm) return false;
+    const reqConf = Math.max(1, cfg.requiredConfirmations ?? 6);
+    const fundingTxid = (rec.myFundingTxid ?? '').toLowerCase();
+    let history: Array<{ tx_hash: string; height: number }>;
+    try { history = await client.getHistory(getHTLCScripthash(myRedeem), 'a914' + bytesToHex(hash160(myRedeem)) + '87'); }
+    catch { return false; } // transient read error — never wipe
+    for (const h of history) {
+      if (typeof h?.tx_hash !== 'string' || !HEX64.test(h.tx_hash.toLowerCase()) || !Number.isInteger(h.height) || h.height <= 0) continue;
+      const txid = h.tx_hash.toLowerCase();
+      if (txid === fundingTxid) continue; // the funding tx itself, not its spend
+      if (await this.spvReorgSafe(client, this.myChain, txid, h.height, undefined, reqConf)) return true;
+    }
+    return false;
   }
 
   // ── resume() — rehydrate a stalled / crashed / new-device swap from durable state (fix #10) ──────────────────
@@ -1994,6 +2070,44 @@ export class SwapController {
       const prior = (await this.deps.durable.get(fundedKey(rec.id)))?.toLowerCase();
       if (prior && BYTES32_0X.test(prior)) return { swapId: prior, txHash: '', adopted: true };
 
+      // FIX #4 (EVM double-lock): the funded sentinel above is written only AFTER the lock RESOLVES — but the
+      // lockpending / evmlocktx recovery markers are written the instant the lock is BROADCAST (before it mines). A
+      // re-call after the broadcast but before the funded sentinel lands must NOT re-lock (a second on-chain lock under
+      // a fresh per-nonce swapId strands the first). Read those markers + recoverLockFromTx (quorum-corroborated) over
+      // the recorded lock tx: ADOPT a prior lock ('locked' -> commit the funded sentinel, return its swapId, NO second
+      // lock), or REFUSE while its disposition is uncertain ('blocked' / a pending marker with no tx hash yet — a
+      // re-lock could double-lock). Only a definitive 'safe' (the prior lock dropped/reverted — moved no funds) falls
+      // through to a fresh lock below.
+      const pendingMarker = await this.deps.durable.get(lockPendingKey(rec.id));
+      if (pendingMarker) {
+        const markedHash = await this.deps.durable.get(evmLockTxKey(rec.id));
+        const lockTxHash = (markedHash && BYTES32_0X.test(markedHash.toLowerCase())) ? markedHash.toLowerCase()
+          : (BYTES32_0X.test(pendingMarker.toLowerCase()) ? pendingMarker.toLowerCase() : null);
+        if (!lockTxHash) {
+          // A pre-broadcast sentinel with no real tx hash yet: the lock may already be in the mempool. Fail closed.
+          throw new Error('lockEvm: a prior EVM lock is in-flight (pending marker set, tx hash not yet recorded) — refusing to re-lock (would risk a double-lock); retry once it resolves (fix #4)');
+        }
+        const readProvider = this.evmProvider(this.myChain);
+        let sender = '';
+        try { sender = await signer.getAddress(); } catch { sender = ''; }
+        let recovery: { kind: 'locked'; swapId: string } | { kind: 'safe' | 'blocked' };
+        try {
+          recovery = await recoverLockFromTx(htlcAddr, lockTxHash, readProvider, {
+            sender, hashLock, recipient, minAmount: amount, fromBlock: rec.evmLockBlock,
+          });
+        } catch { recovery = { kind: 'blocked' }; }
+        if (recovery.kind === 'locked') {
+          // The prior lock is on-chain (authenticated Locked event, quorum-corroborated) — ADOPT it, no second lock.
+          await this.deps.durable.commit([[fundedKey(rec.id), recovery.swapId.toLowerCase()]]);
+          await this.deps.durable.remove(lockPendingKey(rec.id));
+          return { swapId: recovery.swapId, txHash: lockTxHash, adopted: true };
+        }
+        if (recovery.kind === 'blocked') {
+          throw new Error('lockEvm: a prior EVM lock tx is still pending / its disposition is indeterminate — refusing to re-lock (would risk a double-lock + strand); retry once it resolves (fix #4)');
+        }
+        // recovery.kind === 'safe': the prior lock never landed (dropped / reverted, moved no funds) — re-lock is safe.
+      }
+
       // FIX #2: re-mint the counterparty-leg burial FRESH at the broadcast choke point. A throw ABORTS the lock.
       this.status('lockEvm:reverifying-counterparty');
       await this.reverifyCounterpartyLegForFunding();
@@ -2195,8 +2309,12 @@ export class SwapController {
       // A definitively-no-funds-moved failure — clear the sentinel we set so a later retry can re-arm. Covers the
       // PRE-broadcast reverts (not refundable yet / not ours / already refunded / unreadable clock) AND (fix #4) the
       // definitive post-broadcast no-funds-moved outcomes: a 'dropped from mempool' refund (never landed) and the
-      // contract-revert 'timelock may not have expired'. An AMBIGUOUS post-broadcast failure is left SET (fail-safe).
-      if (/not found|not the HTLC initiator|already refunded|Timelock has not expired|timelock may not have expired|dropped from mempool|not a plausible unix|timeLock is zero|could not read latest block/i.test(msg)) {
+      // contract-revert 'timelock may not have expired'. FIX #5: ALSO clear when refundSwap tagged the throw
+      // `preBroadcast:true` — a TRANSIENT pre-flight timeout (getSwap / getAddress / getBlock read failed before
+      // htlc.refund() submitted, so no refund tx exists) that the message-based allowlist above would otherwise MISS,
+      // leaving the sentinel set and WEDGING the refund. An AMBIGUOUS post-broadcast failure is left SET (fail-safe).
+      const isPreBroadcast = !!(e as { preBroadcast?: boolean } | null)?.preBroadcast;
+      if (isPreBroadcast || /not found|not the HTLC initiator|already refunded|Timelock has not expired|timelock may not have expired|dropped from mempool|not a plausible unix|timeLock is zero|could not read latest block/i.test(msg)) {
         try { await this.deps.durable.remove(refundBroadcastKey(rec.id)); } catch { /* best-effort */ }
       }
       throw e;
@@ -2221,6 +2339,22 @@ export class SwapController {
     if (!provider) return false;
     try { const sw = await getSwap(htlcAddr, swapId, provider); return !!sw?.refunded; }
     catch { return false; }
+  }
+
+  /** Broadcast a UTXO claim, clearing the durable claimbroadcast sentinel ONLY on a DEFINITIVE pre-broadcast node
+   *  rejection (the node validated + refused the tx — it never entered any mempool, so the secret is not public and a
+   *  retry can rebuild + re-broadcast), so a later call re-arms instead of ADOPTING a never-broadcast claim (fix #3).
+   *  An AMBIGUOUS / timeout / post-broadcast failure (the tx MAY have reached a mempool) LEAVES the sentinel set
+   *  (R201 fail-safe). The UTXO analogue of claimEvmWithSentinelGuard — same definitive-vs-ambiguous classification. */
+  private async broadcastClaimWithSentinelGuard(client: SwapChainClient, rawTx: string, id: string): Promise<void> {
+    try {
+      await client.broadcastTx(rawTx);
+    } catch (e) {
+      if (isDefinitiveBroadcastRejection(e)) {
+        try { await this.deps.durable.remove(claimBroadcastKey(id)); } catch { /* best-effort */ }
+      }
+      throw e;
+    }
   }
 
   /** Broadcast an EVM claim, clearing the durable claimbroadcast sentinel ONLY on a PRE-broadcast throw (claimSwap tags

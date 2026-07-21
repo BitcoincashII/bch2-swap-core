@@ -1021,6 +1021,15 @@ export async function refundSwap(
 
   const htlc = new Contract(htlcAddr, HTLC_ABI, signer);
 
+  // R-REFUND-SENTINEL-STALE-001 (fix #5): track whether we reached the refund broadcast. EVERY throw before this flips
+  // true is PRE-BROADCAST (pre-flight getSwap/getAddress/getBlock read failed — no refund tx submitted, no funds moved)
+  // and gets tagged `preBroadcast:true` by the outer catch below, so the caller (refundEvm) can clear the load-bearing
+  // bch2swap:refundbroadcast sentinel it set pre-flight and a retry can re-arm. It flips true the instant we ENTER the
+  // refund broadcast (before htlc.refund()), so an ambiguous submission/timeout is treated as POSSIBLY-broadcast (keep
+  // the sentinel = fail-safe over-protect), never cleared. Mirrors claimSwap's broadcastReached/preBroadcast tagging.
+  let broadcastReached = false;
+  try {
+
   // Check timelock before broadcasting — saves gas on guaranteed revert
   // R65-EVM-001: add 15s timeout on getSwap — without it a stalled RPC hangs the entire
   // watchAndRefund poll loop indefinitely, preventing the refund from ever completing.
@@ -1084,6 +1093,7 @@ export async function refundSwap(
   // R21-EVM-004: 80k was insufficient for ERC-20 refunds to cold addresses (~50k for SSTORE + overhead)
   // R102-EVM-002: wrap refund() submission — stalled MetaMask/RPC was left uncovered while all other
   // tx submission calls were wrapped; watchAndRefund retries on timeout.
+  broadcastReached = true; // from here the refund() tx is being submitted — keep the sentinel on any failure (fail-safe)
   const tx = await Promise.race([
     htlc.refund(swapId, { gasLimit: 150_000n, ...(await bumpedTxFees(signer)) }) as Promise<ethers.ContractTransactionResponse>,
     new Promise<never>((_, rej) => setTimeout(() => rej(new Error('[refundSwap] refund() submission timed out after 30s')), 30_000)),
@@ -1167,6 +1177,16 @@ export async function refundSwap(
       // non-fatal check failure — fall through to generic error
     }
     throw new Error('Refund rejected by contract — timelock may not have expired yet');
+  }
+  } catch (refundErr) {
+    // R-REFUND-SENTINEL-STALE-001 (fix #5): tag a PRE-BROADCAST failure (pre-flight getSwap/getAddress/getBlock timeout
+    // or chain-read error threw before htlc.refund() submitted) so refundEvm can clear the stale refundbroadcast
+    // sentinel it set. Tag ONLY when broadcastReached is false (positive proof no refund tx was submitted) — a
+    // post-broadcast / ambiguous failure is left untagged so the caller KEEPS the sentinel (fail-safe over-protect).
+    if (!broadcastReached && refundErr instanceof Error && !(refundErr as { preBroadcast?: boolean }).preBroadcast) {
+      try { (refundErr as { preBroadcast?: boolean }).preBroadcast = true; } catch { /* frozen error — ignore */ }
+    }
+    throw refundErr;
   }
 }
 

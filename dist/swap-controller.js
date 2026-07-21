@@ -1877,6 +1877,74 @@ async function bumpedTxFees(signer) {
     return {};
   }
 }
+async function recoverLockFromTx(htlcAddr, txHash, provider, scan) {
+  const leaves = (() => {
+    const ls = provider.__leafProviders;
+    return Array.isArray(ls) && ls.length > 0 ? ls : [provider];
+  })();
+  const checkOneLeaf = async (p) => {
+    const htlc = new Contract(htlcAddr, HTLC_ABI, p);
+    let receipt;
+    try {
+      receipt = await p.getTransactionReceipt(txHash);
+    } catch {
+      return { kind: "blocked" };
+    }
+    if (receipt) {
+      if (receipt.status !== 1) return { kind: "safe" };
+      for (const log of receipt.logs) {
+        if (htlcAddr && String(log.address).toLowerCase() !== htlcAddr.toLowerCase()) continue;
+        try {
+          const parsed = htlc.interface.parseLog(log);
+          if (parsed && parsed.name === "Locked") {
+            const a = parsed.args;
+            const okHash = !scan?.hashLock || String(a.hashLock).toLowerCase() === scan.hashLock.toLowerCase();
+            const okRcpt = !scan?.recipient || String(a.recipient).toLowerCase() === scan.recipient.toLowerCase();
+            const okAmt = scan?.minAmount === void 0 || a.amount >= scan.minAmount;
+            if (okHash && okRcpt && okAmt) return { kind: "locked", swapId: parsed.args[0] };
+          }
+        } catch {
+        }
+      }
+      return { kind: "blocked" };
+    }
+    let tx;
+    try {
+      tx = await p.getTransaction(txHash);
+    } catch {
+      return { kind: "blocked" };
+    }
+    if (tx) return { kind: "blocked" };
+    if (scan?.sender && scan.hashLock) {
+      try {
+        const tip = await p.getBlockNumber();
+        const start = Math.max(0, scan.fromBlock && scan.fromBlock > 0 ? scan.fromBlock : tip - 5e4);
+        const CHUNK = 1800;
+        for (let to = tip; to >= start; to -= CHUNK) {
+          const from = Math.max(start, to - CHUNK + 1);
+          const evs = await htlc.queryFilter(htlc.filters.Locked(null, scan.sender), from, to);
+          for (const ev of evs) {
+            const a = ev.args;
+            if (!a) continue;
+            const okHash = String(a.hashLock).toLowerCase() === scan.hashLock.toLowerCase();
+            const okRcpt = !scan.recipient || String(a.recipient).toLowerCase() === scan.recipient.toLowerCase();
+            const okAmt = scan.minAmount === void 0 || a.amount >= scan.minAmount;
+            if (okHash && okRcpt && okAmt) return { kind: "locked", swapId: String(a.id) };
+          }
+          if (from <= start) break;
+        }
+      } catch {
+        return { kind: "blocked" };
+      }
+    }
+    return { kind: "safe" };
+  };
+  const results = await Promise.all(leaves.map((p) => checkOneLeaf(p).catch(() => ({ kind: "blocked" }))));
+  const found = results.find((r) => r.kind === "locked");
+  if (found) return found;
+  if (results.some((r) => r.kind === "blocked")) return { kind: "blocked" };
+  return { kind: "safe" };
+}
 function authenticatedLockedSwapId(htlc, htlcAddr, hashLock, logs) {
   for (const log of logs) {
     if (htlcAddr && String(log.address).toLowerCase() !== htlcAddr.toLowerCase()) continue;
@@ -2299,80 +2367,107 @@ async function refundSwap(htlcAddr, swapId, signer) {
   const provider = signer.provider;
   if (!provider) throw new Error("Signer has no provider attached");
   const htlc = new Contract(htlcAddr, HTLC_ABI, signer);
-  let preflight15Id;
-  const swapData = await Promise.race([
-    getSwap(htlcAddr, swapId, provider),
-    new Promise((_, reject) => {
-      preflight15Id = setTimeout(() => reject(new Error("[refundSwap] getSwap timed out after 15s")), 15e3);
-    })
-  ]).finally(() => clearTimeout(preflight15Id));
-  if (!swapData) throw new Error("Swap not found \u2014 may not be funded yet");
-  const signerAddress = (await Promise.race([
-    signer.getAddress(),
-    new Promise((_, rej) => setTimeout(() => rej(new Error("getAddress timed out")), 15e3))
-  ])).toLowerCase();
-  if (swapData.initiator.toLowerCase() !== signerAddress) {
-    throw new Error(
-      `refundSwap: caller ${signerAddress} is not the HTLC initiator (${swapData.initiator}). Only the initiator can trigger a refund.`
-    );
-  }
-  if (swapData.claimed) throw new Error("Swap already claimed \u2014 initiator revealed the secret on-chain");
-  if (swapData.refunded || swapData.amount === 0n) throw new Error("Swap already refunded");
-  if (swapData.timeLock === 0n) {
-    throw new Error("[refundSwap] timeLock is zero \u2014 invalid swap data from contract.");
-  }
-  if (swapData.timeLock < 1000000000n || swapData.timeLock > 100000000000n) {
-    throw new Error(`[refundSwap] timeLock value ${swapData.timeLock} is not a plausible unix timestamp (expected ~1.7e9). Contract invariant violated.`);
-  }
-  let _blockTimeoutId;
-  const latestForRefund = await Promise.race([
-    provider.getBlock("latest"),
-    new Promise((_, rej) => {
-      _blockTimeoutId = setTimeout(() => rej(new Error("[refundSwap] getBlock timed out after 15s")), 15e3);
-    })
-  ]).finally(() => clearTimeout(_blockTimeoutId));
-  if (!latestForRefund || !Number.isFinite(latestForRefund.timestamp)) {
-    throw new Error("[refundSwap] could not read latest block timestamp \u2014 cannot verify timelock expiry.");
-  }
-  const nowSec = BigInt(latestForRefund.timestamp);
-  if (nowSec <= swapData.timeLock) {
-    const rawDelta = swapData.timeLock - nowSec;
-    const secsLeft = rawDelta > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(rawDelta);
-    throw new Error(`Timelock has not expired yet. ~${Math.ceil(secsLeft / 60).toLocaleString()} minutes remaining.`);
-  }
-  const tx = await Promise.race([
-    htlc.refund(swapId, { gasLimit: 150000n, ...await bumpedTxFees(signer) }),
-    new Promise((_, rej) => setTimeout(() => rej(new Error("[refundSwap] refund() submission timed out after 30s")), 3e4))
-  ]);
-  let receipt;
+  let broadcastReached = false;
   try {
-    let refundWaitId;
-    receipt = await Promise.race([
-      tx.wait(),
+    let preflight15Id;
+    const swapData = await Promise.race([
+      getSwap(htlcAddr, swapId, provider),
       new Promise((_, reject) => {
-        refundWaitId = setTimeout(() => reject(new Error("[refundSwap] tx.wait timed out after 120s \u2014 tx may still confirm")), 12e4);
+        preflight15Id = setTimeout(() => reject(new Error("[refundSwap] getSwap timed out after 15s")), 15e3);
       })
-    ]).finally(() => clearTimeout(refundWaitId));
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    const _re = e;
-    if (_re.code === "TRANSACTION_REPLACED") {
-      if (_re.reason === "cancelled" || _re.cancelled) {
-        throw new Error("refundSwap: refund was cancelled in the wallet \u2014 retry the refund.");
+    ]).finally(() => clearTimeout(preflight15Id));
+    if (!swapData) throw new Error("Swap not found \u2014 may not be funded yet");
+    const signerAddress = (await Promise.race([
+      signer.getAddress(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("getAddress timed out")), 15e3))
+    ])).toLowerCase();
+    if (swapData.initiator.toLowerCase() !== signerAddress) {
+      throw new Error(
+        `refundSwap: caller ${signerAddress} is not the HTLC initiator (${swapData.initiator}). Only the initiator can trigger a refund.`
+      );
+    }
+    if (swapData.claimed) throw new Error("Swap already claimed \u2014 initiator revealed the secret on-chain");
+    if (swapData.refunded || swapData.amount === 0n) throw new Error("Swap already refunded");
+    if (swapData.timeLock === 0n) {
+      throw new Error("[refundSwap] timeLock is zero \u2014 invalid swap data from contract.");
+    }
+    if (swapData.timeLock < 1000000000n || swapData.timeLock > 100000000000n) {
+      throw new Error(`[refundSwap] timeLock value ${swapData.timeLock} is not a plausible unix timestamp (expected ~1.7e9). Contract invariant violated.`);
+    }
+    let _blockTimeoutId;
+    const latestForRefund = await Promise.race([
+      provider.getBlock("latest"),
+      new Promise((_, rej) => {
+        _blockTimeoutId = setTimeout(() => rej(new Error("[refundSwap] getBlock timed out after 15s")), 15e3);
+      })
+    ]).finally(() => clearTimeout(_blockTimeoutId));
+    if (!latestForRefund || !Number.isFinite(latestForRefund.timestamp)) {
+      throw new Error("[refundSwap] could not read latest block timestamp \u2014 cannot verify timelock expiry.");
+    }
+    const nowSec = BigInt(latestForRefund.timestamp);
+    if (nowSec <= swapData.timeLock) {
+      const rawDelta = swapData.timeLock - nowSec;
+      const secsLeft = rawDelta > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(rawDelta);
+      throw new Error(`Timelock has not expired yet. ~${Math.ceil(secsLeft / 60).toLocaleString()} minutes remaining.`);
+    }
+    broadcastReached = true;
+    const tx = await Promise.race([
+      htlc.refund(swapId, { gasLimit: 150000n, ...await bumpedTxFees(signer) }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("[refundSwap] refund() submission timed out after 30s")), 3e4))
+    ]);
+    let receipt;
+    try {
+      let refundWaitId;
+      receipt = await Promise.race([
+        tx.wait(),
+        new Promise((_, reject) => {
+          refundWaitId = setTimeout(() => reject(new Error("[refundSwap] tx.wait timed out after 120s \u2014 tx may still confirm")), 12e4);
+        })
+      ]).finally(() => clearTimeout(refundWaitId));
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const _re = e;
+      if (_re.code === "TRANSACTION_REPLACED") {
+        if (_re.reason === "cancelled" || _re.cancelled) {
+          throw new Error("refundSwap: refund was cancelled in the wallet \u2014 retry the refund.");
+        }
+        if (!_re.receipt) {
+          throw new Error("refundSwap: refund tx was sped up; the replacement is on-chain \u2014 reload to confirm the refund.");
+        }
+        receipt = _re.receipt;
+      } else if (msg.includes("CALL_EXCEPTION")) {
+        try {
+          let _ceGsTimer;
+          const postRevert = await Promise.race([
+            getSwap(htlcAddr, swapId, provider),
+            new Promise((_, rej) => {
+              _ceGsTimer = setTimeout(() => rej(new Error("[refundSwap] CALL_EXCEPTION getSwap timed out")), 15e3);
+            })
+          ]).finally(() => clearTimeout(_ceGsTimer));
+          if (postRevert?.claimed) {
+            throw new Error("Swap was claimed before refund executed \u2014 secret is on-chain, check Claimed events");
+          }
+        } catch (checkErr) {
+          const checkMsg = checkErr instanceof Error ? checkErr.message : String(checkErr);
+          if (checkMsg.includes("Swap was claimed")) throw checkErr;
+        }
+        throw new Error("Refund rejected by contract \u2014 timelock may not have expired yet");
+      } else {
+        throw e;
       }
-      if (!_re.receipt) {
-        throw new Error("refundSwap: refund tx was sped up; the replacement is on-chain \u2014 reload to confirm the refund.");
-      }
-      receipt = _re.receipt;
-    } else if (msg.includes("CALL_EXCEPTION")) {
+    }
+    if (receipt === null) {
+      throw new Error("Refund transaction was dropped from mempool \u2014 may need to rebroadcast");
+    }
+    if (receipt.status !== 1) {
       try {
-        let _ceGsTimer;
+        let _postRefundGsTimer;
         const postRevert = await Promise.race([
           getSwap(htlcAddr, swapId, provider),
           new Promise((_, rej) => {
-            _ceGsTimer = setTimeout(() => rej(new Error("[refundSwap] CALL_EXCEPTION getSwap timed out")), 15e3);
+            _postRefundGsTimer = setTimeout(() => rej(new Error("[refundSwap] post-revert getSwap timed out")), 15e3);
           })
-        ]).finally(() => clearTimeout(_ceGsTimer));
+        ]).finally(() => clearTimeout(_postRefundGsTimer));
         if (postRevert?.claimed) {
           throw new Error("Swap was claimed before refund executed \u2014 secret is on-chain, check Claimed events");
         }
@@ -2381,30 +2476,15 @@ async function refundSwap(htlcAddr, swapId, signer) {
         if (checkMsg.includes("Swap was claimed")) throw checkErr;
       }
       throw new Error("Refund rejected by contract \u2014 timelock may not have expired yet");
-    } else {
-      throw e;
     }
-  }
-  if (receipt === null) {
-    throw new Error("Refund transaction was dropped from mempool \u2014 may need to rebroadcast");
-  }
-  if (receipt.status !== 1) {
-    try {
-      let _postRefundGsTimer;
-      const postRevert = await Promise.race([
-        getSwap(htlcAddr, swapId, provider),
-        new Promise((_, rej) => {
-          _postRefundGsTimer = setTimeout(() => rej(new Error("[refundSwap] post-revert getSwap timed out")), 15e3);
-        })
-      ]).finally(() => clearTimeout(_postRefundGsTimer));
-      if (postRevert?.claimed) {
-        throw new Error("Swap was claimed before refund executed \u2014 secret is on-chain, check Claimed events");
+  } catch (refundErr) {
+    if (!broadcastReached && refundErr instanceof Error && !refundErr.preBroadcast) {
+      try {
+        refundErr.preBroadcast = true;
+      } catch {
       }
-    } catch (checkErr) {
-      const checkMsg = checkErr instanceof Error ? checkErr.message : String(checkErr);
-      if (checkMsg.includes("Swap was claimed")) throw checkErr;
     }
-    throw new Error("Refund rejected by contract \u2014 timelock may not have expired yet");
+    throw refundErr;
   }
 }
 async function getSwap(htlcAddr, swapId, provider, blockTag) {
@@ -2838,6 +2918,14 @@ function evmLeaves2(provider) {
   return Array.isArray(ls) && ls.length > 0 ? ls : [provider];
 }
 var HTLC_IFACE = new ethers.Interface(HTLC_ABI);
+function isDefinitiveBroadcastRejection(err) {
+  const msg = (err instanceof Error ? err.message : String(err ?? "")).toLowerCase();
+  if (!msg) return false;
+  if (/tim(e|ed)\s?out|timeout|econnreset|econnrefused|etimedout|socket hang up|network|unreachable|fetch failed|abort|websocket|\b1006\b|disconnect|no (response|reply)|already (in|known)|txn-already-known|in block chain|mempool/i.test(msg)) {
+    return false;
+  }
+  return /reject|bad-txns|missing ?inputs|missingorspent|min relay fee|insufficient (fee|priority)|mandatory-script-verify|non-mandatory-script-verify|scriptsig|dust|non-?final|absurdly-high-fee|belowout|verify (flag|failed)|invalid|malformed|^\s*(16|64|18|256):\s/i.test(msg);
+}
 function isHtlcRefundAvailable(locktime, currentHeight) {
   if (locktime >= 5e8) return Math.floor(Date.now() / 1e3) >= locktime;
   return currentHeight !== null && currentHeight >= locktime;
@@ -3119,6 +3207,15 @@ var SwapController = class _SwapController {
     if (!HEX20.test(claimPkhHex)) {
       throw new Error(`${label}: counterpartyClaimPkh (the counterparty receive pkh on the own leg) is missing \u2014 cannot build the HTLC`);
     }
+    if (expectRole === "initiator") {
+      const isHmacV1 = rec.offer.secretScheme === SWAP_SECRET_SCHEME;
+      const durableSecretHex = await this.deps.durable.get(durableSecretKey(rec.id));
+      if (!isHmacV1 && !durableSecretHex) {
+        throw new Error(
+          `${label}: offer secretScheme '${rec.offer.secretScheme ?? "none"}' is not '${SWAP_SECRET_SCHEME}' and no encrypted-at-rest durable secret is present \u2014 refusing to fund a swap whose secret a crash would strand (fix #5)`
+        );
+      }
+    }
     const client = this.deps.chainClientFor(this.myChain);
     this.status(`${label}:verifying-height`);
     const [buildHeight] = await client.getBlockHeight();
@@ -3369,7 +3466,7 @@ var SwapController = class _SwapController {
         [claimBroadcastKey(rec.id), "1"]
       ]);
       this.status("revealAndClaim:broadcasting");
-      await client.broadcastTx(claimTx.rawTx);
+      await this.broadcastClaimWithSentinelGuard(client, claimTx.rawTx, rec.id);
       return claimTx.txid.toLowerCase();
     });
     let effectiveClaimTx = claimTx;
@@ -3502,7 +3599,7 @@ var SwapController = class _SwapController {
         [claimBroadcastKey(rec.id), "1"]
       ]);
       this.status("claimWithKnownSecret:broadcasting");
-      await client.broadcastTx(claimTx.rawTx);
+      await this.broadcastClaimWithSentinelGuard(client, claimTx.rawTx, rec.id);
       return claimTx.txid.toLowerCase();
     });
     this.record = { ...this.record, claimTx, myClaimTxid: finalTxid };
@@ -3702,6 +3799,7 @@ var SwapController = class _SwapController {
    */
   async trySettleIfBothLegsSpent() {
     this.assertLive();
+    if (this.irreversibleBlocked) return false;
     const rec = this.record;
     if (!await this.deps.durable.get(claimBroadcastKey(rec.id))) return false;
     const myHtlc = rec.myHTLC;
@@ -3717,6 +3815,7 @@ var SwapController = class _SwapController {
       const myClient = this.deps.chainClientFor(this.myChain);
       const myUtxos = await myClient.getUTXOs(getHTLCScripthash(myRedeem), "a914" + bytesToHex(hash160(myRedeem)) + "87");
       if (myUtxos.some((u) => Number.isFinite(u.value) && u.value > 0)) return false;
+      if (!await this.ownLegSpendReorgSafe(myClient, myRedeem)) return false;
       if (this.secret) {
         this.secret.fill(0);
         this.secret = null;
@@ -3728,6 +3827,33 @@ var SwapController = class _SwapController {
     } catch {
       return false;
     }
+  }
+  /**
+   * §9.6 reorg-safe proof that OUR OWN leg's HTLC funding output has been SPENT and that spend is buried at
+   * >= requiredConfirmations SPV-VERIFIED depth (the same anchor confirmClaim / confirmRefund use). The spend is the
+   * confirmed HTLC-scripthash history tx that is NOT our own funding tx. FAIL CLOSED (returns false): a transient read
+   * error, a 0-conf / short-depth spend, a pruned/unprovable SPV read, or the absence of any confirmed spend all KEEP
+   * the recovery material. Never trusts a bare getUTXOs "empty" read to authorize the teardown.
+   */
+  async ownLegSpendReorgSafe(client, myRedeem) {
+    const rec = this.record;
+    const cfg = chainConfigs[this.myChain];
+    if (!cfg || cfg.isEvm) return false;
+    const reqConf = Math.max(1, cfg.requiredConfirmations ?? 6);
+    const fundingTxid = (rec.myFundingTxid ?? "").toLowerCase();
+    let history;
+    try {
+      history = await client.getHistory(getHTLCScripthash(myRedeem), "a914" + bytesToHex(hash160(myRedeem)) + "87");
+    } catch {
+      return false;
+    }
+    for (const h of history) {
+      if (typeof h?.tx_hash !== "string" || !HEX64.test(h.tx_hash.toLowerCase()) || !Number.isInteger(h.height) || h.height <= 0) continue;
+      const txid = h.tx_hash.toLowerCase();
+      if (txid === fundingTxid) continue;
+      if (await this.spvReorgSafe(client, this.myChain, txid, h.height, void 0, reqConf)) return true;
+    }
+    return false;
   }
   // ── resume() — rehydrate a stalled / crashed / new-device swap from durable state (fix #10) ──────────────────
   /**
@@ -4326,6 +4452,41 @@ var SwapController = class _SwapController {
     const outcome = await this.deps.mutex.withLock(lockName, async () => {
       const prior = (await this.deps.durable.get(fundedKey(rec.id)))?.toLowerCase();
       if (prior && BYTES32_0X.test(prior)) return { swapId: prior, txHash: "", adopted: true };
+      const pendingMarker = await this.deps.durable.get(lockPendingKey(rec.id));
+      if (pendingMarker) {
+        const markedHash = await this.deps.durable.get(evmLockTxKey(rec.id));
+        const lockTxHash = markedHash && BYTES32_0X.test(markedHash.toLowerCase()) ? markedHash.toLowerCase() : BYTES32_0X.test(pendingMarker.toLowerCase()) ? pendingMarker.toLowerCase() : null;
+        if (!lockTxHash) {
+          throw new Error("lockEvm: a prior EVM lock is in-flight (pending marker set, tx hash not yet recorded) \u2014 refusing to re-lock (would risk a double-lock); retry once it resolves (fix #4)");
+        }
+        const readProvider = this.evmProvider(this.myChain);
+        let sender = "";
+        try {
+          sender = await signer.getAddress();
+        } catch {
+          sender = "";
+        }
+        let recovery;
+        try {
+          recovery = await recoverLockFromTx(htlcAddr, lockTxHash, readProvider, {
+            sender,
+            hashLock,
+            recipient,
+            minAmount: amount,
+            fromBlock: rec.evmLockBlock
+          });
+        } catch {
+          recovery = { kind: "blocked" };
+        }
+        if (recovery.kind === "locked") {
+          await this.deps.durable.commit([[fundedKey(rec.id), recovery.swapId.toLowerCase()]]);
+          await this.deps.durable.remove(lockPendingKey(rec.id));
+          return { swapId: recovery.swapId, txHash: lockTxHash, adopted: true };
+        }
+        if (recovery.kind === "blocked") {
+          throw new Error("lockEvm: a prior EVM lock tx is still pending / its disposition is indeterminate \u2014 refusing to re-lock (would risk a double-lock + strand); retry once it resolves (fix #4)");
+        }
+      }
       this.status("lockEvm:reverifying-counterparty");
       await this.reverifyCounterpartyLegForFunding();
       let nowSec = null;
@@ -4482,7 +4643,8 @@ var SwapController = class _SwapController {
       if (/already claimed|was claimed|claimed before refund|secret is on-chain/i.test(msg)) {
         return await this.recoverFromRefundRace(htlcAddr, swapId);
       }
-      if (/not found|not the HTLC initiator|already refunded|Timelock has not expired|timelock may not have expired|dropped from mempool|not a plausible unix|timeLock is zero|could not read latest block/i.test(msg)) {
+      const isPreBroadcast = !!e?.preBroadcast;
+      if (isPreBroadcast || /not found|not the HTLC initiator|already refunded|Timelock has not expired|timelock may not have expired|dropped from mempool|not a plausible unix|timeLock is zero|could not read latest block/i.test(msg)) {
         try {
           await this.deps.durable.remove(refundBroadcastKey(rec.id));
         } catch {
@@ -4509,6 +4671,24 @@ var SwapController = class _SwapController {
       return !!sw?.refunded;
     } catch {
       return false;
+    }
+  }
+  /** Broadcast a UTXO claim, clearing the durable claimbroadcast sentinel ONLY on a DEFINITIVE pre-broadcast node
+   *  rejection (the node validated + refused the tx — it never entered any mempool, so the secret is not public and a
+   *  retry can rebuild + re-broadcast), so a later call re-arms instead of ADOPTING a never-broadcast claim (fix #3).
+   *  An AMBIGUOUS / timeout / post-broadcast failure (the tx MAY have reached a mempool) LEAVES the sentinel set
+   *  (R201 fail-safe). The UTXO analogue of claimEvmWithSentinelGuard — same definitive-vs-ambiguous classification. */
+  async broadcastClaimWithSentinelGuard(client, rawTx, id) {
+    try {
+      await client.broadcastTx(rawTx);
+    } catch (e) {
+      if (isDefinitiveBroadcastRejection(e)) {
+        try {
+          await this.deps.durable.remove(claimBroadcastKey(id));
+        } catch {
+        }
+      }
+      throw e;
     }
   }
   /** Broadcast an EVM claim, clearing the durable claimbroadcast sentinel ONLY on a PRE-broadcast throw (claimSwap tags

@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   InMemoryDurableStore,
   LocalStorageDurableStore,
@@ -7,6 +7,8 @@ import {
   InProcessMutex,
   BrowserMutex,
   MutexBusyError,
+  MutexUnavailableError,
+  DurableStoreInconsistentError,
   type DurableStore,
   type StorageLike,
 } from './storage';
@@ -76,6 +78,35 @@ describe('DurableStore.commit — atomic all-or-nothing (fix #4)', () => {
     await expect(store.commit([['k1', 'NEW'], ['k2', 'v2']])).rejects.toThrow(/QuotaExceeded/);
     expect(fake.getItem('k1')).toBe('OLD'); // restored to its prior value, not left as NEW nor removed
     expect(fake.getItem('k2')).toBeNull();
+  });
+
+  it('rollback failure is OBSERVABLE: forward set throws AND the restore set throws too -> commit rejects signalling the inconsistent state (fix #3)', async () => {
+    // A store where the forward write of k2 throws (QuotaExceeded) AND the rollback restore of k1 -> "OLD" ALSO throws.
+    // Pre-fix the catch swallowed the restore throw and rethrew the ORIGINAL commit error, so the caller saw a plain
+    // QuotaExceeded and could not tell the store was left partially written (k1 still holds NEW, not OLD).
+    const m = new Map<string, string>();
+    let phase: 'pre' | 'commit' = 'pre';
+    const s: StorageLike & { _m: Map<string, string> } = {
+      _m: m,
+      getItem(k: string) { return m.has(k) ? (m.get(k) as string) : null; },
+      setItem(k: string, v: string) {
+        if (phase === 'commit') {
+          if (k === 'k2') throw new Error('QuotaExceededError');            // forward write fails partway
+          if (k === 'k1' && v === 'OLD') throw new Error('restore write also failed'); // rollback restore fails too
+        }
+        m.set(k, String(v));
+      },
+      removeItem(k: string) { m.delete(k); },
+    };
+    s.setItem('k1', 'OLD'); // durable prior value, written before the commit
+    phase = 'commit';
+    const store = new LocalStorageDurableStore(s);
+    const err = await store.commit([['k1', 'NEW'], ['k2', 'v2']]).catch((e) => e);
+    expect(err).toBeInstanceOf(DurableStoreInconsistentError);
+    expect((err as DurableStoreInconsistentError).storeInconsistent).toBe(true);
+    expect((err as DurableStoreInconsistentError).rollbackErrors.map((r) => r.key)).toEqual(['k1']);
+    // The store really IS inconsistent: k1 could not be restored to OLD and still holds the half-committed NEW.
+    expect(s.getItem('k1')).toBe('NEW');
   });
 
   it('LocalStorageDurableStore.set read-back-verifies a single write (throws on a dropped key)', async () => {
@@ -167,6 +198,40 @@ describe('InProcessMutex — single-flight (fix #3)', () => {
     expect(await b.withLock('x', async () => 'b-later')).toBe('b-later');
   });
 
+  it('LIVE-HOLDER HEARTBEAT: a body that OUTLASTS ttlMs stays un-stealable by a peer instance (renews the stamp) (fix #1)', async () => {
+    vi.useFakeTimers();
+    try {
+      const store = new InMemoryDurableStore();
+      let clock = 1_000_000;
+      const now = () => clock;
+      const settle = () => Promise.resolve();
+      const ttlMs = 300; // heartbeat fires every ttlMs/3 = 100ms
+      const a = new InProcessMutex({ store, token: 'A', ttlMs, now, settle });
+
+      // A acquires and holds a body that runs far longer than ttlMs.
+      let releaseA!: () => void;
+      const held = new Promise<void>((r) => { releaseA = r; });
+      const aRun = a.withLock('x', async () => { await held; return 'a-done'; });
+
+      // Flush microtasks so A writes + reads back its stamp and starts its heartbeat, then advance the clock 600ms
+      // (2x ttlMs) in lockstep with the fake timer so the heartbeat keeps renewing the stamp with a fresh timestamp.
+      await vi.advanceTimersByTimeAsync(0);
+      for (let i = 0; i < 6; i++) { clock += 100; await vi.advanceTimersByTimeAsync(100); }
+
+      // Peer B (same store) tries to acquire at the current clock. Without renewal the stamp's ts would be 600ms stale
+      // (> ttlMs) and B would steal it; WITH the heartbeat the stamp is fresh so B sees a LIVE peer and fails closed.
+      const b = new InProcessMutex({ store, token: 'B', ttlMs, now, settle });
+      let ranB = false;
+      await expect(b.withLock('x', async () => { ranB = true; return 'b'; })).rejects.toBeInstanceOf(MutexBusyError);
+      expect(ranB).toBe(false);
+
+      releaseA();
+      expect(await aRun).toBe('a-done');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('the MutexBusyError carries a .mutexBusy flag for host handling', async () => {
     const store = new InMemoryDurableStore();
     await store.set('bch2swap:mutexcas:z', `peer@${Date.now()}`);
@@ -209,6 +274,33 @@ describe('BrowserMutex — ported cross-tab CAS (fix #3)', () => {
     fake.setItem('bch2swap:xtlock:fund:offer3', `peerTok@${Date.now() - 300_000}`); // > 240s old
     const mutex = new BrowserMutex({ locks: null, localStorage: fake, token: 'meTok' });
     expect(await mutex.withLock('fund:offer3', async () => 'ok')).toBe('ok');
+  });
+
+  it('FAILS CLOSED when NO cross-tab lock medium is available (no Web Locks + no localStorage) — does NOT run fn (fix #2)', async () => {
+    // A plain-HTTP origin with storage disabled: navigator.locks is undefined AND localStorage is unavailable. The old
+    // fallback ran the irreversible fund/lock body with NO cross-tab lock; it must now throw instead.
+    const mutex = new BrowserMutex({ locks: null, localStorage: undefined });
+    let ran = false;
+    const err = await mutex.withLock('fund:offer4', async () => { ran = true; return 'x'; }).catch((e) => e);
+    expect(err).toBeInstanceOf(MutexUnavailableError);
+    expect((err as MutexUnavailableError).mutexUnavailable).toBe(true);
+    expect(ran).toBe(false);
+  });
+
+  it('FAILS CLOSED when the acquiring setItem throws (storage unusable) — does NOT run fn (fix #2)', async () => {
+    // localStorage is present but every setItem throws (e.g. QuotaExceeded / disabled cookies). The old catch ran fn
+    // with no lock; it must now throw instead.
+    const throwingLs: StorageLike = {
+      getItem() { return null; },              // slot reads empty -> no live peer, proceeds to acquire
+      setItem() { throw new Error('setItem disabled'); },
+      removeItem() { /* no-op */ },
+    };
+    const mutex = new BrowserMutex({ locks: null, localStorage: throwingLs, token: 'meTok' });
+    let ran = false;
+    const err = await mutex.withLock('fund:offer5', async () => { ran = true; return 'x'; }).catch((e) => e);
+    expect(err).toBeInstanceOf(MutexUnavailableError);
+    expect((err as MutexUnavailableError).mutexUnavailable).toBe(true);
+    expect(ran).toBe(false);
   });
 });
 

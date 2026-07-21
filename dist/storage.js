@@ -1,4 +1,13 @@
 // src/storage.ts
+var DurableStoreInconsistentError = class extends Error {
+  constructor(message, commitError, rollbackErrors) {
+    super(message);
+    this.commitError = commitError;
+    this.rollbackErrors = rollbackErrors;
+    this.storeInconsistent = true;
+    this.name = "DurableStoreInconsistentError";
+  }
+};
 var InMemoryDurableStore = class {
   constructor() {
     this.m = /* @__PURE__ */ new Map();
@@ -59,15 +68,26 @@ var LocalStorageDurableStore = class {
         if (this.s.getItem(k) !== v) throw new Error(`LocalStorageDurableStore.commit read-back mismatch for ${k}`);
       }
     } catch (e) {
+      const commitError = e instanceof Error ? e : new Error(String(e));
+      const rollbackErrors = [];
       for (const k of written) {
         const p = prior.get(k) ?? null;
         try {
           if (p === null) this.s.removeItem(k);
           else this.s.setItem(k, p);
-        } catch {
+        } catch (re) {
+          rollbackErrors.push({ key: k, error: re });
         }
       }
-      throw e instanceof Error ? e : new Error(String(e));
+      if (rollbackErrors.length > 0) {
+        const keys = rollbackErrors.map((r) => r.key).join(", ");
+        throw new DurableStoreInconsistentError(
+          `LocalStorageDurableStore.commit rollback FAILED for [${keys}] after a commit error (${commitError.message}) \u2014 the store is in an INCONSISTENT partial-write state and must not be trusted.`,
+          commitError,
+          rollbackErrors
+        );
+      }
+      throw commitError;
     }
   }
 };
@@ -108,6 +128,13 @@ var MutexBusyError = class extends Error {
     this.name = "MutexBusyError";
   }
 };
+var MutexUnavailableError = class extends Error {
+  constructor(name) {
+    super(`No cross-tab lock medium available for "${name}" (Web Locks API absent and localStorage unusable) \u2014 refusing to run the fund/lock body without a cross-tab lock.`);
+    this.mutexUnavailable = true;
+    this.name = "MutexUnavailableError";
+  }
+};
 var _randToken = () => `${Date.now().toString(36)}.${Math.random().toString(36).slice(2, 10)}`;
 var _CAS_PREFIX = "bch2swap:mutexcas:";
 function _parseCas(raw) {
@@ -138,21 +165,40 @@ var InProcessMutex = class {
   // back (a racing peer that overwrote us => throw), run fn, release only if the sentinel is still ours.
   async guarded(name, fn) {
     if (!this.store) return await fn();
+    const store = this.store;
     const key = _CAS_PREFIX + name;
     const now = this.now();
-    const existing = _parseCas(await this.store.get(key));
+    const existing = _parseCas(await store.get(key));
     if (existing && existing.token !== this.token && now - existing.ts < this.ttlMs) {
       throw new MutexBusyError(name, "cross-process");
     }
     const stamp = `${this.token}@${now}`;
-    await this.store.set(key, stamp);
+    await store.set(key, stamp);
     await this.settle();
-    if (await this.store.get(key) !== stamp) throw new MutexBusyError(name, "cross-process");
+    if (await store.get(key) !== stamp) throw new MutexBusyError(name, "cross-process");
+    let hb;
+    try {
+      hb = setInterval(() => {
+        void (async () => {
+          try {
+            if (_parseCas(await store.get(key))?.token === this.token) await store.set(key, `${this.token}@${this.now()}`);
+          } catch {
+          }
+        })();
+      }, Math.max(1, Math.floor(this.ttlMs / 3)));
+    } catch {
+    }
     try {
       return await fn();
     } finally {
+      if (hb) {
+        try {
+          clearInterval(hb);
+        } catch {
+        }
+      }
       try {
-        if (_parseCas(await this.store.get(key))?.token === this.token) await this.store.remove(key);
+        if (_parseCas(await store.get(key))?.token === this.token) await store.remove(key);
       } catch {
       }
     }
@@ -174,7 +220,7 @@ var BrowserMutex = class {
   async withLock(name, fn) {
     if (this.locks) return this.locks.request(name, async () => await fn());
     const s = this.ls;
-    if (!s) return await fn();
+    if (!s) throw new MutexUnavailableError(name);
     const key = `bch2swap:xtlock:${name}`;
     const readTok = () => {
       try {
@@ -191,7 +237,7 @@ var BrowserMutex = class {
     try {
       s.setItem(key, `${this.token}@${Date.now()}`);
     } catch {
-      return await fn();
+      throw new MutexUnavailableError(name);
     }
     await new Promise((res) => {
       setTimeout(res, 30 + Math.floor(Math.random() * 90));
@@ -225,4 +271,4 @@ var BrowserMutex = class {
   }
 };
 
-export { BrowserMutex, InMemoryDurableStore, InMemorySessionStore, InProcessMutex, LocalStorageDurableStore, MutexBusyError, WindowSessionStore };
+export { BrowserMutex, DurableStoreInconsistentError, InMemoryDurableStore, InMemorySessionStore, InProcessMutex, LocalStorageDurableStore, MutexBusyError, MutexUnavailableError, WindowSessionStore };
