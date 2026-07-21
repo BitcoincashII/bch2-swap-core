@@ -3072,7 +3072,35 @@ function avgBlockSecFor(chain) {
 function isValidOutpoint(o) {
   return !!o && typeof o.tx_hash === "string" && /^[0-9a-f]{64}$/.test(o.tx_hash) && Number.isInteger(o.tx_pos) && o.tx_pos >= 0;
 }
-async function reverifyBuriedOutpoint(client, chain, redeemScript, recordedOutpoint, label) {
+function parseHtlcCltv(redeemScript) {
+  const s = redeemScript;
+  const PUSH_AT = 60;
+  if (s.length < PUSH_AT + 3) return null;
+  if (s[0] !== 99 || s[1] !== 168 || s[2] !== 32) return null;
+  if (s[35] !== 136 || s[36] !== 118 || s[37] !== 169 || s[38] !== 20) return null;
+  if (s[59] !== 103) return null;
+  let pos = PUSH_AT;
+  const op = s[pos++];
+  let len;
+  if (op >= 1 && op <= 75) {
+    len = op;
+  } else if (op === 76) {
+    if (pos >= s.length) return null;
+    len = s[pos++];
+  } else if (op === 77) {
+    if (pos + 1 >= s.length) return null;
+    len = s[pos] | s[pos + 1] << 8;
+    pos += 2;
+  } else return null;
+  if (len < 1 || len > 5) return null;
+  if (pos + len >= s.length) return null;
+  if (s[pos + len] !== 177) return null;
+  if (s[pos + len - 1] & 128) return null;
+  let n = 0;
+  for (let i = 0; i < len; i++) n += s[pos + i] * 2 ** (8 * i);
+  return n;
+}
+async function reverifyBuriedOutpoint(client, chain, redeemScript, recordedOutpoint, counterpartyLocktime, label) {
   if (!isValidOutpoint(recordedOutpoint)) {
     throw new GateFailure(`${label}: no valid recorded funding outpoint to re-verify \u2014 rebuild before the irreversible action`, "rebuild");
   }
@@ -3126,11 +3154,21 @@ async function reverifyBuriedOutpoint(client, chain, redeemScript, recordedOutpo
       throw new GateFailure(`${label}: SPV-verified funding depth (${spvConfs}) below required ${vReqConf} \u2014 possible proxy height manipulation; fail closed`, "rearm");
     }
   }
+  const scriptCltv = parseHtlcCltv(redeemScript);
+  if (scriptCltv === null) {
+    throw new GateFailure(`${label}: could not read a CLTV from the counterparty HTLC redeem script \u2014 fail closed`, "rebuild");
+  }
+  if (scriptCltv !== counterpartyLocktime) {
+    throw new GateFailure(
+      `${label}: recorded counterparty locktime (${counterpartyLocktime}) disagrees with the authenticated HTLC redeem script CLTV (${scriptCltv}) \u2014 fail closed`,
+      "rebuild"
+    );
+  }
   return { freshHeight, vReqConf, sameOutpoint, rawFundingTx };
 }
 async function assertRevealSafe(client, p) {
   const { role, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime } = p;
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, "reveal");
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, "reveal");
   const chainNow = await getChainTimeSec(client);
   if (chainNow === null) {
     throw new GateFailure("reveal: could not read chain time to verify the responder refund timelock \u2014 not revealing the secret; retry", "rearm");
@@ -3172,7 +3210,7 @@ async function assertRevealSafe(client, p) {
 }
 async function assertLegBuriedForFunding(client, p) {
   const { theirChain, myChain, myChainIsEvm, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime } = p;
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, "fund");
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, "fund");
   const theirBlockSec = chainConfigs[theirChain]?.avgBlockTimeSec;
   const myBlockSec = chainConfigs[myChain]?.avgBlockTimeSec;
   if (!Number.isFinite(theirBlockSec) || (theirBlockSec ?? 0) <= 0 || !Number.isFinite(myBlockSec) || (myBlockSec ?? 0) <= 0) {
@@ -4347,6 +4385,7 @@ var SwapController = class _SwapController {
     }
     if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
       const r = await this.confirmRefund();
+      if (!r.finalized) await this.rebroadcastRefundIfDropped();
       this.setResumeGate(r.finalized ? "refund-finalized" : "refund-in-flight");
       return;
     }

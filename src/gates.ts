@@ -192,6 +192,43 @@ function isValidOutpoint(o: Outpoint | undefined | null): o is Outpoint {
     && Number.isInteger(o.tx_pos) && o.tx_pos >= 0;
 }
 
+/**
+ * Read the CLTV operand out of an HTLC redeem script (the exact layout htlc-builder.ts createHTLCRedeemScript emits):
+ *   OP_IF OP_SHA256 <32 secretHash> OP_EQUALVERIFY OP_DUP OP_HASH160 <20 recipientPkh>
+ *   OP_ELSE <push locktime> OP_CHECKLOCKTIMEVERIFY OP_DROP OP_DUP OP_HASH160 <20 refundPkh> OP_ENDIF ...
+ * The locktime push always begins at a fixed offset (60) right after OP_ELSE. Returns the pushed number
+ * (a little-endian CScriptNum) or null when the bytes are not this exact HTLC layout, or the operand is not a
+ * plain positive push (the caller fails closed on null). The redeemScript is the value the funds are locked to
+ * on-chain — its hash160 IS the funded P2SH — so its CLTV is the AUTHENTICATED timelock the margin must be
+ * sized from, and it must agree with the caller's counterpartyLocktime record.
+ */
+export function parseHtlcCltv(redeemScript: Uint8Array): number | null {
+  const s = redeemScript;
+  const PUSH_AT = 60; // the locktime push opcode, immediately after the fixed OP_ELSE prefix
+  if (s.length < PUSH_AT + 3) return null;
+  // Fixed prefix bytes of the createHTLCRedeemScript template.
+  if (s[0] !== 0x63 || s[1] !== 0xa8 || s[2] !== 0x20) return null;                     // OP_IF OP_SHA256 push32
+  if (s[35] !== 0x88 || s[36] !== 0x76 || s[37] !== 0xa9 || s[38] !== 0x14) return null; // OP_EQUALVERIFY OP_DUP OP_HASH160 push20
+  if (s[59] !== 0x67) return null;                                                       // OP_ELSE
+  // Read the pushed locktime bytes (a direct push 0x01..0x4b, or OP_PUSHDATA1/2 for completeness).
+  let pos = PUSH_AT;
+  const op = s[pos++];
+  let len: number;
+  if (op >= 0x01 && op <= 0x4b) { len = op; }
+  else if (op === 0x4c) { if (pos >= s.length) return null; len = s[pos++]; }
+  else if (op === 0x4d) { if (pos + 1 >= s.length) return null; len = s[pos] | (s[pos + 1] << 8); pos += 2; }
+  else return null;                                                                      // not a data push (e.g. OP_0)
+  if (len < 1 || len > 5) return null;                                                   // a CLTV CScriptNum is 1..5 bytes
+  if (pos + len >= s.length) return null;                                                // need the trailing opcode too
+  if (s[pos + len] !== 0xb1) return null;                                                // OP_CHECKLOCKTIMEVERIFY must follow the push
+  // Decode the little-endian CScriptNum. A CLTV is always positive, so the top byte's sign bit is clear
+  // (createHTLCRedeemScript appends a 0x00 sign byte when it would otherwise be set); reject a negative encoding.
+  if (s[pos + len - 1] & 0x80) return null;
+  let n = 0;
+  for (let i = 0; i < len; i++) n += s[pos + i] * 2 ** (8 * i);
+  return n;
+}
+
 // ============================================================================
 // Shared UTXO burial re-verify: the R220 exact-outpoint re-check + R139/R175 authentication + R175 SPV depth.
 // Used by BOTH the fund gate (leg X, responder) and the reveal gate (leg Y, initiator). Fail-closed throughout.
@@ -209,6 +246,7 @@ async function reverifyBuriedOutpoint(
   chain: string,
   redeemScript: Uint8Array,
   recordedOutpoint: Outpoint,
+  counterpartyLocktime: number,
   label: string,
 ): Promise<Buried> {
   // R-REVEAL-FAILCLOSE: without a valid recorded funding outpoint we cannot re-verify → rebuild the claim.
@@ -256,6 +294,23 @@ async function reverifyBuriedOutpoint(
       throw new GateFailure(`${label}: SPV-verified funding depth (${spvConfs}) below required ${vReqConf} — possible proxy height manipulation; fail closed`, 'rearm');
     }
   }
+  // FUND-SAFETY (record/authenticated-script consistency): the margin gates below size the counterparty leg's
+  // runway from the caller-supplied counterpartyLocktime, but the on-chain timelock is the CLTV encoded inside the
+  // redeemScript the funds are actually locked to (its hash160 IS the funded P2SH, just re-checked by
+  // verifyAndAuthenticateUtxo above). A malformed / inconsistent durable record whose locktime field disagrees
+  // with that authenticated CLTV would feed a WRONG margin (a record overstating the runway would wave a
+  // near-expiry leg through). Parse the CLTV and require it to equal the passed locktime; fail closed (rebuild the
+  // record from the on-chain leg) on any mismatch or an unparseable script.
+  const scriptCltv = parseHtlcCltv(redeemScript);
+  if (scriptCltv === null) {
+    throw new GateFailure(`${label}: could not read a CLTV from the counterparty HTLC redeem script — fail closed`, 'rebuild');
+  }
+  if (scriptCltv !== counterpartyLocktime) {
+    throw new GateFailure(
+      `${label}: recorded counterparty locktime (${counterpartyLocktime}) disagrees with the authenticated HTLC redeem script CLTV (${scriptCltv}) — fail closed`,
+      'rebuild',
+    );
+  }
   return { freshHeight, vReqConf, sameOutpoint, rawFundingTx };
 }
 
@@ -285,7 +340,7 @@ export interface RevealSafeParams {
 export async function assertRevealSafe(client: GateChainClient, p: RevealSafeParams): Promise<RevealAuthorization> {
   const { role, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime } = p;
 
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, 'reveal');
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, 'reveal');
 
   // fix #9: the reveal is the anti-theft path — anchor to CHAIN time (never Date.now). Fail closed if unreadable.
   const chainNow = await getChainTimeSec(client);
@@ -367,7 +422,7 @@ export interface FundGateParams {
 export async function assertLegBuriedForFunding(client: GateChainClient, p: FundGateParams): Promise<FundProof> {
   const { theirChain, myChain, myChainIsEvm, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime } = p;
 
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, 'fund');
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, 'fund');
 
   // R125: chain block-time configuration must be valid before any wall-clock timelock comparison.
   const theirBlockSec = chainConfigs[theirChain as Chain]?.avgBlockTimeSec;

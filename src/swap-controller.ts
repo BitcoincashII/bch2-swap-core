@@ -1496,6 +1496,10 @@ export class SwapController {
     // reorg-safe depth (reveal nothing new), so they run regardless of the fix #10 auth block.
     if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
       const r = await this.confirmRefund();
+      // If the refund is not yet confirmed it may have DROPPED from the mempool — resubmit the exact durable refund
+      // tx (idempotent) so §9.7 refund-reachability is not one-shot. This branch returns before step 4b, so the
+      // resubmit MUST run here or it is never reached on a resume where a refund is in flight.
+      if (!r.finalized) await this.rebroadcastRefundIfDropped();
       this.setResumeGate(r.finalized ? 'refund-finalized' : 'refund-in-flight');
       return; // refund-first short-circuit: a refund is in flight — do NOT also route to a claim / fund gate
     }

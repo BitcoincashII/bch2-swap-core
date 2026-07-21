@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { sha256 } from '@noble/hashes/sha256';
-import { deriveSwapSecret, deriveMakerIdPub, generateSwapNonce, SWAP_NONCE_BYTES, signMakerIdentity, verifyMakerIdentity, deriveApiAuthPub, signApiRequest, buildApiAuthPreimage } from './seed-secret';
+import { deriveSwapSecret, deriveSwapKss, swapSecretFromKss, deriveMakerIdPub, generateSwapNonce, SWAP_NONCE_BYTES, signMakerIdentity, verifyMakerIdentity, deriveApiAuthPub, signApiRequest, buildApiAuthPreimage } from './seed-secret';
 import { createPublicKey, verify as cryptoVerify } from 'node:crypto';
 
 // ── FROZEN canonical vectors (DECISION A, 2026-07-08) ────────────────────────────────────────────
@@ -55,6 +55,51 @@ describe('seed-secret FROZEN vectors — DECISION A (do not change)', () => {
       expect(n.length).toBe(SWAP_NONCE_BYTES);
       expect(n.every((b) => b === 0)).toBe(false);
     }
+  });
+});
+
+// ── deriveSwapKss + swapSecretFromKss (the cached-key two-step path) ─────────────────────────────
+// deriveSwapSecret = deriveSwapKss(mnemonic) then swapSecretFromKss(kss, nonce). The wallet caches K_ss at
+// unlock and re-derives the preimage with swapSecretFromKss at fund/claim time (mnemonic already wiped), so the
+// two-step path must match the frozen vector exactly and each half must fail closed (null) on bad input.
+describe('deriveSwapKss + swapSecretFromKss (cached-key path)', () => {
+  it('deriveSwapKss returns a 32-byte key for a valid mnemonic, null for an invalid one', () => {
+    const kss = deriveSwapKss(TEST_MNEMONIC);
+    expect(kss).not.toBeNull();
+    expect(kss!.length).toBe(32);
+    expect(deriveSwapKss('not a valid bip39 mnemonic at all')).toBeNull();
+  });
+
+  it('swapSecretFromKss(deriveSwapKss, nonce) reproduces the canonical preimage S (two-step == one-step)', () => {
+    const kss = deriveSwapKss(TEST_MNEMONIC)!;
+    expect(hex(swapSecretFromKss(kss, TEST_NONCE)!)).toBe(VEC.S);
+    // identical to the one-step deriveSwapSecret (the wallet's fund-time path must equal the post-time path)
+    expect(hex(swapSecretFromKss(kss, TEST_NONCE)!)).toBe(hex(deriveSwapSecret(TEST_MNEMONIC, TEST_NONCE)!));
+  });
+
+  it('is deterministic and returns a fresh 32-byte buffer (does not alias / mutate K_ss)', () => {
+    const kss = deriveSwapKss(TEST_MNEMONIC)!;
+    const kssBefore = hex(kss);
+    const s1 = swapSecretFromKss(kss, TEST_NONCE)!;
+    const s2 = swapSecretFromKss(kss, TEST_NONCE)!;
+    expect(hex(s1)).toBe(hex(s2));          // determinism
+    expect(s1.length).toBe(32);
+    expect(s1).not.toBe(kss);               // a separate buffer, not the key itself
+    s1.fill(0);                             // mutating the output must not touch K_ss
+    expect(hex(kss)).toBe(kssBefore);
+  });
+
+  it('null on a wrong-length or non-Uint8Array K_ss (fail-closed)', () => {
+    expect(swapSecretFromKss(new Uint8Array(31), TEST_NONCE)).toBeNull();
+    expect(swapSecretFromKss(new Uint8Array(33), TEST_NONCE)).toBeNull();
+    expect(swapSecretFromKss('deadbeef' as unknown as Uint8Array, TEST_NONCE)).toBeNull();
+  });
+
+  it('null on a wrong-length or non-Uint8Array nonce (fail-closed)', () => {
+    const kss = deriveSwapKss(TEST_MNEMONIC)!;
+    expect(swapSecretFromKss(kss, new Uint8Array(8))).toBeNull();
+    expect(swapSecretFromKss(kss, new Uint8Array(SWAP_NONCE_BYTES + 1))).toBeNull();
+    expect(swapSecretFromKss(kss, '00112233445566778899aabbccddeeff' as unknown as Uint8Array)).toBeNull();
   });
 });
 

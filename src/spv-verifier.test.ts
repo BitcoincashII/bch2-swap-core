@@ -256,6 +256,25 @@ describe('spv-verifier — FAIL-CLOSED MATRIX (synthetic PoW chain)', () => {
     __resetSpvCacheForTests();
     await expect(spvVerifiedTipFresh(mockClient(realByHeight()), 'bch2', FIRST + 5)).rejects.toThrow(/stale|under-report/i);
   });
+
+  // (b2) HEIGHT-branch staleness clamp — the confirmation count is bounded by Math.min(cachedTip, freshTip).
+  // The verified-chain cache is monotonic (it only grows), so after a reorg the freshly-supplied proxy tip can be
+  // LOWER than the cached tip. verifyConfirmations must return the depth measured from the LOWER fresh tip, never
+  // the stale higher cached tip — otherwise a reorged-away cache would overstate confirmations and the reveal gate
+  // could fire too early. This exercises the `Math.min(v.tipHeight, tipHeight)` clamp (spv-verifier.ts:170), the
+  // height-side counterpart to spvVerifiedTipFresh's timestamp bound.
+  it('FAIL-CLOSED (b2): a lower fresh tip after the cache advanced does NOT overstate confirmations (Math.min clamp)', async () => {
+    const client = mockClient(ctx.headersByHeight, { merkleProof: { block_height: ctx.fundHeight, merkle: [], pos: 0 } });
+    // First call advances the monotonic cache all the way to the full tip (cache.tipHeight = ctx.tip).
+    const deep = await verifyConfirmations(client, CHAIN, ctx.fundTxid, ctx.fundHeight, ctx.fundRawHex, ctx.tip);
+    expect(deep).toBe(ctx.tip - ctx.fundHeight + 1); // == count (4), measured from the full tip
+    // Now the proxy reports a LOWER tip (a reorg dropped the top blocks). The cache still holds the higher tip, but
+    // the returned depth must reflect the lower fresh tip: min(cachedTip=ctx.tip, freshTip=fundHeight+1) - height + 1.
+    const lowerTip = ctx.fundHeight + 1;
+    const shallow = await verifyConfirmations(client, CHAIN, ctx.fundTxid, ctx.fundHeight, ctx.fundRawHex, lowerTip);
+    expect(shallow).toBe(lowerTip - ctx.fundHeight + 1); // == 2, clamped to the fresh tip (NOT the cached 4)
+    expect(shallow).toBeLessThan(deep);                  // the clamp really lowered the reported depth
+  });
 });
 
 // ============================================================================

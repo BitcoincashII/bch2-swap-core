@@ -8,20 +8,27 @@
  * The UTXO gates run over a SYNTHETIC easy-difficulty PoW chain (same technique as spv-verifier.test.ts) so
  * the real R175 verifyConfirmations + spvVerifiedTipFresh + provenTxid binding execute fully offline; the EVM
  * gates run over MockEvmProvider (+ leaf providers for the quorum chain-clock reads).
+ *
+ * The funding output pays the P2SH of a REAL HTLC redeem script (htlc-builder createHTLCRedeemScript) so the
+ * new CLTV-consistency check inside reverifyBuriedOutpoint can parse the authenticated CLTV and require it to
+ * equal the caller-supplied counterpartyLocktime. Because the two must now agree, each test funds the exact
+ * locktime it passes: the module fixture uses HEIGHT_LOCKTIME, and tests that need a different locktime build a
+ * dedicated redeem + chain via buildHtlcChain().
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
+import type { Provider } from 'ethers';
 import {
   assertRevealSafe, assertLegBuriedForFunding, assertOrderingSafe,
   assertEvmLegBuriedForFunding, assertEvmRevealSafe,
-  aggregateChainNow, validateEvmTimeLock, GateFailure,
+  aggregateChainNow, validateEvmTimeLock, parseHtlcCltv, GateFailure,
   type FundProof, type RevealAuthorization, type GateChainClient,
 } from './gates';
 import {
   __setSpvConfigForTests, __resetSpvCacheForTests, parseHeaderTimeSec,
 } from './spv-verifier';
 import { blockHashInternal, checkPoW, hash256, type AsertParams } from './spv';
-import { hexToBytes, bytesToHex, hash160 } from './htlc-builder';
+import { hexToBytes, bytesToHex, hash160, createHTLCRedeemScript } from './htlc-builder';
 import {
   MockElectrumClient, buildUtxoRawTx, MockEvmProvider, makeSwap, ZERO_ADDRESS,
   type MockElectrumOpts,
@@ -33,11 +40,12 @@ const toHexRev = (a: Uint8Array) => [...a].reverse().map((b) => b.toString(16).p
 // Synthetic PoW chain builder — the fund block (checkpoint+1) is a single-tx block whose one tx funds a P2SH we
 // control, so its merkle root == that funding txid and an empty-branch Merkle proof verifies. `tipAgeSec` shifts
 // every timestamp uniformly back (constant ASERT target) to exercise spvVerifiedTipFresh's staleness bound.
+// `fundValue` funds a 0-value output to drive the re-authentication non-positive-value branch.
 // ============================================================================
 function buildSynthChain(opts: {
-  anchorHeight: number; count: number; spacing: number; bits: number; fundSpkHex: string; tipAgeSec?: number;
+  anchorHeight: number; count: number; spacing: number; bits: number; fundSpkHex: string; tipAgeSec?: number; fundValue?: number;
 }) {
-  const { anchorHeight, count, spacing, bits, fundSpkHex, tipAgeSec = 0 } = opts;
+  const { anchorHeight, count, spacing, bits, fundSpkHex, tipAgeSec = 0, fundValue = 100000 } = opts;
   const powLimit = 1n << 255n;
   const nowSec = Math.floor(Date.now() / 1000);
   const anchorParentTime = nowSec - spacing * (count + 1) - tipAgeSec; // => tip block time == nowSec - tipAgeSec
@@ -45,7 +53,7 @@ function buildSynthChain(opts: {
   const params: AsertParams = { anchorHeight, anchorBits: bits, anchorParentTime, spacing: BigInt(spacing), powLimit, halfLife: () => 172800n };
 
   const fundHeight = anchorHeight + 1;
-  const fund = buildUtxoRawTx([{ value: 100000, scriptPubKeyHex: fundSpkHex }]);
+  const fund = buildUtxoRawTx([{ value: fundValue, scriptPubKeyHex: fundSpkHex }]);
   const fundRootInternal = hash256(hexToBytes(fund.rawTxHex)); // single-tx block: merkleRoot == txidInternal
   const checkpointHashInternal = hash256(new Uint8Array([0xc9, ...new Array(31).fill(0)]));
   const checkpoint = { height: anchorHeight, hashDisplay: toHexRev(checkpointHashInternal), time: T(anchorHeight) };
@@ -72,17 +80,40 @@ function buildSynthChain(opts: {
     prevHashInternal = blockHashInternal(raw);
   }
   const tip = anchorHeight + count;
-  return { params, checkpoint, headersByHeight, fundHeight, fundTxid: fund.txid, fundRawHex: fund.rawTxHex, tip };
+  return { params, checkpoint, headersByHeight, fundHeight, fundTxid: fund.txid, fundRawHex: fund.rawTxHex, tip, fundValue };
 }
 
-// A fixed arbitrary "redeem script" — only its hash160 (the P2SH the funding output pays) matters to the gates.
-const REDEEM = new Uint8Array(50).fill(0x77);
-const FUND_SPK = 'a914' + bytesToHex(hash160(REDEEM)) + '87';
-// Inject the synthetic PoW fixture UNDER a real UTXO chain so the timelock-margin gates (which read
-// chainConfigs[chain].avgBlockTimeSec — no default) see a valid block time. bc2's requiredConfirmations (3) is
-// <= the fixture depth (4). __setSpvConfigForTests forces asert-mode against the synthetic checkpoint.
-const CHAIN = 'bc2';
+// ============================================================================
+// REAL HTLC redeem scripts + a chain funding their P2SH. The gate authenticates the redeemScript CLTV against
+// the passed counterpartyLocktime, so a test funds the EXACT locktime it passes.
+// ============================================================================
+function htlcRedeem(locktime: number): Uint8Array {
+  // recipient/refund pkhs only need to differ (the R72 degenerate-script guard); the CLTV is what the gate reads.
+  return createHTLCRedeemScript({
+    secretHash: new Uint8Array(32).fill(0xa5),
+    recipientPubkeyHash: new Uint8Array(20).fill(0x11),
+    refundPubkeyHash: new Uint8Array(20).fill(0x22),
+    locktime,
+  });
+}
+function p2shSpk(redeem: Uint8Array): string {
+  return 'a914' + bytesToHex(hash160(redeem)) + '87';
+}
+/** A real HTLC redeem script with the given CLTV + a synthetic PoW chain funding its P2SH. */
+function buildHtlcChain(locktime: number, over: { tipAgeSec?: number; fundValue?: number } = {}) {
+  const redeem = htlcRedeem(locktime);
+  const ctx = buildSynthChain({ anchorHeight: 100000, count: 4, spacing: 600, bits: 0x20010000, fundSpkHex: p2shSpk(redeem), ...over });
+  return { ctx, redeem };
+}
 
+const CHAIN = 'bc2'; // bc2's requiredConfirmations (3) is <= the fixture depth (4); avgBlockTimeSec 600.
+const SYNTH_TIP = 100004; // anchorHeight(100000) + count(4) — deterministic, no build needed.
+// One locktime that clears BOTH the reveal 4h claim margin (÷K 60000s >= 14400) AND the responder fund margin
+// (÷K 60000s >= responderLock 43200 + margin 14400 = 57600).
+const HEIGHT_LOCKTIME = SYNTH_TIP + 200; // 100204
+
+const REDEEM = htlcRedeem(HEIGHT_LOCKTIME);
+const FUND_SPK = p2shSpk(REDEEM);
 const CTX = buildSynthChain({ anchorHeight: 100000, count: 4, spacing: 600, bits: 0x20010000, fundSpkHex: FUND_SPK });
 const TIP_TIME = parseHeaderTimeSec(CTX.headersByHeight[CTX.tip])!; // chain time getChainTimeSec will report
 
@@ -91,7 +122,7 @@ function utxoClient(ctx: Ctx, over: Partial<MockElectrumOpts> = {}): GateChainCl
   return new MockElectrumClient({
     headersByHeight: ctx.headersByHeight,
     merkleProof: { block_height: ctx.fundHeight, merkle: [], pos: 0 },
-    utxos: [{ tx_hash: ctx.fundTxid, tx_pos: 0, value: 100000, height: ctx.fundHeight }],
+    utxos: [{ tx_hash: ctx.fundTxid, tx_pos: 0, value: ctx.fundValue, height: ctx.fundHeight }],
     rawTxByTxid: { [ctx.fundTxid]: ctx.fundRawHex },
     height: ctx.tip,
     tipHeaderHex: ctx.headersByHeight[ctx.tip],
@@ -99,20 +130,42 @@ function utxoClient(ctx: Ctx, over: Partial<MockElectrumOpts> = {}): GateChainCl
   }) as unknown as GateChainClient;
 }
 const outpoint = (ctx: Ctx) => ({ tx_hash: ctx.fundTxid, tx_pos: 0 });
+/** Point the SPV verifier at a specific synthetic chain (dedicated-chain tests override the module CTX config). */
+function useChain(ctx: Ctx): void {
+  __setSpvConfigForTests(CHAIN, ctx.params, ctx.checkpoint);
+  __resetSpvCacheForTests();
+}
+
+// ============================================================================
+// (0) parseHtlcCltv — the new authenticated-CLTV reader powering the record/script consistency gate.
+// ============================================================================
+describe('parseHtlcCltv (authenticated HTLC CLTV reader)', () => {
+  it('reads a block-height CLTV out of a real HTLC redeem script', () => {
+    expect(parseHtlcCltv(htlcRedeem(100204))).toBe(100204);
+    expect(parseHtlcCltv(htlcRedeem(90000))).toBe(90000);
+    expect(parseHtlcCltv(htlcRedeem(499_999_999))).toBe(499_999_999);
+  });
+  it('reads a unix-timestamp CLTV (>= 1.5e9) out of a real HTLC redeem script', () => {
+    expect(parseHtlcCltv(htlcRedeem(2_100_000_000))).toBe(2_100_000_000);
+    expect(parseHtlcCltv(htlcRedeem(1_800_000_000))).toBe(1_800_000_000);
+  });
+  it('returns null for bytes that are not the HTLC layout (fail closed at the caller)', () => {
+    expect(parseHtlcCltv(new Uint8Array(50).fill(0x77))).toBeNull(); // arbitrary junk
+    expect(parseHtlcCltv(new Uint8Array(0))).toBeNull();             // empty
+    expect(parseHtlcCltv(htlcRedeem(100204).slice(0, 40))).toBeNull(); // truncated before the CLTV push
+  });
+});
 
 // ============================================================================
 // (1) REVEAL gate — assertRevealSafe -> RevealAuthorization
 // ============================================================================
 describe('assertRevealSafe (initiator secret-reveal gate)', () => {
-  beforeEach(() => {
-    __setSpvConfigForTests(CHAIN, CTX.params, CTX.checkpoint);
-    __resetSpvCacheForTests();
-  });
+  beforeEach(() => { useChain(CTX); });
 
   it('HAPPY (height-CLTV): deep+fresh+margin-ok mints an OUTPOINT-BOUND RevealAuthorization', async () => {
     const auth = await assertRevealSafe(utxoClient(CTX), {
       role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: outpoint(CTX), counterpartyLocktime: CTX.tip + 100, // 100 blocks => ÷K 30000s >= 4h
+      recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME, // 200 blocks => ÷K 60000s >= 4h
     });
     expect(auth.leg).toBe('Y');
     expect(auth.for).toBe('reveal');
@@ -123,9 +176,11 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
   });
 
   it('HAPPY (timestamp-CLTV): a unix-timestamp CLTV anchored to chain time mints RevealAuthorization', async () => {
-    const auth = await assertRevealSafe(utxoClient(CTX), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: outpoint(CTX), counterpartyLocktime: TIP_TIME + 20000, // 20000s > 4h margin
+    const { ctx, redeem } = buildHtlcChain(2_100_000_000); // ~year 2036, far beyond the 4h margin vs chain-time now
+    useChain(ctx);
+    const auth = await assertRevealSafe(utxoClient(ctx), {
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      recordedOutpoint: outpoint(ctx), counterpartyLocktime: 2_100_000_000,
     });
     expect(auth.marginBasis).toBe('timestamp-cltv');
     expect(auth.for).toBe('reveal');
@@ -135,14 +190,14 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
     const client = utxoClient(CTX, { utxos: [] });
     await expect(assertRevealSafe(client, {
       role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: outpoint(CTX), counterpartyLocktime: CTX.tip + 100,
+      recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rebuild' });
   });
 
   it('FAIL-CLOSED: a spent-less / malformed recorded outpoint throws (rebuild)', async () => {
     await expect(assertRevealSafe(utxoClient(CTX), {
       role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: { tx_hash: 'not-hex', tx_pos: 0 }, counterpartyLocktime: CTX.tip + 100,
+      recordedOutpoint: { tx_hash: 'not-hex', tx_pos: 0 }, counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ disposition: 'rebuild' });
   });
 
@@ -150,31 +205,35 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
     const client = utxoClient(CTX, { height: CTX.tip + 10 }); // filter passes; SPV cannot reach the inflated tip
     await expect(assertRevealSafe(client, {
       role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: outpoint(CTX), counterpartyLocktime: CTX.tip + 100,
+      recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
   });
 
   it('FAIL-CLOSED: a real-but-STALE tip (height-CLTV under-report guard) throws (rearm)', async () => {
-    const stale = buildSynthChain({ anchorHeight: 100000, count: 4, spacing: 600, bits: 0x20010000, fundSpkHex: FUND_SPK, tipAgeSec: 3 * 3600 });
-    __setSpvConfigForTests(CHAIN, stale.params, stale.checkpoint);
-    __resetSpvCacheForTests();
-    await expect(assertRevealSafe(utxoClient(stale), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: outpoint(stale), counterpartyLocktime: stale.tip + 100,
+    const { ctx, redeem } = buildHtlcChain(HEIGHT_LOCKTIME, { tipAgeSec: 3 * 3600 });
+    useChain(ctx);
+    await expect(assertRevealSafe(utxoClient(ctx), {
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      recordedOutpoint: outpoint(ctx), counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
   });
 
   it('FAIL-CLOSED: margin < 4h on the height-CLTV branch throws (abort), mints nothing', async () => {
-    await expect(assertRevealSafe(utxoClient(CTX), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: outpoint(CTX), counterpartyLocktime: CTX.tip + 40, // ÷K 12000s < 14400s
+    const { ctx, redeem } = buildHtlcChain(SYNTH_TIP + 40); // ÷K 12000s < 14400s
+    useChain(ctx);
+    await expect(assertRevealSafe(utxoClient(ctx), {
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      recordedOutpoint: outpoint(ctx), counterpartyLocktime: SYNTH_TIP + 40,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'abort' });
   });
 
   it('FAIL-CLOSED: margin < 4h on the timestamp-CLTV branch throws (abort)', async () => {
-    await expect(assertRevealSafe(utxoClient(CTX), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: outpoint(CTX), counterpartyLocktime: TIP_TIME + 1000, // 1000s < 14400s
+    const tsLock = Math.floor(Date.now() / 1000) + 1000; // 1000s < 14400s remaining vs chain-time now
+    const { ctx, redeem } = buildHtlcChain(tsLock);
+    useChain(ctx);
+    await expect(assertRevealSafe(utxoClient(ctx), {
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      recordedOutpoint: outpoint(ctx), counterpartyLocktime: tsLock,
     })).rejects.toMatchObject({ disposition: 'abort' });
   });
 
@@ -182,33 +241,97 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
     const client = utxoClient(CTX, { tipHeaderHex: '' });
     await expect(assertRevealSafe(client, {
       role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: outpoint(CTX), counterpartyLocktime: CTX.tip + 100,
+      recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ disposition: 'rearm' });
   });
 
   it('RESPONDER (already-public secret) is NOT margin-blocked even with a near-expiry counterparty leg', async () => {
-    const auth = await assertRevealSafe(utxoClient(CTX), {
-      role: 'responder', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: outpoint(CTX), counterpartyLocktime: CTX.tip + 1, // would be far too tight for an initiator
+    const { ctx, redeem } = buildHtlcChain(SYNTH_TIP + 1); // would be far too tight for an initiator
+    useChain(ctx);
+    const auth = await assertRevealSafe(utxoClient(ctx), {
+      role: 'responder', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      recordedOutpoint: outpoint(ctx), counterpartyLocktime: SYNTH_TIP + 1,
     });
     expect(auth.marginBasis).toBe('none');
     expect(auth.role).toBe('responder');
   });
+
+  it('FAIL-CLOSED (hardening): a counterpartyLocktime that disagrees with the authenticated redeemScript CLTV throws (rebuild), mints nothing', async () => {
+    // The funding output pays p2sh(REDEEM), whose encoded CLTV is HEIGHT_LOCKTIME. A durable record whose locktime
+    // field says something else would feed a wrong margin — the gate parses the authenticated CLTV and fails closed.
+    await expect(assertRevealSafe(utxoClient(CTX), {
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
+      recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME + 1, // disagrees with the script CLTV
+    })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rebuild' });
+  });
 });
 
 // ============================================================================
-// (2) FUND-Y gate — assertLegBuriedForFunding -> FundProof
+// (2) reverifyBuriedOutpoint fail-closed branches — shared by BOTH the reveal + fund gates (driven here via the
+//     reveal gate). Every branch throws + mints nothing on any read failure / shallow / re-auth doubt.
+// ============================================================================
+describe('reverifyBuriedOutpoint fail-closed branches (shared burial re-verify)', () => {
+  beforeEach(() => { useChain(CTX); });
+
+  const reveal = (client: GateChainClient, over: Partial<Parameters<typeof assertRevealSafe>[1]> = {}) =>
+    assertRevealSafe(client, {
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
+      recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME, ...over,
+    });
+
+  it('re-authentication throw: getTx returns bytes whose double-sha256 != the recorded txid -> rebuild', async () => {
+    // A rawtx for a DIFFERENT output (value 99999) — its true txid != CTX.fundTxid, so parseAuthenticatedOutput's
+    // txid binding rejects it. The funding UTXO is still "found" by the filter; the failure is at re-authentication.
+    const lyingRawTx = buildUtxoRawTx([{ value: 99999, scriptPubKeyHex: FUND_SPK }]).rawTxHex;
+    await expect(reveal(utxoClient(CTX, { lyingRawTx })))
+      .rejects.toMatchObject({ name: 'GateFailure', disposition: 'rebuild' });
+  });
+
+  it('present-but-shallow funding: UTXO returned but depth < requiredConfirmations -> rebuild', async () => {
+    // The recorded outpoint IS present, but at the tip (depth 1) — below bc2's requiredConfirmations (3). The
+    // depth filter drops it, so the exact recorded outpoint is not found at the required depth: fail closed.
+    const shallow = [{ tx_hash: CTX.fundTxid, tx_pos: 0, value: 100000, height: CTX.tip }];
+    await expect(reveal(utxoClient(CTX, { utxos: shallow })))
+      .rejects.toMatchObject({ name: 'GateFailure', disposition: 'rebuild' });
+  });
+
+  it('transient read: the tip height is unavailable (getBlockHeight 0) -> rearm', async () => {
+    await expect(reveal(utxoClient(CTX, { height: 0 })))
+      .rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
+  });
+
+  it('transient read: getUTXOs errors -> rearm', async () => {
+    const mock = new MockElectrumClient({ headersByHeight: CTX.headersByHeight, height: CTX.tip, tipHeaderHex: CTX.headersByHeight[CTX.tip] });
+    mock.getUTXOs = async () => { throw new Error('electrum getUTXOs unreachable'); };
+    await expect(reveal(mock as unknown as GateChainClient))
+      .rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
+  });
+
+  it('transient read: getTx errors (cannot fetch the funding tx to authenticate) -> rearm', async () => {
+    await expect(reveal(utxoClient(CTX, { getTxThrows: true })))
+      .rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
+  });
+
+  it('re-authentication non-positive value: the funding output authenticates to value 0 -> rebuild', async () => {
+    const { ctx, redeem } = buildHtlcChain(HEIGHT_LOCKTIME, { fundValue: 0 }); // funds a 0-value output
+    useChain(ctx);
+    await expect(assertRevealSafe(utxoClient(ctx), {
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      recordedOutpoint: outpoint(ctx), counterpartyLocktime: HEIGHT_LOCKTIME,
+    })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rebuild' });
+  });
+});
+
+// ============================================================================
+// (3) FUND-Y gate — assertLegBuriedForFunding -> FundProof
 // ============================================================================
 describe('assertLegBuriedForFunding (responder fund-Y gate)', () => {
-  beforeEach(() => {
-    __setSpvConfigForTests(CHAIN, CTX.params, CTX.checkpoint);
-    __resetSpvCacheForTests();
-  });
+  beforeEach(() => { useChain(CTX); });
 
   it('HAPPY: leg-X buried + responder margin ok mints an OUTPOINT-BOUND FundProof', async () => {
     const proof = await assertLegBuriedForFunding(utxoClient(CTX), {
       theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: outpoint(CTX), counterpartyLocktime: CTX.tip + 200, // ÷K 60000s >= 43200+14400
+      recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME, // ÷K 60000s >= 43200+14400
     });
     expect(proof.leg).toBe('X');
     expect(proof.for).toBe('fundY');
@@ -217,30 +340,67 @@ describe('assertLegBuriedForFunding (responder fund-Y gate)', () => {
   });
 
   it('FAIL-CLOSED: responder margin too tight (initiator leg expires too soon) throws (abort)', async () => {
-    await expect(assertLegBuriedForFunding(utxoClient(CTX), {
-      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: outpoint(CTX), counterpartyLocktime: CTX.tip + 100, // ÷K 30000s < 57600s
+    const { ctx, redeem } = buildHtlcChain(SYNTH_TIP + 100); // ÷K 30000s < 57600s
+    useChain(ctx);
+    await expect(assertLegBuriedForFunding(utxoClient(ctx), {
+      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: redeem,
+      recordedOutpoint: outpoint(ctx), counterpartyLocktime: SYNTH_TIP + 100,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'abort' });
   });
 
   it('FAIL-CLOSED: a vanished funding outpoint throws (rebuild) and mints nothing', async () => {
     await expect(assertLegBuriedForFunding(utxoClient(CTX, { utxos: [] }), {
       theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: outpoint(CTX), counterpartyLocktime: CTX.tip + 200,
+      recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ disposition: 'rebuild' });
   });
 
   it('FAIL-CLOSED (fix #4): a real-but-STALE tip fails the fund margin (rearm) — was silently minting before', async () => {
-    // A locktime that PASSES the happy margin against the RAW tip (tip+200 => ÷K 60000s >= 57600s), so the ONLY
-    // guard that can catch it is the spvVerifiedTipFresh under-report bound the reveal gate had but the fund gate
-    // had dropped. Before fix #4 this MINTED a FundProof against a near-expiry counterparty leg.
-    const stale = buildSynthChain({ anchorHeight: 100000, count: 4, spacing: 600, bits: 0x20010000, fundSpkHex: FUND_SPK, tipAgeSec: 3 * 3600 });
-    __setSpvConfigForTests(CHAIN, stale.params, stale.checkpoint);
-    __resetSpvCacheForTests();
-    await expect(assertLegBuriedForFunding(utxoClient(stale), {
-      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: REDEEM,
-      recordedOutpoint: outpoint(stale), counterpartyLocktime: stale.tip + 200,
+    // A locktime that PASSES the happy margin against the RAW tip (÷K 60000s >= 57600s), so the ONLY guard that can
+    // catch it is the spvVerifiedTipFresh under-report bound the reveal gate had but the fund gate had dropped.
+    const { ctx, redeem } = buildHtlcChain(HEIGHT_LOCKTIME, { tipAgeSec: 3 * 3600 });
+    useChain(ctx);
+    await expect(assertLegBuriedForFunding(utxoClient(ctx), {
+      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: redeem,
+      recordedOutpoint: outpoint(ctx), counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
+  });
+
+  it('FAIL-CLOSED: an already-expired counterparty locktime (remaining <= 0) throws (abort)', async () => {
+    const { ctx, redeem } = buildHtlcChain(90000); // well below the tip (100004) => already refundable
+    useChain(ctx);
+    await expect(assertLegBuriedForFunding(utxoClient(ctx), {
+      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: redeem,
+      recordedOutpoint: outpoint(ctx), counterpartyLocktime: 90000,
+    })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'abort' });
+  });
+
+  it('FAIL-CLOSED: a suspiciously-far counterparty locktime (grief lock, remaining > maxLockBlocks*3) throws (abort)', async () => {
+    const { ctx, redeem } = buildHtlcChain(110000); // remaining ~9996 > bc2 maxLockBlocks(2016)*3 = 6048
+    useChain(ctx);
+    await expect(assertLegBuriedForFunding(utxoClient(ctx), {
+      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: redeem,
+      recordedOutpoint: outpoint(ctx), counterpartyLocktime: 110000,
+    })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'abort' });
+  });
+
+  it('EVM-responder margin branch (myChainIsEvm=true uses RESPONDER_LOCK_SEC): a leg too tight for the 12h wall-clock lock throws (abort)', async () => {
+    // remaining = 100 blocks => ÷K 30000s. The EVM branch sizes the responder lock at RESPONDER_LOCK_SEC (43200s),
+    // so the threshold is 43200+14400 = 57600 > 30000 -> abort. Had it wrongly used LOCKTIME_BLOCKS.responder *
+    // poly's 2s/block (= 144s, threshold 14544 < 30000) it would have MINTED — so aborting proves the EVM branch ran.
+    const { ctx, redeem } = buildHtlcChain(SYNTH_TIP + 100);
+    useChain(ctx);
+    await expect(assertLegBuriedForFunding(utxoClient(ctx), {
+      theirChain: CHAIN, myChain: 'poly', myChainIsEvm: true, counterpartyRedeemScript: redeem,
+      recordedOutpoint: outpoint(ctx), counterpartyLocktime: SYNTH_TIP + 100,
+    })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'abort' });
+  });
+
+  it('FAIL-CLOSED (hardening): a counterpartyLocktime that disagrees with the authenticated redeemScript CLTV throws (rebuild)', async () => {
+    await expect(assertLegBuriedForFunding(utxoClient(CTX), {
+      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: REDEEM,
+      recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME + 1, // disagrees with the script CLTV
+    })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rebuild' });
   });
 
   it('FAIL-CLOSED (fix #1): a single-leaf EVM provider is refused (rearm) — quorum>=2 required', async () => {
@@ -253,7 +413,7 @@ describe('assertLegBuriedForFunding (responder fund-Y gate)', () => {
 });
 
 // ============================================================================
-// (3) ORDERING gate — assertOrderingSafe (pure initiator precondition assertion)
+// (4) ORDERING gate — assertOrderingSafe (pure initiator precondition assertion)
 // ============================================================================
 describe('assertOrderingSafe (initiator cross-domain ordering)', () => {
   const heightClient = (h: number): GateChainClient =>
@@ -280,6 +440,13 @@ describe('assertOrderingSafe (initiator cross-domain ordering)', () => {
     })).rejects.toMatchObject({ disposition: 'abort' });
   });
 
+  it('FAIL-CLOSED: own-chain height unavailable (getBlockHeight 0) throws (abort)', async () => {
+    await expect(assertOrderingSafe(heightClient(0), {
+      theirChain: 'bch2', myChain: 'btc', remainingBlocks: 60, // passes the claim-window gate
+      myLocktime: 2_000_300, myFundingTxid: 'ab'.repeat(32),
+    })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'abort' });
+  });
+
   it('R277 FAIL-CLOSED: a FUNDED own leg with an unrecoverable locktime throws (abort)', async () => {
     await expect(assertOrderingSafe(heightClient(2_000_000), {
       theirChain: 'bch2', myChain: 'btc', remainingBlocks: 60,
@@ -296,7 +463,7 @@ describe('assertOrderingSafe (initiator cross-domain ordering)', () => {
 });
 
 // ============================================================================
-// (4) EVM fund gate — assertEvmLegBuriedForFunding -> FundProof
+// (5) EVM fund gate — assertEvmLegBuriedForFunding -> FundProof
 // ============================================================================
 const HTLC_ADDR = '0x405A6dD5b51a00C5F789C9D215e4986ba1Dc9963';
 const SWAP_ID = '0x' + 'ab'.repeat(32);
@@ -351,7 +518,7 @@ describe('assertEvmLegBuriedForFunding (responder EVM fund gate)', () => {
 });
 
 // ============================================================================
-// (5) EVM reveal gate — assertEvmRevealSafe -> RevealAuthorization
+// (6) EVM reveal gate — assertEvmRevealSafe -> RevealAuthorization
 // ============================================================================
 function evmRevealProvider(over: {
   swap?: ReturnType<typeof makeSwap> | null;
@@ -380,9 +547,33 @@ describe('assertEvmRevealSafe (initiator EVM secret-reveal gate)', () => {
     expect(auth.capturedAtChainSec).toBe(CHAIN_NOW);
   });
 
+  it('FAIL-CLOSED (fix #7): a single-leaf provider is refused (rearm), reveals nothing — quorum>=2 required', async () => {
+    const singleLeaf = new MockEvmProvider({ block: { timestamp: CHAIN_NOW }, blockNumber: 5000 }); // no __leafProviders
+    await expect(assertEvmRevealSafe(singleLeaf as unknown as Provider, base))
+      .rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
+  });
+
   it('FAIL-CLOSED: gate#2 depth/binding fail (already claimed) throws (rearm), mints nothing', async () => {
     const claimed = makeSwap({ hashLock: HASHLOCK, recipient: RECIPIENT, token: ZERO_ADDRESS, amount: 1_000_000_000_000_000_000n, timeLock: 1_900_000_000n, claimed: true });
     await expect(assertEvmRevealSafe(evmRevealProvider({ swap: claimed }), base))
+      .rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
+  });
+
+  it('FAIL-CLOSED: a recipient binding mismatch (same-nonce replacement pays a different address) throws (rearm)', async () => {
+    const badRecip = makeSwap({ hashLock: HASHLOCK, recipient: '0x' + '33'.repeat(20), token: ZERO_ADDRESS, amount: 1_000_000_000_000_000_000n, timeLock: 1_900_000_000n });
+    await expect(assertEvmRevealSafe(evmRevealProvider({ swap: badRecip }), base))
+      .rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
+  });
+
+  it('FAIL-CLOSED: a token binding mismatch (lock funded with a different token) throws (rearm)', async () => {
+    const badToken = makeSwap({ hashLock: HASHLOCK, recipient: RECIPIENT, token: '0x' + '44'.repeat(20), amount: 1_000_000_000_000_000_000n, timeLock: 1_900_000_000n });
+    await expect(assertEvmRevealSafe(evmRevealProvider({ swap: badToken }), base))
+      .rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
+  });
+
+  it('FAIL-CLOSED: a minAmount binding mismatch (lock under-funded) throws (rearm)', async () => {
+    const underFunded = makeSwap({ hashLock: HASHLOCK, recipient: RECIPIENT, token: ZERO_ADDRESS, amount: 999_999_999_999_999_999n, timeLock: 1_900_000_000n }); // < minAmount
+    await expect(assertEvmRevealSafe(evmRevealProvider({ swap: underFunded }), base))
       .rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
   });
 
@@ -399,7 +590,7 @@ describe('assertEvmRevealSafe (initiator EVM secret-reveal gate)', () => {
 });
 
 // ============================================================================
-// (6) Pure EVM-margin helpers
+// (7) Pure EVM-margin helpers
 // ============================================================================
 describe('aggregateChainNow / validateEvmTimeLock', () => {
   it('aggregateChainNow requires EVERY leaf and takes the MAX (defeats a behind-reporting leaf)', () => {
@@ -415,7 +606,7 @@ describe('aggregateChainNow / validateEvmTimeLock', () => {
 });
 
 // ============================================================================
-// (7) Compile-time NON-INTERCHANGEABILITY (fix #1). Validated by `tsc --noEmit`, not the runtime (esbuild strips
+// (8) Compile-time NON-INTERCHANGEABILITY (fix #1). Validated by `tsc --noEmit`, not the runtime (esbuild strips
 // types): if the brands were interchangeable the @ts-expect-error would be UNUSED and tsc would fail.
 // ============================================================================
 function _brandCompileChecks(fp: FundProof, ra: RevealAuthorization): void {

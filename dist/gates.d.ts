@@ -86,6 +86,17 @@ declare function aggregateChainNow(leafTimestamps: Array<number | null>, leafCou
  * caller fails closed. Accepts bigint (ethers getSwap) or number.
  */
 declare function validateEvmTimeLock(raw: number | bigint | null | undefined): number | null;
+/**
+ * Read the CLTV operand out of an HTLC redeem script (the exact layout htlc-builder.ts createHTLCRedeemScript emits):
+ *   OP_IF OP_SHA256 <32 secretHash> OP_EQUALVERIFY OP_DUP OP_HASH160 <20 recipientPkh>
+ *   OP_ELSE <push locktime> OP_CHECKLOCKTIMEVERIFY OP_DROP OP_DUP OP_HASH160 <20 refundPkh> OP_ENDIF ...
+ * The locktime push always begins at a fixed offset (60) right after OP_ELSE. Returns the pushed number
+ * (a little-endian CScriptNum) or null when the bytes are not this exact HTLC layout, or the operand is not a
+ * plain positive push (the caller fails closed on null). The redeemScript is the value the funds are locked to
+ * on-chain — its hash160 IS the funded P2SH — so its CLTV is the AUTHENTICATED timelock the margin must be
+ * sized from, and it must agree with the caller's counterpartyLocktime record.
+ */
+declare function parseHtlcCltv(redeemScript: Uint8Array): number | null;
 interface RevealSafeParams {
     /** Only the INITIATOR reveals the secret; a responder claims an ALREADY-PUBLIC secret and is NOT margin-blocked. */
     role: 'initiator' | 'responder';
@@ -188,4 +199,4 @@ interface EvmRevealGateParams {
  */
 declare function assertEvmRevealSafe(provider: Provider, p: EvmRevealGateParams): Promise<RevealAuthorization>;
 
-export { type EvmFundGateParams, type EvmRevealGateParams, type FundGateParams, type FundProof, type GateChainClient, type GateDisposition, GateFailure, type GateUtxo, type MarginBasis, type OrderingParams, type Outpoint, type ProvenLegAnchor, type RevealAuthorization, type RevealSafeParams, aggregateChainNow, assertEvmLegBuriedForFunding, assertEvmRevealSafe, assertLegBuriedForFunding, assertOrderingSafe, assertRevealSafe, validateEvmTimeLock };
+export { type EvmFundGateParams, type EvmRevealGateParams, type FundGateParams, type FundProof, type GateChainClient, type GateDisposition, GateFailure, type GateUtxo, type MarginBasis, type OrderingParams, type Outpoint, type ProvenLegAnchor, type RevealAuthorization, type RevealSafeParams, aggregateChainNow, assertEvmLegBuriedForFunding, assertEvmRevealSafe, assertLegBuriedForFunding, assertOrderingSafe, assertRevealSafe, parseHtlcCltv, validateEvmTimeLock };

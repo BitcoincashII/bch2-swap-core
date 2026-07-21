@@ -1,5 +1,29 @@
 # Changelog
 
+## 3.0.1
+
+### Fixed (fund-safety audit)
+A full test-completeness audit of the v3 SwapController surface found and closed 8 confirmed fund-safety
+bugs (the SwapController was new in v3.0.0 with no adopters):
+- **trySettleIfBothLegsSpent** no longer wipes non-recoverable recovery material on a bare 0-conf read — it
+  now requires an SPV-verified reorg-safe depth on our own leg's spend, and respects the resume auth block.
+- **fundLegX** now enforces the re-derivable-secret gate (previously only `prepare()` did), so a swap whose
+  secret a crash would strand cannot be funded.
+- The UTXO claim path no longer poisons its durable sentinel on a rejected broadcast (definitive-vs-ambiguous
+  classifier that errs safe); **lockEvm** adopts a prior lock instead of double-locking; **refundEvm** no
+  longer wedges on a transient pre-broadcast RPC timeout; **InProcessMutex** renews its lock (no steal);
+  **BrowserMutex** fails closed; **LocalStorageDurableStore** surfaces an inconsistent-state error.
+
+### Hardened
+- The timelock margin now cross-checks the caller-supplied locktime against the CLTV parsed from the
+  authenticated redeem script (a malformed record can't feed a wrong anti-theft margin).
+- Resume now resubmits a dropped refund (§9.7 refund-reachability is no longer one-shot).
+
+### Tests
+- 582 tests (up from 424): the full legacy-chain funding path, the EVM lock/claim/refund/pivot branches, the
+  finalizer + resume branches, the gate fail-closed matrix, and a new chain-config param-pinning suite.
+
+
 ## 3.0.0
 
 ### Breaking

@@ -948,6 +948,19 @@ describe('claim/refund nLockTime + nSequence + fee-vs-output invariants', () => 
     await expect(buildHTLCClaimTx(utxo, redeemScript, new Uint8Array(31), privKey, pubKey, destSpk, 'bch2'))
       .rejects.toThrow(/secret must be exactly 32 bytes/);
   });
+
+  // resolveClampedFeeRate passes NaN/Infinity through UNCLAMPED by design, so the builder's own finite/positive
+  // feePerByte guard is what rejects them (R47-HTLC-001). A deadline-scaled rate that computes to Infinity/NaN must
+  // fail closed rather than produce a garbage-fee tx. (A too-HIGH but finite rate is clamped, not rejected — covered
+  // by the affordability-clamp tests above.)
+  it('CLAIM + REFUND reject a non-finite feeRate (Infinity / NaN) — fail closed, never a garbage-fee tx', async () => {
+    for (const bad of [Infinity, NaN]) {
+      await expect(buildHTLCClaimTx(utxo, redeemScript, SECRET, privKey, pubKey, destSpk, 'bch2', bad))
+        .rejects.toThrow(/feePerByte must be a finite positive number/);
+      await expect(buildHTLCRefundTx(refundUtxo, refundRedeem, LOCKTIME, privKey, pubKey, destSpk, 'bch2', bad))
+        .rejects.toThrow(/feePerByte must be a finite positive number/);
+    }
+  });
 });
 
 // ============================================================================
@@ -994,6 +1007,29 @@ describe('extractSecretFromClaimTx round-trip + hash binding', () => {
   it('returns null (not a throw) for a malformed expectedSecretHash hex — honors the null-on-failure contract', async () => {
     const { rawTx } = await buildHTLCClaimTx(utxo, redeemScript, SECRET, privKey, pubKey, destSpk, 'bch2');
     expect(extractSecretFromClaimTx(rawTx, 'zz')).toBeNull(); // odd/non-hex → rejected, not thrown
+  });
+
+  // R53-HTLC-004: the per-input scan. A counterparty may PREPEND a non-HTLC input (e.g. a consolidation input),
+  // placing the real HTLC-claim input at position >= 1. Checking only input[0] would return null and the watcher
+  // would never learn the secret (and later refund it, keeping both legs). Splice a plausible P2PKH-shaped input
+  // (a 72-byte sig push + a 33-byte pubkey push, then it ends) in FRONT of a real 1-input claim tx and bump the
+  // input count to 2: the scan must skip input 0 (sig+pubkey parse, then no secret → continue) and recover the
+  // secret from input 1.
+  it('recovers the secret when the HTLC input is NOT first (skips a prepended non-HTLC input) — R53-HTLC-004', async () => {
+    const { rawTx } = await buildHTLCClaimTx(utxo, redeemScript, SECRET, privKey, pubKey, destSpk, 'bch2');
+    // A 107-byte P2PKH-style scriptSig: push72(sig-shaped) || push33(pubkey-shaped). No 32-byte secret follows,
+    // so the parser reaches the secret slot at end-of-scriptSig and `continue`s to the next input.
+    const dummyScriptSig = '48' + 'aa'.repeat(72) + '21' + '02' + 'bb'.repeat(32); // 214 hex = 107 bytes
+    const dummyInput = '11'.repeat(32) + '00000000' + '6b' + dummyScriptSig + 'ffffffff'; // txid|vout|len(0x6b=107)|ss|nSeq
+    // rawTx = version(8 hex) | inputCount '01' (chars 8-9) | input... ; bump the count to 02 and inject the dummy first.
+    const twoInputTx = rawTx.slice(0, 8) + '02' + dummyInput + rawTx.slice(10);
+    const got = extractSecretFromClaimTx(twoInputTx);
+    expect(got).not.toBeNull();
+    expect(bytesToHex(got!)).toBe(bytesToHex(SECRET));
+    // hash-binding still holds when the match is found at position 1 (not just position 0)
+    const bound = extractSecretFromClaimTx(twoInputTx, bytesToHex(SECRET_HASH));
+    expect(bound).not.toBeNull();
+    expect(bytesToHex(bound!)).toBe(bytesToHex(SECRET));
   });
 });
 
