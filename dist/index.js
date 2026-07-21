@@ -4602,6 +4602,11 @@ var SwapController = class _SwapController {
         this.setResumeGate("settled");
         return;
       }
+      if (!!chainConfigs[this.theirChain]?.isEvm) {
+        const ce = await this.confirmClaimEvm();
+        this.setResumeGate(ce.finalized ? "claim-finalized" : "claim-in-flight");
+        return;
+      }
       const c = await this.confirmClaim();
       this.setResumeGate(c.finalized ? "claim-finalized" : "claim-in-flight");
       return;
@@ -5309,8 +5314,16 @@ var SwapController = class _SwapController {
       throw new Error("revealAndClaimEvm: the supplied authorization is not an initiator leg-Y reveal authorization \u2014 refusing to reveal the secret (fix #3)");
     }
     if (await this.deps.durable.get(claimBroadcastKey(rec.id))) {
-      this.status("revealAndClaimEvm:adopted");
-      return { txHash: rec.myClaimTxid ?? "" };
+      const legAdopt = this.counterpartyEvmLeg("revealAndClaimEvm");
+      if (await this.evmSwapIsClaimed(this.evmProvider(this.theirChain), legAdopt.htlcAddr, legAdopt.swapId)) {
+        this.status("revealAndClaimEvm:adopted");
+        return { txHash: rec.myClaimTxid ?? legAdopt.swapId };
+      }
+      try {
+        await this.deps.durable.remove(claimBroadcastKey(rec.id));
+      } catch {
+      }
+      this.status("revealAndClaimEvm:re-driving-orphaned-claim");
     }
     this.assertIrreversibleAllowed("revealAndClaimEvm");
     if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
@@ -5432,6 +5445,96 @@ var SwapController = class _SwapController {
     } catch {
       return false;
     }
+  }
+  /**
+   * R-EVMCLAIM-REORG-001: the claim-side analogue of evmSwapIsRefunded — the on-chain trust anchor for whether OUR
+   * claim of an EVM leg actually stuck. Reads getSwap.claimed (fail-closed false on any read error or absent swap).
+   * Used to corroborate the claimbroadcast sentinel before adopting a claim as final, so a 1-conf claim later orphaned
+   * by a reorg is re-driven rather than falsely reported as complete.
+   */
+  async evmSwapIsClaimed(provider, htlcAddr, swapId) {
+    if (!provider) return false;
+    try {
+      const sw = await getSwap(htlcAddr, swapId, provider);
+      return !!sw?.claimed;
+    } catch {
+      return false;
+    }
+  }
+  /**
+   * R-EVMCLAIM-REORG-001: the reorg-safe finalizer + orphan re-driver for an EVM theirChain claim (confirmClaim +
+   * trySettleIfBothLegsSpent both bail for EVM, so the resume claim branch never finalized/re-drove an EVM claim). It
+   * reads getSwap.claimed at a REORG-SAFE depth (tip - reqConf + 1, the same depth basis isEvmLockAtSafeDepth uses for
+   * the lock):
+   *  - claimed at the buried depth        -> FINALIZE ('claimed' -> 'completed').
+   *  - claimed at the tip but not buried  -> KEEP (still finalizing; a later resume finalizes it).
+   *  - NOT claimed + the lock still funded (an ORPHANED 1-conf claim, or one that never mined) -> RE-BROADCAST the
+   *    claim with the now-public S (skips the reveal margin gate — re-revealing a public S leaks nothing).
+   *  - lock gone / refunded / any read error -> KEEP (never finalize or re-drive on doubt).
+   * Fail-safe: a spurious re-broadcast at worst reverts on-chain (the contract enforces single-claim) — never a loss.
+   */
+  async confirmClaimEvm() {
+    const rec = this.record;
+    const theirCfg = chainConfigs[this.theirChain];
+    if (!theirCfg || !theirCfg.isEvm) return { finalized: false };
+    if (!await this.deps.durable.get(claimBroadcastKey(rec.id))) return { finalized: false };
+    let leg;
+    try {
+      leg = this.counterpartyEvmLeg("confirmClaimEvm");
+    } catch {
+      return { finalized: false };
+    }
+    const provider = this.evmProvider(this.theirChain);
+    const reqConf = leg.requiredConfirmations;
+    let tip;
+    try {
+      tip = await provider.getBlockNumber();
+    } catch {
+      return { finalized: false };
+    }
+    if (!(reqConf > 1 && tip > reqConf)) return { finalized: false };
+    let buried;
+    try {
+      buried = await getSwap(leg.htlcAddr, leg.swapId, provider, tip - (reqConf - 1));
+    } catch {
+      return { finalized: false };
+    }
+    if (buried?.claimed) {
+      this.setPhase("completed");
+      this.status("confirmClaimEvm:finalized");
+      await this.persistRecord();
+      return { finalized: true };
+    }
+    let now;
+    try {
+      now = await getSwap(leg.htlcAddr, leg.swapId, provider);
+    } catch {
+      return { finalized: false };
+    }
+    if (now?.claimed) return { finalized: false };
+    if (!now || now.refunded) return { finalized: false };
+    try {
+      await this.reBroadcastOrphanedEvmClaim(leg);
+    } catch {
+    }
+    return { finalized: false };
+  }
+  /**
+   * R-EVMCLAIM-REORG-001: re-broadcast an EVM claim that a reorg orphaned. S is already public (the orphaned claim
+   * revealed it), so this SKIPS the reveal margin gate (re-revealing leaks nothing) — the initiator's S is re-derived
+   * from the seed, the responder's is the in-memory public secret. Re-commits the sentinel around the fresh broadcast.
+   */
+  async reBroadcastOrphanedEvmClaim(leg) {
+    const rec = this.record;
+    const secret = rec.role === "initiator" ? await this.loadInitiatorSecret() : this.secret;
+    if (!secret || secret.length !== 32) throw new Error("reBroadcastOrphanedEvmClaim: S unavailable to re-drive the orphaned EVM claim");
+    const signer = this.evmSigner(this.theirChain);
+    const lockName = `bch2swap:claim:${rec.id}`;
+    await this.deps.mutex.withLock(lockName, async () => {
+      await this.deps.durable.commit([[claimBroadcastKey(rec.id), "1"]]);
+      this.status("confirmClaimEvm:re-broadcasting-orphaned-claim");
+      await this.claimEvmWithSentinelGuard(leg.htlcAddr, leg.swapId, secret.slice(), signer, leg.evmChainId);
+    });
   }
   /** Broadcast a UTXO claim, clearing the durable claimbroadcast sentinel ONLY on a DEFINITIVE pre-broadcast node
    *  rejection (the node validated + refused the tx — it never entered any mempool, so the secret is not public and a
@@ -5606,7 +5709,13 @@ var SwapController = class _SwapController {
     const signer = this.evmSigner(this.theirChain);
     const lockName = `bch2swap:claim:${rec.id}`;
     const result = await this.deps.mutex.withLock(lockName, async () => {
-      if (await this.deps.durable.get(claimBroadcastKey(rec.id))) return { swapId: leg.swapId };
+      if (await this.deps.durable.get(claimBroadcastKey(rec.id))) {
+        if (await this.evmSwapIsClaimed(signer.provider, leg.htlcAddr, leg.swapId)) return { swapId: leg.swapId };
+        try {
+          await this.deps.durable.remove(claimBroadcastKey(rec.id));
+        } catch {
+        }
+      }
       await this.deps.durable.commit([[claimBroadcastKey(rec.id), "1"]]);
       await this.claimEvmWithSentinelGuard(leg.htlcAddr, leg.swapId, secret.slice(), signer, leg.evmChainId);
       return { swapId: leg.swapId };

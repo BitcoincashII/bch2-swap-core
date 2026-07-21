@@ -1,5 +1,26 @@
 # Changelog
 
+## 3.1.10
+
+### Fixed (fund-safety — HIGH, audit round 6)
+- **R-EVMCLAIM-REORG-001** (HIGH): the EVM receive-leg claim finalized `phase='claimed'` at 1 confirmation, discarded
+  the block number `claimSwap` returns for reorg-deferral, and its adopt-guards reported "adopted" success on the local
+  `claimbroadcast` sentinel ALONE — with no `getSwap.claimed` corroboration. If a deep-reorg chain (e.g. Polygon,
+  `requiredConfirmations=128`) orphaned the 1-conf claim, the lock reverted to funded (`claimed=false`) but the SDK
+  never re-broadcast: any re-drive of `revealAndClaimEvm` / `claimEvmCounterpartyWithPublicSecret` falsely adopted, and
+  `resume()` only reported `claim-in-flight` because `confirmClaim` + `trySettleIfBothLegsSpent` both bail for EVM. The
+  counterparty (holding the now-public S) would take the other leg — initiator loses both. Its sibling `refundEvm`
+  already finalizes only on the on-chain `getSwap.refunded` anchor; the claim path had no equivalent. Fix:
+  - New `evmSwapIsClaimed` (the claim-side analogue of `evmSwapIsRefunded`, reading `getSwap.claimed`, fail-closed).
+  - The adopt-guards in `revealAndClaimEvm` + `claimEvmCounterpartyWithPublicSecret` now adopt ONLY when
+    `getSwap.claimed` is true; otherwise they clear the sentinel and re-drive the claim (S is already public, so
+    re-revealing leaks nothing).
+  - New `confirmClaimEvm` reorg-safe finalizer, wired into `resume()`'s claim branch for an EVM `theirChain`: reads
+    `getSwap.claimed` at a reorg-safe depth (`tip - requiredConfirmations + 1`) and either finalizes
+    (`'claimed'`→`'completed'`) or, on an orphaned claim (`claimed=false` + lock still funded), re-broadcasts it. A
+    spurious re-broadcast at worst reverts on-chain (the contract enforces single-claim) — never a loss. Regression
+    tests added (corroborated adopt, reorg-safe finalize, and orphaned-claim auto re-broadcast on resume).
+
 ## 3.1.9
 
 ### Fixed (fund-safety — HIGH, audit round 6)

@@ -572,6 +572,32 @@ declare class SwapController {
      *  getSwap over the given provider and returns `!!swap.refunded`; fail-closed to `false` on any read error / missing
      *  provider (a not-yet-confirmed / dropped refund must never be finalized as a completed 'refunded'). */
     private evmSwapIsRefunded;
+    /**
+     * R-EVMCLAIM-REORG-001: the claim-side analogue of evmSwapIsRefunded — the on-chain trust anchor for whether OUR
+     * claim of an EVM leg actually stuck. Reads getSwap.claimed (fail-closed false on any read error or absent swap).
+     * Used to corroborate the claimbroadcast sentinel before adopting a claim as final, so a 1-conf claim later orphaned
+     * by a reorg is re-driven rather than falsely reported as complete.
+     */
+    private evmSwapIsClaimed;
+    /**
+     * R-EVMCLAIM-REORG-001: the reorg-safe finalizer + orphan re-driver for an EVM theirChain claim (confirmClaim +
+     * trySettleIfBothLegsSpent both bail for EVM, so the resume claim branch never finalized/re-drove an EVM claim). It
+     * reads getSwap.claimed at a REORG-SAFE depth (tip - reqConf + 1, the same depth basis isEvmLockAtSafeDepth uses for
+     * the lock):
+     *  - claimed at the buried depth        -> FINALIZE ('claimed' -> 'completed').
+     *  - claimed at the tip but not buried  -> KEEP (still finalizing; a later resume finalizes it).
+     *  - NOT claimed + the lock still funded (an ORPHANED 1-conf claim, or one that never mined) -> RE-BROADCAST the
+     *    claim with the now-public S (skips the reveal margin gate — re-revealing a public S leaks nothing).
+     *  - lock gone / refunded / any read error -> KEEP (never finalize or re-drive on doubt).
+     * Fail-safe: a spurious re-broadcast at worst reverts on-chain (the contract enforces single-claim) — never a loss.
+     */
+    private confirmClaimEvm;
+    /**
+     * R-EVMCLAIM-REORG-001: re-broadcast an EVM claim that a reorg orphaned. S is already public (the orphaned claim
+     * revealed it), so this SKIPS the reveal margin gate (re-revealing leaks nothing) — the initiator's S is re-derived
+     * from the seed, the responder's is the in-memory public secret. Re-commits the sentinel around the fresh broadcast.
+     */
+    private reBroadcastOrphanedEvmClaim;
     /** Broadcast a UTXO claim, clearing the durable claimbroadcast sentinel ONLY on a DEFINITIVE pre-broadcast node
      *  rejection (the node validated + refused the tx — it never entered any mempool, so the secret is not public and a
      *  retry can rebuild + re-broadcast), so a later call re-arms instead of ADOPTING a never-broadcast claim (fix #3).

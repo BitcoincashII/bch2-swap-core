@@ -1550,6 +1550,52 @@ describe('SwapController.revealAndClaimEvm() — the initiator EVM secret reveal
   });
 });
 
+// ── R-EVMCLAIM-REORG-001: EVM claim reorg corroboration + finalize/re-drive (confirmClaimEvm + adopt-guard) ──
+describe('R-EVMCLAIM-REORG-001 EVM claim reorg corroboration', () => {
+  beforeEach(() => { __setSpvConfigForTests('btc', FX.params, FX.checkpoint); __resetSpvCacheForTests(); });
+
+  it('adopt-guard: revealAndClaimEvm adopts ONLY when getSwap.claimed corroborates (claimed=true -> adopt, no re-broadcast)', async () => {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:claimbroadcast:evmreveal-1', '1');
+    const claimedSwap = makeSwap({ hashLock: EVM_HASHLOCK, recipient: EVM_RECIP, token: ZERO_ADDRESS, amount: EVM_AMT, timeLock: 1_900_000_000n, claimed: true });
+    const goodAuth = await gateAssertEvmRevealSafe(P(evmLegProvider()), REVEAL_GATE_PARAMS);
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP);
+    const ctrl = new SwapController(evmRevealRecord({ phase: 'claimed', myClaimTxid: EVM_SWAP_ID }), makeEvmDeps({
+      evmProviderFor: () => P(evmLegProvider({ swap: claimedSwap })), evmSignerFor: () => SG(signer), durable,
+    }));
+    const { txHash } = await ctrl.revealAndClaimEvm(goodAuth);
+    expect(txHash).toBe(EVM_SWAP_ID);       // adopted the on-chain-corroborated claim
+    expect(signer.broadcastCount).toBe(0);  // no re-broadcast — the claim is confirmed on-chain
+  });
+
+  it('finalize: confirmClaimEvm finalizes a reorg-safe claim on resume (getSwap.claimed at buried depth -> completed)', async () => {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:claimbroadcast:evmreveal-1', '1');
+    const claimedSwap = makeSwap({ hashLock: EVM_HASHLOCK, recipient: EVM_RECIP, token: ZERO_ADDRESS, amount: EVM_AMT, timeLock: 1_900_000_000n, claimed: true });
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP);
+    const ctrl = await SwapController.resume(evmRevealRecord({ phase: 'claimed' }), makeEvmDeps({
+      evmProviderFor: () => P(evmLegProvider({ swap: claimedSwap })), evmSignerFor: () => SG(signer), durable,
+    }));
+    expect(ctrl.getState().phase).toBe('completed');          // reorg-safe claimed -> finalized
+    expect(ctrl.getState().resumeGate).toBe('claim-finalized');
+    expect(signer.broadcastCount).toBe(0);                    // already claimed on-chain — nothing to re-broadcast
+  });
+
+  it('re-drive: confirmClaimEvm RE-BROADCASTS an ORPHANED claim on resume (getSwap.claimed=false + lock still funded)', async () => {
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:claimbroadcast:evmreveal-1', '1');
+    // The 1-conf claim was orphaned by a reorg: claimed=false again, the lock is still funded (initiator set, not refunded).
+    const orphan = makeSwap({ initiator: EVM_CP_ADDR, recipient: EVM_RECIP, hashLock: EVM_HASHLOCK, token: ZERO_ADDRESS, amount: EVM_AMT, timeLock: 1_900_000_000n, claimed: false, refunded: false });
+    const claimProvider = new MockEvmProvider({ swap: orphan, safeSwap: orphan, block: { timestamp: EVM_CHAIN_NOW }, blockNumber: 5000, chainId: 42161n });
+    const signer = new MockSigner(claimProvider, EVM_RECIP, { mode: 'ok' });
+    const ctrl = await SwapController.resume(evmRevealRecord({ phase: 'claimed' }), makeEvmDeps({
+      evmProviderFor: () => P(claimProvider), evmSignerFor: () => SG(signer), durable,
+    }));
+    expect(signer.broadcastCount).toBe(1);                    // the orphaned claim was re-broadcast (auto-recovery)
+    expect(ctrl.getState().resumeGate).toBe('claim-in-flight');
+  });
+});
+
 // ── (iv) refundEvm() — happy + durable-before-broadcast + the refund-race pivot (fix #7) ──────────────────
 describe('SwapController.refundEvm() — refund own EVM lock + the refund-race secret-recovery pivot (fix #7)', () => {
   beforeEach(() => { __setSpvConfigForTests('btc', FX.params, FX.checkpoint); __resetSpvCacheForTests(); });
