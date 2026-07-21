@@ -633,6 +633,20 @@ declare class SwapController {
      *  never-broadcast claim (fix #3). A POST-broadcast / ambiguous failure LEAVES the sentinel set (R201 fail-safe). */
     private claimEvmWithSentinelGuard;
     /**
+     * R-EVM-REFUNDRACE-RESUME-001: the EVM-own-leg parity sibling of recoverUtxoRefundRace, wired into resume(). A
+     * RESPONDER whose own EVM leg Y was CLAIMED by the initiator (S now public) — after it had already committed the
+     * refundbroadcast sentinel but crashed before refundEvm's synchronous pivot (recoverFromRefundRace) cleared it — is
+     * otherwise permanently wedged on resume: confirmRefund + recoverUtxoRefundRace + rebroadcastRefundIfDropped ALL bail
+     * for an EVM own leg, so resume short-circuits at 'refund-in-flight' with the sentinel stuck, and claimWithKnownSecret
+     * is blocked by the refund cross-guard — the responder forfeits leg X (still claimable with the public S until its
+     * longer timelock) while the initiator nets both legs. Detect the lost race on-chain (our own EVM swap is claimed +
+     * not refunded, so the refund can never confirm) and drive recoverFromRefundRace (recovers S from the Claimed event,
+     * clears the sentinel, claims leg X). Fail-closed: pivots ONLY when getSwap shows claimed && !refunded; returns false
+     * and KEEPS everything on any read error / not-claimed / S-not-yet-extractable (a later resume retries).
+     * @returns true iff the pivot ran AND completed (S recovered + leg X claimed).
+     */
+    private recoverEvmRefundRaceOnResume;
+    /**
      * THE REFUND-RACE PIVOT body (fix #7). Recover S from OUR OWN EVM lock's on-chain `Claimed` event, corroborated
      * across quorum>=2 leaves, verify sha256(S)===hashLock, then claim the OTHER (counterparty) leg with the now-public
      * S so we are made whole. If S is not YET extractable (a lagging/pruned leaf), we KEEP the refund sentinel and throw

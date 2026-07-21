@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.1.11
+
+### Fixed (fund-safety — HIGH, audit round 7)
+- **R-EVM-REFUNDRACE-RESUME-001** (HIGH): the parity sibling of the v3.1.9 UTXO refund-race fix — the EVM-own-leg
+  refund-race recovery was never wired into `resume()`. `recoverFromRefundRace` was only reachable from inside
+  `refundEvm`; `recoverUtxoRefundRace` (wired into resume) bails for an EVM own leg. So a RESPONDER whose own EVM leg Y
+  was CLAIMED by the initiator (S now public) — after committing the `refundbroadcast` sentinel but crashing before
+  `refundEvm`'s synchronous pivot cleared it — was permanently wedged on resume: `confirmRefund`,
+  `recoverUtxoRefundRace`, and `rebroadcastRefundIfDropped` ALL bail for an EVM own leg, so resume short-circuited at
+  `refund-in-flight` with the sentinel stuck, and `claimWithKnownSecret` was blocked by the refund cross-guard — the
+  responder forfeited leg X (still claimable with the public S) while the initiator netted both legs. Its UTXO-own-leg
+  twin recovers on resume and is tested; the EVM twin was neither. Fix: new `recoverEvmRefundRaceOnResume()` (reads
+  `getSwap` for our own EVM swapId; if `claimed && !refunded`, drives `recoverFromRefundRace` — recovers S from the
+  Claimed event, clears the sentinel, claims leg X), wired into `resume()`'s refund-first branch right after the UTXO
+  pivot. Plus a defense-in-depth pre-mutex check in `refundEvm` so a MANUAL re-call also pivots (a set sentinel with
+  the lock claimed-but-not-refunded routes to recovery instead of a false `refund-pending`). Fail-closed throughout.
+  Regression test added (resume-driven end-to-end recovery for the EVM-own-leg / UTXO-counterparty topology).
+
 ## 3.1.10
 
 ### Fixed (fund-safety — HIGH, audit round 6)

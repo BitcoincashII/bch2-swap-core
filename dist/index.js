@@ -4593,6 +4593,10 @@ var SwapController = class _SwapController {
         this.setResumeGate("refund-race-recovered");
         return;
       }
+      if (await this.recoverEvmRefundRaceOnResume()) {
+        this.setResumeGate("refund-race-recovered");
+        return;
+      }
       await this.rebroadcastRefundIfDropped();
       this.setResumeGate("refund-in-flight");
       return;
@@ -5395,6 +5399,13 @@ var SwapController = class _SwapController {
       throw new Error("refundEvm: a claim is already in flight \u2014 refusing to refund while a claim is active (R181 cross-guard)");
     }
     const signer = this.evmSigner(this.myChain);
+    if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
+      const prov = signer.provider;
+      if (await this.evmSwapIsClaimed(prov, htlcAddr, swapId) && !await this.evmSwapIsRefunded(prov, htlcAddr, swapId)) {
+        this.status("refundEvm:sentinel-set-but-claimed");
+        return await this.recoverFromRefundRace(htlcAddr, swapId);
+      }
+    }
     const lockName = `bch2swap:claim:${rec.id}`;
     let outcome;
     try {
@@ -5658,6 +5669,47 @@ var SwapController = class _SwapController {
         }
       }
       throw e;
+    }
+  }
+  /**
+   * R-EVM-REFUNDRACE-RESUME-001: the EVM-own-leg parity sibling of recoverUtxoRefundRace, wired into resume(). A
+   * RESPONDER whose own EVM leg Y was CLAIMED by the initiator (S now public) — after it had already committed the
+   * refundbroadcast sentinel but crashed before refundEvm's synchronous pivot (recoverFromRefundRace) cleared it — is
+   * otherwise permanently wedged on resume: confirmRefund + recoverUtxoRefundRace + rebroadcastRefundIfDropped ALL bail
+   * for an EVM own leg, so resume short-circuits at 'refund-in-flight' with the sentinel stuck, and claimWithKnownSecret
+   * is blocked by the refund cross-guard — the responder forfeits leg X (still claimable with the public S until its
+   * longer timelock) while the initiator nets both legs. Detect the lost race on-chain (our own EVM swap is claimed +
+   * not refunded, so the refund can never confirm) and drive recoverFromRefundRace (recovers S from the Claimed event,
+   * clears the sentinel, claims leg X). Fail-closed: pivots ONLY when getSwap shows claimed && !refunded; returns false
+   * and KEEPS everything on any read error / not-claimed / S-not-yet-extractable (a later resume retries).
+   * @returns true iff the pivot ran AND completed (S recovered + leg X claimed).
+   */
+  async recoverEvmRefundRaceOnResume() {
+    const rec = this.record;
+    if (rec.role !== "responder") return false;
+    if (!chainConfigs[this.myChain]?.isEvm) return false;
+    if (!await this.deps.durable.get(refundBroadcastKey(rec.id))) return false;
+    const swapId = (rec.myEvmSwapId ?? "").toLowerCase();
+    if (!BYTES32_0X.test(swapId)) return false;
+    let htlcAddr;
+    try {
+      ({ htlcAddr } = this.evmCfgFor(this.myChain));
+    } catch {
+      return false;
+    }
+    let sw;
+    try {
+      sw = await getSwap(htlcAddr, swapId, this.evmProvider(this.myChain));
+    } catch {
+      return false;
+    }
+    if (!sw || !sw.claimed || sw.refunded) return false;
+    this.status("recoverEvmRefundRaceOnResume:pivoting");
+    try {
+      await this.recoverFromRefundRace(htlcAddr, swapId);
+      return true;
+    } catch {
+      return false;
     }
   }
   /**

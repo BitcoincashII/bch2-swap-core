@@ -1553,6 +1553,10 @@ export class SwapController {
       // it LOST the race to the counterparty's secret-revealing claim of our leg Y (S now public). If so, recover S +
       // claim leg X rather than forever short-circuiting on 'refund-in-flight'.
       if (await this.recoverUtxoRefundRace()) { this.setResumeGate('refund-race-recovered'); return; }
+      // R-EVM-REFUNDRACE-RESUME-001: the EVM-own-leg sibling — recoverUtxoRefundRace bails for an EVM own leg, so a
+      // responder whose EVM leg Y was claimed (S public) but crashed before refundEvm's pivot cleared the sentinel is
+      // recovered here (else permanently wedged: leg X forfeited). Parity with the UTXO pivot above.
+      if (await this.recoverEvmRefundRaceOnResume()) { this.setResumeGate('refund-race-recovered'); return; }
       await this.rebroadcastRefundIfDropped();
       this.setResumeGate('refund-in-flight');
       return; // refund-first short-circuit: a refund is in flight — do NOT also route to a claim / fund gate
@@ -2420,6 +2424,17 @@ export class SwapController {
       throw new Error('refundEvm: a claim is already in flight — refusing to refund while a claim is active (R181 cross-guard)');
     }
     const signer = this.evmSigner(this.myChain);
+    // R-EVM-REFUNDRACE-RESUME-001 (defense-in-depth for a MANUAL re-call): the refundbroadcast sentinel is already set
+    // but our lock was CLAIMED (not refunded) — the refund can NEVER confirm. Pivot to recovery instead of adopting the
+    // sentinel below as a false 'refund-pending' (which strands leg X). Reads via signer.provider (as the adopt path
+    // does) so it works when only evmSignerFor is wired. Mirrors the resume-side recoverEvmRefundRaceOnResume.
+    if (await this.deps.durable.get(refundBroadcastKey(rec.id))) {
+      const prov = signer.provider as Provider | null;
+      if ((await this.evmSwapIsClaimed(prov, htlcAddr, swapId)) && !(await this.evmSwapIsRefunded(prov, htlcAddr, swapId))) {
+        this.status('refundEvm:sentinel-set-but-claimed');
+        return await this.recoverFromRefundRace(htlcAddr, swapId);
+      }
+    }
     const lockName = `bch2swap:claim:${rec.id}`;
     let outcome: { refunded: boolean };
     try {
@@ -2663,6 +2678,37 @@ export class SwapController {
       }
       throw e;
     }
+  }
+
+  /**
+   * R-EVM-REFUNDRACE-RESUME-001: the EVM-own-leg parity sibling of recoverUtxoRefundRace, wired into resume(). A
+   * RESPONDER whose own EVM leg Y was CLAIMED by the initiator (S now public) — after it had already committed the
+   * refundbroadcast sentinel but crashed before refundEvm's synchronous pivot (recoverFromRefundRace) cleared it — is
+   * otherwise permanently wedged on resume: confirmRefund + recoverUtxoRefundRace + rebroadcastRefundIfDropped ALL bail
+   * for an EVM own leg, so resume short-circuits at 'refund-in-flight' with the sentinel stuck, and claimWithKnownSecret
+   * is blocked by the refund cross-guard — the responder forfeits leg X (still claimable with the public S until its
+   * longer timelock) while the initiator nets both legs. Detect the lost race on-chain (our own EVM swap is claimed +
+   * not refunded, so the refund can never confirm) and drive recoverFromRefundRace (recovers S from the Claimed event,
+   * clears the sentinel, claims leg X). Fail-closed: pivots ONLY when getSwap shows claimed && !refunded; returns false
+   * and KEEPS everything on any read error / not-claimed / S-not-yet-extractable (a later resume retries).
+   * @returns true iff the pivot ran AND completed (S recovered + leg X claimed).
+   */
+  private async recoverEvmRefundRaceOnResume(): Promise<boolean> {
+    const rec = this.record;
+    if (rec.role !== 'responder') return false;
+    if (!(chainConfigs[this.myChain] as { isEvm?: boolean } | undefined)?.isEvm) return false; // our own leg Y is EVM
+    if (!(await this.deps.durable.get(refundBroadcastKey(rec.id)))) return false; // no refund was ever broadcast
+    const swapId = (rec.myEvmSwapId ?? '').toLowerCase();
+    if (!BYTES32_0X.test(swapId)) return false;
+    let htlcAddr: string;
+    try { ({ htlcAddr } = this.evmCfgFor(this.myChain)); } catch { return false; }
+    let sw: SwapData | null;
+    try { sw = await getSwap(htlcAddr, swapId, this.evmProvider(this.myChain)); } catch { return false; } // KEEP on read error
+    if (!sw || !sw.claimed || sw.refunded) return false; // not the claimed-not-refunded refund-race case — KEEP
+    // Our own EVM leg was CLAIMED (S public) and NOT refunded — the refund can never confirm. Recover S + claim leg X.
+    this.status('recoverEvmRefundRaceOnResume:pivoting');
+    try { await this.recoverFromRefundRace(htlcAddr, swapId); return true; }
+    catch { return false; } // S not yet extractable — recoverFromRefundRace set refundracepending; a later resume retries
   }
 
   /**

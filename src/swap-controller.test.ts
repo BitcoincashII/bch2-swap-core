@@ -1680,6 +1680,32 @@ describe('SwapController.refundEvm() — refund own EVM lock + the refund-race s
     expect(await durable.get('bch2swap:refundbroadcast:evmrefund-1')).toBeNull();
   });
 
+  it('R-EVM-REFUNDRACE-RESUME-001: resume() recovers an EVM-own-leg LOST refund race (our EVM leg Y was CLAIMED) — clears the sentinel, recovers S, claims leg X', async () => {
+    // Crash window: refundEvm committed refundbroadcast='1' then our EVM leg Y was CLAIMED by the initiator (S public),
+    // but the process died before refundEvm's synchronous pivot cleared the sentinel. Before the fix, resume would
+    // short-circuit at 'refund-in-flight' (recoverUtxoRefundRace bails for EVM) and the responder forfeited leg X.
+    const claimedLog = htlcInterface.encodeEventLog('Claimed', [EVM_SWAP_ID, ethers.hexlify(S)]);
+    const leaf = () => new MockEvmProvider({ logs: [{ topics: claimedLog.topics, data: claimedLog.data, blockNumber: 10 }] });
+    // Our own EVM leg Y (base): getSwap says CLAIMED + NOT refunded (the refund can never confirm); leaves carry Claimed(S).
+    const baseProvider = new MockEvmProvider({
+      swap: makeSwap({ initiator: EVM_RECIP, claimed: true, refunded: false, timeLock: 1_800_000_000n, amount: EVM_AMT }),
+      leafProviders: [leaf(), leaf()], blockNumber: 5000,
+    });
+    const btc = fxClient(); // leg X on btc — claimable with the recovered public S
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:refundbroadcast:evmrefund-1', '1'); // sentinel set; pivot never cleared it (crash)
+    const ctrl = await SwapController.resume(refundEvmRecord(), makeEvmDeps({
+      evmProviderFor: (chain) => P(chain === 'base' ? baseProvider : evmLegProvider()),
+      clients: { btc },
+      durable,
+    }));
+    expect(await durable.get('bch2swap:refundbroadcast:evmrefund-1')).toBeNull(); // sentinel cleared (recovery ran)
+    expect(btc.broadcasts.length).toBe(1);                       // leg X claimed with the recovered S
+    expect(ctrl.getState().hasSecret).toBe(true);               // S recovered + retained
+    expect(ctrl.getState().phase).toBe('completed');            // made whole via RESUME (parity with the UTXO twin)
+    expect(ctrl.getState().resumeGate).toBe('refund-race-recovered');
+  });
+
   it('the pivot KEEPS retrying (does not abandon) when S is NOT yet extractable from the Claimed event', async () => {
     const claimedProvider = new MockEvmProvider({ swap: makeSwap({ initiator: EVM_RECIP, claimed: true, timeLock: 1_800_000_000n, amount: EVM_AMT }), block: { timestamp: 1_700_000_000 }, blockNumber: 5000 });
     const signer = new MockSigner(claimedProvider, EVM_RECIP);
