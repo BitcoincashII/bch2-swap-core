@@ -108,6 +108,10 @@ interface RevealSafeParams {
     recordedOutpoint: Outpoint;
     /** The counterparty HTLC locktime: a block height, or a unix timestamp (>= 1.5e9) for an EVM-anchored CLTV. */
     counterpartyLocktime: number;
+    /** R-UNDERFUND-001: the amount (sats) WE claim from this leg — the authenticated funded value must be >= this, or a
+     *  dust-funded counterparty leg would pass and we would reveal/commit our own full leg against it. For the initiator
+     *  reveal this is offer.receiveAmount (leg Y); the responder-fund equivalent is offer.sendAmount (leg X). */
+    expectedFundedValueSats: number;
 }
 /**
  * R220 exact-outpoint re-check + R139/R175 authentication + R175 SPV depth + R258/R261 initiator-only 4h margin.
@@ -128,6 +132,10 @@ interface FundGateParams {
     recordedOutpoint: Outpoint;
     /** The initiator leg X block-height CLTV. */
     counterpartyLocktime: number;
+    /** R-UNDERFUND-001: the amount (sats) the responder will claim from leg X (= offer.sendAmount). The authenticated
+     *  funded value of leg X must be >= this, or a dust-funded leg X would pass and the responder would fund its full
+     *  leg Y against it. */
+    expectedFundedValueSats: number;
 }
 /**
  * Burial re-verify (R220/R139/R175) of leg X + R125/R133 responder margin: the initiator leg must outlast the

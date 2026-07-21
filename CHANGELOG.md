@@ -1,5 +1,25 @@
 # Changelog
 
+## 3.1.8
+
+### Fixed (fund-safety — CRITICAL, audit round 6)
+- **R-UNDERFUND-001** (CRITICAL): the UTXO counterparty-leg gates never bound the on-chain funded value to the offer
+  amount. `reverifyBuriedOutpoint` (shared by the responder fund gate `assertLegBuriedForFunding` and the initiator
+  reveal gate `assertRevealSafe`) authenticated the funding output's value but asserted only `value > 0` — neither
+  `FundGateParams` nor `RevealSafeParams` carried an expected-amount field, and the controller never passed
+  `offer.sendAmount`/`receiveAmount`. A malicious maker/responder could dust-fund the counterparty leg (a REAL,
+  buried, correct-outpoint, CLTV-consistent HTLC holding e.g. ~20k sats instead of the advertised 50 BCH2); every
+  other check passed, so the victim funded/revealed its OWN full leg and could only ever claim back dust — a whole
+  receive-leg loss requiring NO race or reorg. The EVM sibling path already binds this (`isEvmLockAtSafeDepth` rejects
+  `lock.amount < inv.minAmount`, with an explicit comment that omitting it lets a party reveal against an under-funded
+  lock); the guard was dropped only on the UTXO path. (The live app is NOT affected — `SwapExecute.tsx` binds the
+  expected amount at its poll/reveal sites; this restores the same bind in the SDK.) Fix: `FundGateParams` and
+  `RevealSafeParams` gain `expectedFundedValueSats`; `reverifyBuriedOutpoint` fails closed (`abort`) unless the
+  authenticated value of the exact recorded outpoint the claim spends is `>=` it (also covers split-UTXO funding). The
+  controller passes `offer.sendAmount` for the responder fund gate (claims leg X) and `offer.receiveAmount` for the
+  initiator reveal gate + the broadcast-choke re-mint (claims leg Y). Regression tests added to `gates.test.ts` (both
+  gates ABORT when the authenticated value is one sat below the required amount).
+
 ## 3.1.7
 
 ### Fixed (fund-safety — audit round 5)

@@ -2787,7 +2787,7 @@ function parseHtlcCltv(redeemScript) {
   for (let i = 0; i < len; i++) n += s[pos + i] * 2 ** (8 * i);
   return n;
 }
-async function reverifyBuriedOutpoint(client, chain, redeemScript, recordedOutpoint, counterpartyLocktime, label) {
+async function reverifyBuriedOutpoint(client, chain, redeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, label) {
   if (!isValidOutpoint(recordedOutpoint)) {
     throw new GateFailure(`${label}: no valid recorded funding outpoint to re-verify \u2014 rebuild before the irreversible action`, "rebuild");
   }
@@ -2830,6 +2830,15 @@ async function reverifyBuriedOutpoint(client, chain, redeemScript, recordedOutpo
   if (!(vAuthed.value > 0)) {
     throw new GateFailure(`${label}: counterparty HTLC funding output failed re-authentication (non-positive value) \u2014 fail closed`, "rebuild");
   }
+  if (!Number.isFinite(expectedFundedValueSats) || expectedFundedValueSats <= 0) {
+    throw new GateFailure(`${label}: invalid expected counterparty funded amount \u2014 fail closed`, "abort");
+  }
+  if (!(vAuthed.value >= expectedFundedValueSats)) {
+    throw new GateFailure(
+      `${label}: counterparty HTLC underfunded (authenticated ${vAuthed.value} sats < required ${expectedFundedValueSats} sats) \u2014 claim would under-recover; fail closed`,
+      "abort"
+    );
+  }
   if (spvSupported(chain)) {
     let spvConfs;
     try {
@@ -2854,8 +2863,8 @@ async function reverifyBuriedOutpoint(client, chain, redeemScript, recordedOutpo
   return { freshHeight, vReqConf, sameOutpoint, rawFundingTx };
 }
 async function assertRevealSafe(client, p) {
-  const { role, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime } = p;
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, "reveal");
+  const { role, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats } = p;
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, "reveal");
   const chainNow = await getChainTimeSec(client);
   if (chainNow === null) {
     throw new GateFailure("reveal: could not read chain time to verify the responder refund timelock \u2014 not revealing the secret; retry", "rearm");
@@ -2904,8 +2913,8 @@ async function assertRevealSafe(client, p) {
   });
 }
 async function assertLegBuriedForFunding(client, p) {
-  const { theirChain, myChain, myChainIsEvm, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime } = p;
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, "fund");
+  const { theirChain, myChain, myChainIsEvm, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats } = p;
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, "fund");
   const theirBlockSec = chainConfigs[theirChain]?.avgBlockTimeSec;
   const myBlockSec = chainConfigs[myChain]?.avgBlockTimeSec;
   if (!Number.isFinite(theirBlockSec) || (theirBlockSec ?? 0) <= 0 || !Number.isFinite(myBlockSec) || (myBlockSec ?? 0) <= 0) {
@@ -3529,7 +3538,9 @@ var SwapController = class _SwapController {
       myChainIsEvm,
       counterpartyRedeemScript: redeemScript,
       recordedOutpoint: outpoint,
-      counterpartyLocktime: locktime
+      counterpartyLocktime: locktime,
+      // R-UNDERFUND-001: the responder claims leg X = offer.sendAmount — bind the gate so a dust-funded leg X is rejected.
+      expectedFundedValueSats: this.amountSats(this.record.offer.sendAmount, "verifyCounterpartyLegForFunding", "counterparty leg X")
     });
   }
   /**
@@ -3550,7 +3561,10 @@ var SwapController = class _SwapController {
       theirChain: this.theirChain,
       counterpartyRedeemScript: redeemScript,
       recordedOutpoint: outpoint,
-      counterpartyLocktime: locktime
+      counterpartyLocktime: locktime,
+      // R-UNDERFUND-001: the initiator claims leg Y = offer.receiveAmount — bind the gate so a dust-funded leg Y is
+      // rejected BEFORE the irreversible secret reveal (else we reveal S against a dust leg and recover only dust).
+      expectedFundedValueSats: this.amountSats(this.record.offer.receiveAmount, "verifyCounterpartyLegForReveal", "counterparty leg Y")
     });
   }
   // ── revealAndClaim(auth) — the INITIATOR's single irreversible secret reveal (claim of leg Y) ────────────────
@@ -3650,7 +3664,10 @@ var SwapController = class _SwapController {
         theirChain: this.theirChain,
         counterpartyRedeemScript: redeemScript,
         recordedOutpoint: claimTx.spent,
-        counterpartyLocktime: locktime
+        counterpartyLocktime: locktime,
+        // R-UNDERFUND-001: re-bind the funded-value check at the broadcast choke point too — never reveal S against a
+        // counterparty leg Y that holds less than offer.receiveAmount.
+        expectedFundedValueSats: this.amountSats(this.record.offer.receiveAmount, "revealAndClaim", "counterparty leg Y")
       });
       this.status("revealAndClaim:committing");
       await this.deps.durable.commit([

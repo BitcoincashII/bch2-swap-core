@@ -247,6 +247,7 @@ async function reverifyBuriedOutpoint(
   redeemScript: Uint8Array,
   recordedOutpoint: Outpoint,
   counterpartyLocktime: number,
+  expectedFundedValueSats: number,
   label: string,
 ): Promise<Buried> {
   // R-REVEAL-FAILCLOSE: without a valid recorded funding outpoint we cannot re-verify → rebuild the claim.
@@ -283,6 +284,23 @@ async function reverifyBuriedOutpoint(
   catch { throw new GateFailure(`${label}: counterparty HTLC funding output failed re-authentication — fail closed`, 'rebuild'); }
   if (!(vAuthed.value > 0)) {
     throw new GateFailure(`${label}: counterparty HTLC funding output failed re-authentication (non-positive value) — fail closed`, 'rebuild');
+  }
+  // R-UNDERFUND-001: bind the AUTHENTICATED funded value to the offer amount the claim will actually recover. The EVM
+  // sibling gate enforces this (isEvmLockAtSafeDepth rejects lock.amount < inv.minAmount, evm-client.ts:1379, with the
+  // EvmRevealGateParams.minAmount comment noting that omitting it lets a party reveal against an under-funded lock);
+  // the UTXO gate previously asserted only value>0. Without this bind a malicious maker/responder who dust-funds the
+  // counterparty leg — REAL, buried, correct outpoint + consistent CLTV — passes every other check, and we then
+  // fund/reveal our OWN full leg and can only ever claim back dust (whole-leg loss, no race/reorg needed). The value
+  // is the authenticated value of the exact recorded outpoint the claim spends, so this also covers split-UTXO
+  // funding. Fail closed ('abort' — the shortfall is the maker's choice, not a transient/rebuildable condition).
+  if (!Number.isFinite(expectedFundedValueSats) || expectedFundedValueSats <= 0) {
+    throw new GateFailure(`${label}: invalid expected counterparty funded amount — fail closed`, 'abort');
+  }
+  if (!(vAuthed.value >= expectedFundedValueSats)) {
+    throw new GateFailure(
+      `${label}: counterparty HTLC underfunded (authenticated ${vAuthed.value} sats < required ${expectedFundedValueSats} sats) — claim would under-recover; fail closed`,
+      'abort',
+    );
   }
   // R175-SPV (THE trust removal): PoW+Merkle depth WITHOUT trusting the proxy's height. Over-report guard: an
   // unverifiable/inflated tip THROWS. Fail closed on throw OR a verified depth below required.
@@ -330,6 +348,10 @@ export interface RevealSafeParams {
   recordedOutpoint: Outpoint;
   /** The counterparty HTLC locktime: a block height, or a unix timestamp (>= 1.5e9) for an EVM-anchored CLTV. */
   counterpartyLocktime: number;
+  /** R-UNDERFUND-001: the amount (sats) WE claim from this leg — the authenticated funded value must be >= this, or a
+   *  dust-funded counterparty leg would pass and we would reveal/commit our own full leg against it. For the initiator
+   *  reveal this is offer.receiveAmount (leg Y); the responder-fund equivalent is offer.sendAmount (leg X). */
+  expectedFundedValueSats: number;
 }
 
 /**
@@ -338,9 +360,9 @@ export interface RevealSafeParams {
  * fails closed rather than reveal the secret within the margin. THROWS + mints nothing on any doubt.
  */
 export async function assertRevealSafe(client: GateChainClient, p: RevealSafeParams): Promise<RevealAuthorization> {
-  const { role, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime } = p;
+  const { role, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats } = p;
 
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, 'reveal');
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, 'reveal');
 
   // fix #9: the reveal is the anti-theft path — anchor to CHAIN time (never Date.now). Fail closed if unreadable.
   const chainNow = await getChainTimeSec(client);
@@ -428,6 +450,10 @@ export interface FundGateParams {
   recordedOutpoint: Outpoint;
   /** The initiator leg X block-height CLTV. */
   counterpartyLocktime: number;
+  /** R-UNDERFUND-001: the amount (sats) the responder will claim from leg X (= offer.sendAmount). The authenticated
+   *  funded value of leg X must be >= this, or a dust-funded leg X would pass and the responder would fund its full
+   *  leg Y against it. */
+  expectedFundedValueSats: number;
 }
 
 /**
@@ -436,9 +462,9 @@ export interface FundGateParams {
  * margin, sized by the ÷K minSecondsUntilRefund conservatism. THROWS + mints nothing on any doubt.
  */
 export async function assertLegBuriedForFunding(client: GateChainClient, p: FundGateParams): Promise<FundProof> {
-  const { theirChain, myChain, myChainIsEvm, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime } = p;
+  const { theirChain, myChain, myChainIsEvm, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats } = p;
 
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, 'fund');
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, 'fund');
 
   // R125: chain block-time configuration must be valid before any wall-clock timelock comparison.
   const theirBlockSec = chainConfigs[theirChain as Chain]?.avgBlockTimeSec;

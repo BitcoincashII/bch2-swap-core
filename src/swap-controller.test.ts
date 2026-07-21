@@ -584,7 +584,7 @@ describe('SwapController.revealAndClaim() — the initiator secret reveal (fix #
     const ctrl = new SwapController(revealRecord(), makeMultiDeps({ btc }));
     // A responder auth (marginBasis 'none' — SKIPS the 4h margin) minted via the gate directly: must NEVER drive the reveal.
     const responderAuth = await gateAssertRevealSafe(btc as unknown as GateChainClient, {
-      role: 'responder', theirChain: 'btc', counterpartyRedeemScript: CP_REDEEM,
+      role: 'responder', theirChain: 'btc', counterpartyRedeemScript: CP_REDEEM, expectedFundedValueSats: 100000,
       recordedOutpoint: FX_OUTPOINT, counterpartyLocktime: CP_CLTV, // == the funded CLTV (the responder auth SKIPS the margin regardless)
     });
     expect(responderAuth.role).toBe('responder');
@@ -1441,7 +1441,7 @@ describe('SwapController.revealAndClaimEvm() — the initiator EVM secret reveal
     // A responder RevealAuthorization (marginBasis 'none' — SKIPS the 4h margin) can only come from the UTXO gate.
     const btc = fxClient();
     const responderAuth = await gateAssertRevealSafe(G(btc), {
-      role: 'responder', theirChain: 'btc', counterpartyRedeemScript: CP_REDEEM,
+      role: 'responder', theirChain: 'btc', counterpartyRedeemScript: CP_REDEEM, expectedFundedValueSats: 100000,
       recordedOutpoint: FX_OUTPOINT, counterpartyLocktime: CP_CLTV,
     });
     expect(responderAuth.role).toBe('responder');

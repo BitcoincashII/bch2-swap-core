@@ -181,7 +181,7 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
 
   it('HAPPY (height-CLTV): deep+fresh+margin-ok mints an OUTPOINT-BOUND RevealAuthorization', async () => {
     const auth = await assertRevealSafe(utxoClient(CTX), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME, // 200 blocks => ÷K 60000s >= 4h
     });
     expect(auth.leg).toBe('Y');
@@ -196,7 +196,7 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
     const { ctx, redeem } = buildHtlcChain(2_100_000_000); // ~year 2036, far beyond the 4h margin vs chain-time now
     useChain(ctx);
     const auth = await assertRevealSafe(utxoClient(ctx), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(ctx), counterpartyLocktime: 2_100_000_000,
     });
     expect(auth.marginBasis).toBe('timestamp-cltv');
@@ -206,14 +206,14 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
   it('FAIL-CLOSED: a VANISHED / double-spent outpoint throws (rebuild) and mints nothing', async () => {
     const client = utxoClient(CTX, { utxos: [] });
     await expect(assertRevealSafe(client, {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rebuild' });
   });
 
   it('FAIL-CLOSED: a spent-less / malformed recorded outpoint throws (rebuild)', async () => {
     await expect(assertRevealSafe(utxoClient(CTX), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM, expectedFundedValueSats: 100000,
       recordedOutpoint: { tx_hash: 'not-hex', tx_pos: 0 }, counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ disposition: 'rebuild' });
   });
@@ -221,7 +221,7 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
   it('FAIL-CLOSED: an over-reported / unverifiable SPV depth (proxy tip beyond supplied headers) throws (rearm)', async () => {
     const client = utxoClient(CTX, { height: CTX.tip + 10 }); // filter passes; SPV cannot reach the inflated tip
     await expect(assertRevealSafe(client, {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
   });
@@ -230,7 +230,7 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
     const { ctx, redeem } = buildHtlcChain(HEIGHT_LOCKTIME, { tipAgeSec: 3 * 3600 });
     useChain(ctx);
     await expect(assertRevealSafe(utxoClient(ctx), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(ctx), counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
   });
@@ -239,7 +239,7 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
     const { ctx, redeem } = buildHtlcChain(SYNTH_TIP + 40); // ÷K 12000s < 14400s
     useChain(ctx);
     await expect(assertRevealSafe(utxoClient(ctx), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(ctx), counterpartyLocktime: SYNTH_TIP + 40,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'abort' });
   });
@@ -249,7 +249,7 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
     const { ctx, redeem } = buildHtlcChain(tsLock);
     useChain(ctx);
     await expect(assertRevealSafe(utxoClient(ctx), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(ctx), counterpartyLocktime: tsLock,
     })).rejects.toMatchObject({ disposition: 'abort' });
   });
@@ -262,7 +262,7 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
     const { ctx, redeem } = buildHtlcChain(tsLock, { tipAgeSec: 3 * 3600 });
     useChain(ctx);
     await expect(assertRevealSafe(utxoClient(ctx), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(ctx), counterpartyLocktime: tsLock,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
   });
@@ -278,7 +278,7 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
     const gapCtx = buildSynthChain({ anchorHeight: 100000, count: 4, spacing: 600, bits: 0x20010000, fundSpkHex: p2shSpk(redeem) });
     useChain(gapCtx);
     await expect(assertRevealSafe(utxoClient(gapCtx), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(gapCtx), counterpartyLocktime: GAP,
     })).rejects.toMatchObject({ name: 'GateFailure' }); // aborts; before the fix this MINTED a RevealAuthorization
   });
@@ -286,7 +286,7 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
   it('FAIL-CLOSED: chain time unavailable (empty tip header) throws (rearm)', async () => {
     const client = utxoClient(CTX, { tipHeaderHex: '' });
     await expect(assertRevealSafe(client, {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ disposition: 'rearm' });
   });
@@ -295,7 +295,7 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
     const { ctx, redeem } = buildHtlcChain(SYNTH_TIP + 1); // would be far too tight for an initiator
     useChain(ctx);
     const auth = await assertRevealSafe(utxoClient(ctx), {
-      role: 'responder', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      role: 'responder', theirChain: CHAIN, counterpartyRedeemScript: redeem, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(ctx), counterpartyLocktime: SYNTH_TIP + 1,
     });
     expect(auth.marginBasis).toBe('none');
@@ -306,9 +306,20 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
     // The funding output pays p2sh(REDEEM), whose encoded CLTV is HEIGHT_LOCKTIME. A durable record whose locktime
     // field says something else would feed a wrong margin — the gate parses the authenticated CLTV and fails closed.
     await expect(assertRevealSafe(utxoClient(CTX), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME + 1, // disagrees with the script CLTV
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rebuild' });
+  });
+
+  it('FAIL-CLOSED (R-UNDERFUND-001): a dust-funded counterparty leg Y (authenticated value < offer amount) aborts — never reveal S against an under-funded leg', async () => {
+    // The leg is REAL, buried, correct outpoint + consistent CLTV (every other check passes), funded 100000 while the
+    // initiator is owed 100001. Before the fix the gate asserted only value>0 and MINTED — the initiator then revealed
+    // S to recover dust while the responder claimed the full leg X.
+    await expect(assertRevealSafe(utxoClient(CTX), {
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
+      recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME,
+      expectedFundedValueSats: 100001, // one sat above the authenticated funded value (100000)
+    })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'abort' });
   });
 });
 
@@ -321,7 +332,7 @@ describe('reverifyBuriedOutpoint fail-closed branches (shared burial re-verify)'
 
   const reveal = (client: GateChainClient, over: Partial<Parameters<typeof assertRevealSafe>[1]> = {}) =>
     assertRevealSafe(client, {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: REDEEM, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME, ...over,
     });
 
@@ -362,7 +373,7 @@ describe('reverifyBuriedOutpoint fail-closed branches (shared burial re-verify)'
     const { ctx, redeem } = buildHtlcChain(HEIGHT_LOCKTIME, { fundValue: 0 }); // funds a 0-value output
     useChain(ctx);
     await expect(assertRevealSafe(utxoClient(ctx), {
-      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(ctx), counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rebuild' });
   });
@@ -376,7 +387,7 @@ describe('assertLegBuriedForFunding (responder fund-Y gate)', () => {
 
   it('HAPPY: leg-X buried + responder margin ok mints an OUTPOINT-BOUND FundProof', async () => {
     const proof = await assertLegBuriedForFunding(utxoClient(CTX), {
-      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: REDEEM,
+      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: REDEEM, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME, // ÷K 60000s >= 43200+14400
     });
     expect(proof.leg).toBe('X');
@@ -389,14 +400,14 @@ describe('assertLegBuriedForFunding (responder fund-Y gate)', () => {
     const { ctx, redeem } = buildHtlcChain(SYNTH_TIP + 100); // ÷K 30000s < 57600s
     useChain(ctx);
     await expect(assertLegBuriedForFunding(utxoClient(ctx), {
-      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: redeem,
+      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: redeem, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(ctx), counterpartyLocktime: SYNTH_TIP + 100,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'abort' });
   });
 
   it('FAIL-CLOSED: a vanished funding outpoint throws (rebuild) and mints nothing', async () => {
     await expect(assertLegBuriedForFunding(utxoClient(CTX, { utxos: [] }), {
-      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: REDEEM,
+      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: REDEEM, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ disposition: 'rebuild' });
   });
@@ -407,7 +418,7 @@ describe('assertLegBuriedForFunding (responder fund-Y gate)', () => {
     const { ctx, redeem } = buildHtlcChain(HEIGHT_LOCKTIME, { tipAgeSec: 3 * 3600 });
     useChain(ctx);
     await expect(assertLegBuriedForFunding(utxoClient(ctx), {
-      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: redeem,
+      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: redeem, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(ctx), counterpartyLocktime: HEIGHT_LOCKTIME,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
   });
@@ -416,7 +427,7 @@ describe('assertLegBuriedForFunding (responder fund-Y gate)', () => {
     const { ctx, redeem } = buildHtlcChain(90000); // well below the tip (100004) => already refundable
     useChain(ctx);
     await expect(assertLegBuriedForFunding(utxoClient(ctx), {
-      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: redeem,
+      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: redeem, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(ctx), counterpartyLocktime: 90000,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'abort' });
   });
@@ -425,7 +436,7 @@ describe('assertLegBuriedForFunding (responder fund-Y gate)', () => {
     const { ctx, redeem } = buildHtlcChain(110000); // remaining ~9996 > bc2 maxLockBlocks(2016)*3 = 6048
     useChain(ctx);
     await expect(assertLegBuriedForFunding(utxoClient(ctx), {
-      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: redeem,
+      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: redeem, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(ctx), counterpartyLocktime: 110000,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'abort' });
   });
@@ -437,16 +448,26 @@ describe('assertLegBuriedForFunding (responder fund-Y gate)', () => {
     const { ctx, redeem } = buildHtlcChain(SYNTH_TIP + 100);
     useChain(ctx);
     await expect(assertLegBuriedForFunding(utxoClient(ctx), {
-      theirChain: CHAIN, myChain: 'poly', myChainIsEvm: true, counterpartyRedeemScript: redeem,
+      theirChain: CHAIN, myChain: 'poly', myChainIsEvm: true, counterpartyRedeemScript: redeem, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(ctx), counterpartyLocktime: SYNTH_TIP + 100,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'abort' });
   });
 
   it('FAIL-CLOSED (hardening): a counterpartyLocktime that disagrees with the authenticated redeemScript CLTV throws (rebuild)', async () => {
     await expect(assertLegBuriedForFunding(utxoClient(CTX), {
-      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: REDEEM,
+      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: REDEEM, expectedFundedValueSats: 100000,
       recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME + 1, // disagrees with the script CLTV
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rebuild' });
+  });
+
+  it('FAIL-CLOSED (R-UNDERFUND-001): a dust-funded leg X (authenticated value < offer.sendAmount) aborts — the responder never funds leg Y against a dust leg X', async () => {
+    // Leg X is REAL, buried, correct outpoint + consistent CLTV, funded 100000 while the responder is owed 100001.
+    // Before the fix the fund gate asserted only value>0 and MINTED a FundProof, so the responder funded its full leg Y.
+    await expect(assertLegBuriedForFunding(utxoClient(CTX), {
+      theirChain: CHAIN, myChain: 'bch2', myChainIsEvm: false, counterpartyRedeemScript: REDEEM,
+      recordedOutpoint: outpoint(CTX), counterpartyLocktime: HEIGHT_LOCKTIME,
+      expectedFundedValueSats: 100001, // one sat above the authenticated funded value (100000)
+    })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'abort' });
   });
 
   it('FAIL-CLOSED (fix #1): a single-leaf EVM provider is refused (rearm) — quorum>=2 required', async () => {

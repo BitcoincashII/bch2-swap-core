@@ -879,6 +879,8 @@ export class SwapController {
       counterpartyRedeemScript: redeemScript,
       recordedOutpoint: outpoint,
       counterpartyLocktime: locktime,
+      // R-UNDERFUND-001: the responder claims leg X = offer.sendAmount — bind the gate so a dust-funded leg X is rejected.
+      expectedFundedValueSats: this.amountSats(this.record.offer.sendAmount, 'verifyCounterpartyLegForFunding', 'counterparty leg X'),
     });
   }
 
@@ -901,6 +903,9 @@ export class SwapController {
       counterpartyRedeemScript: redeemScript,
       recordedOutpoint: outpoint,
       counterpartyLocktime: locktime,
+      // R-UNDERFUND-001: the initiator claims leg Y = offer.receiveAmount — bind the gate so a dust-funded leg Y is
+      // rejected BEFORE the irreversible secret reveal (else we reveal S against a dust leg and recover only dust).
+      expectedFundedValueSats: this.amountSats(this.record.offer.receiveAmount, 'verifyCounterpartyLegForReveal', 'counterparty leg Y'),
     });
   }
 
@@ -1020,6 +1025,9 @@ export class SwapController {
         counterpartyRedeemScript: redeemScript,
         recordedOutpoint: claimTx.spent as Outpoint,
         counterpartyLocktime: locktime,
+        // R-UNDERFUND-001: re-bind the funded-value check at the broadcast choke point too — never reveal S against a
+        // counterparty leg Y that holds less than offer.receiveAmount.
+        expectedFundedValueSats: this.amountSats(this.record.offer.receiveAmount, 'revealAndClaim', 'counterparty leg Y'),
       });
 
       // Durable-before-broadcast (fix #4): persist the claim tx + the winning-claim sentinel ATOMICALLY BEFORE the
