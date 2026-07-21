@@ -4928,6 +4928,23 @@ var SwapController = class _SwapController {
       await this.deps.durable.remove(lockPendingKey(rec.id));
       return { swapId, txHash: finalHash, adopted: false };
     });
+    if (lockBlockNum === null && !Number.isInteger(this.record.evmLockBlock)) {
+      const markedHash = await this.deps.durable.get(evmLockTxKey(rec.id));
+      const lockTxHash = markedHash && BYTES32_0X.test(markedHash.toLowerCase()) ? markedHash.toLowerCase() : null;
+      if (lockTxHash) {
+        try {
+          let sender = "";
+          try {
+            sender = await signer.getAddress();
+          } catch {
+            sender = "";
+          }
+          const r = await recoverLockFromTx(htlcAddr, lockTxHash, this.evmProvider(this.myChain), { sender, hashLock, recipient, minAmount: amount, fromBlock: rec.evmLockBlock });
+          if (r.kind === "locked" && r.blockNumber != null && Number.isInteger(r.blockNumber)) lockBlockNum = r.blockNumber;
+        } catch {
+        }
+      }
+    }
     this.record = {
       ...this.record,
       myEvmSwapId: outcome.swapId,

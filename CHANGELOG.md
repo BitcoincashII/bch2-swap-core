@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.1.18
+
+### Fixed (fund-safety — HIGH, audit round 13 — third adopt-path seam)
+- **R-EVMLOCKBLOCK-ADOPT-001 (fast-adopt)**: the v3.1.17 fix covered two of the three EVM-lock adopt paths but missed
+  `lockEvm`'s **fast-adopt** (the `fundedKey`-only adopt at ~2286). A crash in lockEvm's `[fundedKey-commit →
+  persistRecord]` window (State B: `fundedKey` set, `lockpending` removed, record stale) makes `recoverEvmLockOnResume`
+  bail (its guard sees `fundedKey` set), so the only reconstruction left is the host's gate-conforming re-drive of
+  `lockEvm`, which hit the fast-adopt and persisted `evmLockBlock` undefined — re-introducing the `tip-90000`
+  Claimed-scan floor (~6.25h on Arbitrum) that ages out S for an offline responder → forfeits the leg. Fix: a single
+  CENTRAL backfill after the lock mutex — if any adopt path returned without a block and the record still lacks
+  `evmLockBlock`, recover it from the recorded lock tx (`evmlocktx` marker, which survives the window) via
+  `recoverLockFromTx` (best-effort). This covers the fast-adopt and any future adopt path. Regression test added.
+
 ## 3.1.17
 
 ### Fixed (fund-safety — HIGH, audit round 12 — fix-interaction seam)

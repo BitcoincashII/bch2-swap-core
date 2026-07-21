@@ -2387,6 +2387,23 @@ export class SwapController {
       return { swapId, txHash: finalHash, adopted: false };
     });
 
+    // R-EVMLOCKBLOCK-ADOPT-001: an ADOPT path (the fast fundedKey adopt at ~2286, or any future adopt) can return
+    // without capturing the block, leaving lockBlockNum null. If the record STILL lacks evmLockBlock, backfill it
+    // centrally from the recorded lock tx (evmlocktx marker) so readEvmClaimedSecret keeps the lossless [lockBlock,
+    // tip] Claimed-event scan — else it floors at tip-90000 (~6.25h on a sub-second chain) and ages out S for an
+    // offline responder, stranding leg X. Best-effort read OUTSIDE the mutex; a later re-call/resume retries on failure.
+    if (lockBlockNum === null && !Number.isInteger(this.record.evmLockBlock)) {
+      const markedHash = await this.deps.durable.get(evmLockTxKey(rec.id));
+      const lockTxHash = (markedHash && BYTES32_0X.test(markedHash.toLowerCase())) ? markedHash.toLowerCase() : null;
+      if (lockTxHash) {
+        try {
+          let sender = ''; try { sender = await signer.getAddress(); } catch { sender = ''; }
+          const r = await recoverLockFromTx(htlcAddr, lockTxHash, this.evmProvider(this.myChain), { sender, hashLock, recipient, minAmount: amount, fromBlock: rec.evmLockBlock });
+          if (r.kind === 'locked' && r.blockNumber != null && Number.isInteger(r.blockNumber)) lockBlockNum = r.blockNumber;
+        } catch { /* best-effort — a later resume / lockEvm re-call retries the backfill */ }
+      }
+    }
+
     this.record = {
       ...this.record, myEvmSwapId: outcome.swapId, myFundingTxid: outcome.swapId, funded: true,
       // R-EVMLOCKBLOCK-001: persist the lock's block floor so readEvmClaimedSecret scans [lockBlock, tip] instead of

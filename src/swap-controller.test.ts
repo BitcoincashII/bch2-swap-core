@@ -1494,6 +1494,32 @@ describe('SwapController.lockEvm() — fix #2 re-mint FRESH at the choke point',
     expect(ctrl.getState().evmLockBlock).toBe(10);           // R-EVMLOCKBLOCK-ADOPT-001: lock block persisted on the in-lock adopt too
   });
 
+  it('R-EVMLOCKBLOCK-ADOPT-001 (fast-adopt / State B): lockEvm fast-adopt (fundedKey set) BACKFILLS evmLockBlock from the recorded lock tx', async () => {
+    // State B: a crash after lockEvm committed fundedKey but before the record persisted (lockpending already removed).
+    // On re-drive, the fast-adopt at ~2286 returns the prior swapId; the central backfill must recover evmLockBlock from
+    // the evmlocktx marker so the Claimed-event scan stays lossless (else it floors at tip-90000 and ages out S).
+    const LOCK_TX_HASH = '0x' + 'cd'.repeat(32);
+    const BASE_HTLC = getEvmConfig(84532)!.htlcAddress;
+    const lockedLog = htlcInterface.encodeEventLog('Locked', [EVM_SWAP_ID, EVM_RECIP, EVM_CP_ADDR, ZERO_ADDRESS, EVM_AMT, EVM_HASHLOCK, 1_900_000_000n]);
+    const receipt = { status: 1, blockNumber: 10, logs: [{ address: BASE_HTLC, topics: lockedLog.topics, data: lockedLog.data }] };
+    const onChainSwap = makeSwap({ initiator: EVM_RECIP, recipient: EVM_CP_ADDR, token: ZERO_ADDRESS, amount: EVM_AMT, hashLock: EVM_HASHLOCK, timeLock: 1_900_000_000n });
+    const baseQuorum = new MockEvmProvider({ swap: onChainSwap, leafProviders: [new MockEvmProvider({ receipt }), new MockEvmProvider({ receipt })], blockNumber: 5000 });
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:funded:evmfund-1', EVM_SWAP_ID);   // fundedKey committed (State B) -> triggers the fast-adopt
+    await durable.set('bch2swap:evmlocktx:evmfund-1', LOCK_TX_HASH); // the lock tx hash (committed on broadcast); NO lockpending, NO evmLockBlock in the record
+    const goodProof = await gateAssertEvmLegBuriedForFunding(P(evmLegProvider()), FUND_GATE_PARAMS);
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP); // throw-mode: a SECOND lock would broadcast + throw
+    const ctrl = new SwapController(evmFundRecord(), makeEvmDeps({
+      evmProviderFor: (chain) => P(chain === 'base' ? baseQuorum : evmLegProvider()),
+      evmSignerFor: () => SG(signer),
+      durable,
+    }));
+    const { swapId } = await ctrl.lockEvm(goodProof);
+    expect(swapId).toBe(EVM_SWAP_ID);            // fast-adopt returned the prior swapId
+    expect(signer.broadcastCount).toBe(0);       // fix #4: NO second lock
+    expect(ctrl.getState().evmLockBlock).toBe(10); // R-EVMLOCKBLOCK-ADOPT-001: central backfill recovered the block from evmlocktx
+  });
+
   it('R-RECOVER-SWAPID-QUORUM-001: a lying leaf fabricating a Locked event with an attacker-chosen swapId is REJECTED (getSwap over the quorum cannot corroborate a non-existent id)', async () => {
     const LOCK_TX_HASH = '0x' + 'ef'.repeat(32);
     const BASE_HTLC = getEvmConfig(84532)!.htlcAddress;
