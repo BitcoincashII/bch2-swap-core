@@ -3245,7 +3245,12 @@ function parseHtlcCltv(redeemScript) {
   for (let i = 0; i < len; i++) n += s[pos + i] * 2 ** (8 * i);
   return n;
 }
-async function reverifyBuriedOutpoint(client, chain, redeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, label) {
+function bytesEq(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+async function reverifyBuriedOutpoint(client, chain, redeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash, label) {
   if (!isValidOutpoint(recordedOutpoint)) {
     throw new GateFailure(`${label}: no valid recorded funding outpoint to re-verify \u2014 rebuild before the irreversible action`, "rebuild");
   }
@@ -3318,11 +3323,17 @@ async function reverifyBuriedOutpoint(client, chain, redeemScript, recordedOutpo
       "rebuild"
     );
   }
+  if (expectedSecretHash.length !== 32 || !bytesEq(redeemScript.slice(3, 35), expectedSecretHash)) {
+    throw new GateFailure(`${label}: counterparty HTLC secretHash does not match the offer \u2014 the swap secret would not unlock this leg; fail closed`, "abort");
+  }
+  if (expectedRecipientPkh.length !== 20 || !bytesEq(redeemScript.slice(39, 59), expectedRecipientPkh)) {
+    throw new GateFailure(`${label}: counterparty HTLC recipient pkh does not match our claim key \u2014 we could never claim this leg; fail closed`, "abort");
+  }
   return { freshHeight, vReqConf, sameOutpoint, rawFundingTx };
 }
 async function assertRevealSafe(client, p) {
-  const { role, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats } = p;
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, "reveal");
+  const { role, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash } = p;
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash, "reveal");
   const chainNow = await getChainTimeSec(client);
   if (chainNow === null) {
     throw new GateFailure("reveal: could not read chain time to verify the responder refund timelock \u2014 not revealing the secret; retry", "rearm");
@@ -3371,8 +3382,8 @@ async function assertRevealSafe(client, p) {
   });
 }
 async function assertLegBuriedForFunding(client, p) {
-  const { theirChain, myChain, myChainIsEvm, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats } = p;
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, "fund");
+  const { theirChain, myChain, myChainIsEvm, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash } = p;
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash, "fund");
   const theirBlockSec = chainConfigs[theirChain]?.avgBlockTimeSec;
   const myBlockSec = chainConfigs[myChain]?.avgBlockTimeSec;
   if (!Number.isFinite(theirBlockSec) || (theirBlockSec ?? 0) <= 0 || !Number.isFinite(myBlockSec) || (myBlockSec ?? 0) <= 0) {
@@ -3998,7 +4009,9 @@ var SwapController = class _SwapController {
       recordedOutpoint: outpoint,
       counterpartyLocktime: locktime,
       // R-UNDERFUND-001: the responder claims leg X = offer.sendAmount — bind the gate so a dust-funded leg X is rejected.
-      expectedFundedValueSats: this.amountSats(this.record.offer.sendAmount, "verifyCounterpartyLegForFunding", "counterparty leg X")
+      expectedFundedValueSats: this.amountSats(this.record.offer.sendAmount, "verifyCounterpartyLegForFunding", "counterparty leg X"),
+      // R-CPRECIP-001: bind leg X's recipient pkh + secretHash so a substituted-recipient / substituted-secret leg is rejected.
+      ...await this.counterpartyLegBinds("verifyCounterpartyLegForFunding")
     });
   }
   /**
@@ -4022,7 +4035,9 @@ var SwapController = class _SwapController {
       counterpartyLocktime: locktime,
       // R-UNDERFUND-001: the initiator claims leg Y = offer.receiveAmount — bind the gate so a dust-funded leg Y is
       // rejected BEFORE the irreversible secret reveal (else we reveal S against a dust leg and recover only dust).
-      expectedFundedValueSats: this.amountSats(this.record.offer.receiveAmount, "verifyCounterpartyLegForReveal", "counterparty leg Y")
+      expectedFundedValueSats: this.amountSats(this.record.offer.receiveAmount, "verifyCounterpartyLegForReveal", "counterparty leg Y"),
+      // R-CPRECIP-001: bind leg Y's recipient pkh + secretHash so we never reveal S against a leg we cannot claim.
+      ...await this.counterpartyLegBinds("verifyCounterpartyLegForReveal")
     });
   }
   // ── revealAndClaim(auth) — the INITIATOR's single irreversible secret reveal (claim of leg Y) ────────────────
@@ -4125,7 +4140,9 @@ var SwapController = class _SwapController {
         counterpartyLocktime: locktime,
         // R-UNDERFUND-001: re-bind the funded-value check at the broadcast choke point too — never reveal S against a
         // counterparty leg Y that holds less than offer.receiveAmount.
-        expectedFundedValueSats: this.amountSats(this.record.offer.receiveAmount, "revealAndClaim", "counterparty leg Y")
+        expectedFundedValueSats: this.amountSats(this.record.offer.receiveAmount, "revealAndClaim", "counterparty leg Y"),
+        // R-CPRECIP-001: re-bind recipient pkh + secretHash at the broadcast choke point.
+        ...await this.counterpartyLegBinds("revealAndClaim")
       });
       this.status("revealAndClaim:committing");
       await this.deps.durable.commit([
@@ -4867,6 +4884,17 @@ var SwapController = class _SwapController {
   /** leg Y amount in sats (offer.receiveAmount = the RESPONDER's locked amount on receiveChain). Fail closed. */
   legYAmountSats() {
     return this.amountSats(this.record.offer.receiveAmount, "fundLegY", "leg Y");
+  }
+  /** R-CPRECIP-001: the {recipientPkh, secretHash} the COUNTERPARTY leg's redeemScript MUST commit for us to be able to
+   *  claim it — hash160 of OUR claim key on theirChain (exactly the pkh buildSecretClaim sweeps to) + the offer
+   *  secretHash. The UTXO gates bind the recorded counterparty script against these (parity with the EVM
+   *  isEvmLockAtSafeDepth {recipient, hashLock} binds), rejecting a substituted-recipient / substituted-secret leg. */
+  async counterpartyLegBinds(label) {
+    const sk = await this.deps.seedVault.signingKey(this.theirChain);
+    const expectedRecipientPkh = hash160(sk.publicKey);
+    const shHex = (this.record.offer.secretHash ?? "").toLowerCase().replace(/^0x/, "");
+    if (!HEX64.test(shHex)) throw new Error(`${label}: offer.secretHash is not a 32-byte hex hash \u2014 cannot bind the counterparty leg`);
+    return { expectedRecipientPkh, expectedSecretHash: hexToBytes(shHex) };
   }
   amountSats(raw, label, leg) {
     const n = typeof raw === "number" ? raw : Number(raw);

@@ -881,6 +881,8 @@ export class SwapController {
       counterpartyLocktime: locktime,
       // R-UNDERFUND-001: the responder claims leg X = offer.sendAmount — bind the gate so a dust-funded leg X is rejected.
       expectedFundedValueSats: this.amountSats(this.record.offer.sendAmount, 'verifyCounterpartyLegForFunding', 'counterparty leg X'),
+      // R-CPRECIP-001: bind leg X's recipient pkh + secretHash so a substituted-recipient / substituted-secret leg is rejected.
+      ...(await this.counterpartyLegBinds('verifyCounterpartyLegForFunding')),
     });
   }
 
@@ -906,6 +908,8 @@ export class SwapController {
       // R-UNDERFUND-001: the initiator claims leg Y = offer.receiveAmount — bind the gate so a dust-funded leg Y is
       // rejected BEFORE the irreversible secret reveal (else we reveal S against a dust leg and recover only dust).
       expectedFundedValueSats: this.amountSats(this.record.offer.receiveAmount, 'verifyCounterpartyLegForReveal', 'counterparty leg Y'),
+      // R-CPRECIP-001: bind leg Y's recipient pkh + secretHash so we never reveal S against a leg we cannot claim.
+      ...(await this.counterpartyLegBinds('verifyCounterpartyLegForReveal')),
     });
   }
 
@@ -1028,6 +1032,8 @@ export class SwapController {
         // R-UNDERFUND-001: re-bind the funded-value check at the broadcast choke point too — never reveal S against a
         // counterparty leg Y that holds less than offer.receiveAmount.
         expectedFundedValueSats: this.amountSats(this.record.offer.receiveAmount, 'revealAndClaim', 'counterparty leg Y'),
+        // R-CPRECIP-001: re-bind recipient pkh + secretHash at the broadcast choke point.
+        ...(await this.counterpartyLegBinds('revealAndClaim')),
       });
 
       // Durable-before-broadcast (fix #4): persist the claim tx + the winning-claim sentinel ATOMICALLY BEFORE the
@@ -1804,6 +1810,18 @@ export class SwapController {
   /** leg Y amount in sats (offer.receiveAmount = the RESPONDER's locked amount on receiveChain). Fail closed. */
   private legYAmountSats(): number {
     return this.amountSats(this.record.offer.receiveAmount, 'fundLegY', 'leg Y');
+  }
+
+  /** R-CPRECIP-001: the {recipientPkh, secretHash} the COUNTERPARTY leg's redeemScript MUST commit for us to be able to
+   *  claim it — hash160 of OUR claim key on theirChain (exactly the pkh buildSecretClaim sweeps to) + the offer
+   *  secretHash. The UTXO gates bind the recorded counterparty script against these (parity with the EVM
+   *  isEvmLockAtSafeDepth {recipient, hashLock} binds), rejecting a substituted-recipient / substituted-secret leg. */
+  private async counterpartyLegBinds(label: string): Promise<{ expectedRecipientPkh: Uint8Array; expectedSecretHash: Uint8Array }> {
+    const sk = await this.deps.seedVault.signingKey(this.theirChain);
+    const expectedRecipientPkh = hash160(sk.publicKey);
+    const shHex = (this.record.offer.secretHash ?? '').toLowerCase().replace(/^0x/, '');
+    if (!HEX64.test(shHex)) throw new Error(`${label}: offer.secretHash is not a 32-byte hex hash — cannot bind the counterparty leg`);
+    return { expectedRecipientPkh, expectedSecretHash: hexToBytes(shHex) };
   }
 
   private amountSats(raw: string | number, label: string, leg: string): number {

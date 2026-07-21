@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.1.12
+
+### Fixed (fund-safety — CRITICAL, audit round 8)
+- **R-CPRECIP-001** (CRITICAL — SDK-boundary): the UTXO counterparty-leg gates authenticated only that the funding
+  output is locked to the RECORDED redeemScript — they never bound the script's CONTENTS to our identity. A malicious
+  counterparty could fund a self-consistent HTLC naming THEIR OWN pkh as the recipient (or a different secretHash):
+  depth / exact-outpoint / CLTV / value all pass, we fund/reveal our own full leg, they claim it with S, and OUR claim
+  of that leg is script-invalid (needs their key / a different preimage) — deterministic whole-leg theft, no race or
+  reorg. The EVM sibling already binds both (`isEvmLockAtSafeDepth`: `lock.recipient===inv.recipient` +
+  `lock.hashLock===inv.hashLock`); only the UTXO gate was left trusting the recorded script's contents. (The live app
+  is NOT affected — it reconstructs the counterparty HTLC with our own pkh + the offer secretHash and accepts funding
+  only at that exact P2SH; this restores the same bind in the SDK, which reads the counterparty script verbatim.) Fix:
+  `FundGateParams`/`RevealSafeParams` gain `expectedRecipientPkh` (hash160 of our claim key on that leg's chain — exactly
+  what `buildSecretClaim` sweeps to) + `expectedSecretHash` (the offer secretHash); `reverifyBuriedOutpoint` parses the
+  script's recipient pkh (bytes 39..59) + secretHash (bytes 3..35) and fails closed (`abort`) on any mismatch. Enforced
+  in `verifyCounterpartyLegForFunding`, `verifyCounterpartyLegForReveal`, and the `revealAndClaim` broadcast-choke
+  re-mint. Regression tests added (a substituted-recipient and a substituted-secretHash leg both ABORT).
+
 ## 3.1.11
 
 ### Fixed (fund-safety — HIGH, audit round 7)

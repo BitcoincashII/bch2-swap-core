@@ -241,6 +241,12 @@ interface Buried {
   rawFundingTx: string;
 }
 
+function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 async function reverifyBuriedOutpoint(
   client: GateChainClient,
   chain: string,
@@ -248,6 +254,8 @@ async function reverifyBuriedOutpoint(
   recordedOutpoint: Outpoint,
   counterpartyLocktime: number,
   expectedFundedValueSats: number,
+  expectedRecipientPkh: Uint8Array,
+  expectedSecretHash: Uint8Array,
   label: string,
 ): Promise<Buried> {
   // R-REVEAL-FAILCLOSE: without a valid recorded funding outpoint we cannot re-verify → rebuild the claim.
@@ -329,6 +337,21 @@ async function reverifyBuriedOutpoint(
       'rebuild',
     );
   }
+  // R-CPRECIP-001: bind the counterparty redeemScript's RECIPIENT pkh + SECRETHASH to OUR claim identity + the offer
+  // secret. The EVM sibling binds both (isEvmLockAtSafeDepth: lock.recipient===inv.recipient + lock.hashLock===inv.hashLock)
+  // but the UTXO gate authenticated ONLY that the funding is locked to the RECORDED script, trusting its CONTENTS. A
+  // malicious counterparty could fund a self-consistent HTLC naming THEIR OWN pkh as recipient (or a different
+  // secretHash): depth / exact-outpoint / CLTV / value all pass, we fund our leg, they claim it with S, and OUR claim
+  // of this leg is script-invalid (needs their key / a different preimage) so we recover nothing — deterministic
+  // whole-leg theft, no race/reorg. parseHtlcCltv above already validated the fixed prefix (s[0..2]=OP_IF OP_SHA256
+  // push32, s[35..38]=OP_EQUALVERIFY OP_DUP OP_HASH160 push20, s[59]=OP_ELSE), so the slices below are well-formed.
+  // Fail closed ('abort' — a substituted recipient/secret is the counterparty's choice, not a transient condition).
+  if (expectedSecretHash.length !== 32 || !bytesEq(redeemScript.slice(3, 35), expectedSecretHash)) {
+    throw new GateFailure(`${label}: counterparty HTLC secretHash does not match the offer — the swap secret would not unlock this leg; fail closed`, 'abort');
+  }
+  if (expectedRecipientPkh.length !== 20 || !bytesEq(redeemScript.slice(39, 59), expectedRecipientPkh)) {
+    throw new GateFailure(`${label}: counterparty HTLC recipient pkh does not match our claim key — we could never claim this leg; fail closed`, 'abort');
+  }
   return { freshHeight, vReqConf, sameOutpoint, rawFundingTx };
 }
 
@@ -352,6 +375,12 @@ export interface RevealSafeParams {
    *  dust-funded counterparty leg would pass and we would reveal/commit our own full leg against it. For the initiator
    *  reveal this is offer.receiveAmount (leg Y); the responder-fund equivalent is offer.sendAmount (leg X). */
   expectedFundedValueSats: number;
+  /** R-CPRECIP-001: hash160 of OUR claim key on this leg's chain — the counterparty redeemScript's recipient pkh must
+   *  equal it, or the leg cannot be claimed by us (buildSecretClaim sweeps to exactly this pkh). */
+  expectedRecipientPkh: Uint8Array;
+  /** R-CPRECIP-001: the offer secretHash (32 bytes) — the counterparty redeemScript's committed hash must equal it, or
+   *  the swap secret would not unlock this leg. */
+  expectedSecretHash: Uint8Array;
 }
 
 /**
@@ -360,9 +389,9 @@ export interface RevealSafeParams {
  * fails closed rather than reveal the secret within the margin. THROWS + mints nothing on any doubt.
  */
 export async function assertRevealSafe(client: GateChainClient, p: RevealSafeParams): Promise<RevealAuthorization> {
-  const { role, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats } = p;
+  const { role, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash } = p;
 
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, 'reveal');
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash, 'reveal');
 
   // fix #9: the reveal is the anti-theft path — anchor to CHAIN time (never Date.now). Fail closed if unreadable.
   const chainNow = await getChainTimeSec(client);
@@ -454,6 +483,10 @@ export interface FundGateParams {
    *  funded value of leg X must be >= this, or a dust-funded leg X would pass and the responder would fund its full
    *  leg Y against it. */
   expectedFundedValueSats: number;
+  /** R-CPRECIP-001: hash160 of the responder's claim key on leg X's chain — leg X's recipient pkh must equal it. */
+  expectedRecipientPkh: Uint8Array;
+  /** R-CPRECIP-001: the offer secretHash (32 bytes) — leg X's committed hash must equal it. */
+  expectedSecretHash: Uint8Array;
 }
 
 /**
@@ -462,9 +495,9 @@ export interface FundGateParams {
  * margin, sized by the ÷K minSecondsUntilRefund conservatism. THROWS + mints nothing on any doubt.
  */
 export async function assertLegBuriedForFunding(client: GateChainClient, p: FundGateParams): Promise<FundProof> {
-  const { theirChain, myChain, myChainIsEvm, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats } = p;
+  const { theirChain, myChain, myChainIsEvm, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash } = p;
 
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, 'fund');
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash, 'fund');
 
   // R125: chain block-time configuration must be valid before any wall-clock timelock comparison.
   const theirBlockSec = chainConfigs[theirChain as Chain]?.avgBlockTimeSec;

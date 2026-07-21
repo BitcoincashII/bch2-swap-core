@@ -112,6 +112,12 @@ interface RevealSafeParams {
      *  dust-funded counterparty leg would pass and we would reveal/commit our own full leg against it. For the initiator
      *  reveal this is offer.receiveAmount (leg Y); the responder-fund equivalent is offer.sendAmount (leg X). */
     expectedFundedValueSats: number;
+    /** R-CPRECIP-001: hash160 of OUR claim key on this leg's chain — the counterparty redeemScript's recipient pkh must
+     *  equal it, or the leg cannot be claimed by us (buildSecretClaim sweeps to exactly this pkh). */
+    expectedRecipientPkh: Uint8Array;
+    /** R-CPRECIP-001: the offer secretHash (32 bytes) — the counterparty redeemScript's committed hash must equal it, or
+     *  the swap secret would not unlock this leg. */
+    expectedSecretHash: Uint8Array;
 }
 /**
  * R220 exact-outpoint re-check + R139/R175 authentication + R175 SPV depth + R258/R261 initiator-only 4h margin.
@@ -136,6 +142,10 @@ interface FundGateParams {
      *  funded value of leg X must be >= this, or a dust-funded leg X would pass and the responder would fund its full
      *  leg Y against it. */
     expectedFundedValueSats: number;
+    /** R-CPRECIP-001: hash160 of the responder's claim key on leg X's chain — leg X's recipient pkh must equal it. */
+    expectedRecipientPkh: Uint8Array;
+    /** R-CPRECIP-001: the offer secretHash (32 bytes) — leg X's committed hash must equal it. */
+    expectedSecretHash: Uint8Array;
 }
 /**
  * Burial re-verify (R220/R139/R175) of leg X + R125/R133 responder margin: the initiator leg must outlast the

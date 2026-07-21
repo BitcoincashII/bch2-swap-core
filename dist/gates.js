@@ -955,7 +955,12 @@ function parseHtlcCltv(redeemScript) {
   for (let i = 0; i < len; i++) n += s[pos + i] * 2 ** (8 * i);
   return n;
 }
-async function reverifyBuriedOutpoint(client, chain, redeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, label) {
+function bytesEq(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+async function reverifyBuriedOutpoint(client, chain, redeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash, label) {
   if (!isValidOutpoint(recordedOutpoint)) {
     throw new GateFailure(`${label}: no valid recorded funding outpoint to re-verify \u2014 rebuild before the irreversible action`, "rebuild");
   }
@@ -1028,11 +1033,17 @@ async function reverifyBuriedOutpoint(client, chain, redeemScript, recordedOutpo
       "rebuild"
     );
   }
+  if (expectedSecretHash.length !== 32 || !bytesEq(redeemScript.slice(3, 35), expectedSecretHash)) {
+    throw new GateFailure(`${label}: counterparty HTLC secretHash does not match the offer \u2014 the swap secret would not unlock this leg; fail closed`, "abort");
+  }
+  if (expectedRecipientPkh.length !== 20 || !bytesEq(redeemScript.slice(39, 59), expectedRecipientPkh)) {
+    throw new GateFailure(`${label}: counterparty HTLC recipient pkh does not match our claim key \u2014 we could never claim this leg; fail closed`, "abort");
+  }
   return { freshHeight, vReqConf, sameOutpoint, rawFundingTx };
 }
 async function assertRevealSafe(client, p) {
-  const { role, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats } = p;
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, "reveal");
+  const { role, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash } = p;
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash, "reveal");
   const chainNow = await getChainTimeSec(client);
   if (chainNow === null) {
     throw new GateFailure("reveal: could not read chain time to verify the responder refund timelock \u2014 not revealing the secret; retry", "rearm");
@@ -1081,8 +1092,8 @@ async function assertRevealSafe(client, p) {
   });
 }
 async function assertLegBuriedForFunding(client, p) {
-  const { theirChain, myChain, myChainIsEvm, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats } = p;
-  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, "fund");
+  const { theirChain, myChain, myChainIsEvm, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash } = p;
+  const buried = await reverifyBuriedOutpoint(client, theirChain, counterpartyRedeemScript, recordedOutpoint, counterpartyLocktime, expectedFundedValueSats, expectedRecipientPkh, expectedSecretHash, "fund");
   const theirBlockSec = chainConfigs[theirChain]?.avgBlockTimeSec;
   const myBlockSec = chainConfigs[myChain]?.avgBlockTimeSec;
   if (!Number.isFinite(theirBlockSec) || (theirBlockSec ?? 0) <= 0 || !Number.isFinite(myBlockSec) || (myBlockSec ?? 0) <= 0) {

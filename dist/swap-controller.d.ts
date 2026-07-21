@@ -443,6 +443,11 @@ declare class SwapController {
     private legXAmountSats;
     /** leg Y amount in sats (offer.receiveAmount = the RESPONDER's locked amount on receiveChain). Fail closed. */
     private legYAmountSats;
+    /** R-CPRECIP-001: the {recipientPkh, secretHash} the COUNTERPARTY leg's redeemScript MUST commit for us to be able to
+     *  claim it — hash160 of OUR claim key on theirChain (exactly the pkh buildSecretClaim sweeps to) + the offer
+     *  secretHash. The UTXO gates bind the recorded counterparty script against these (parity with the EVM
+     *  isEvmLockAtSafeDepth {recipient, hashLock} binds), rejecting a substituted-recipient / substituted-secret leg. */
+    private counterpartyLegBinds;
     private amountSats;
     /** A minimal SwapState for createInitiatorHTLC/createResponderHTLC (they read only offer.{send,receive}Chain +
      *  secretHash). `role` selects which leg-chain the builder reads; the address fields are UI-only here. */
