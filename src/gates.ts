@@ -355,9 +355,13 @@ export async function assertRevealSafe(client: GateChainClient, p: RevealSafePar
   if (role === 'initiator') {
     const cpLock = counterpartyLocktime;
     let respRemainingSec: number;
-    if (cpLock >= 1_500_000_000) {
-      // TIMESTAMP-CLTV branch (EVM-init / UTXO-resp): a unix-timestamp CLTV is enforced by block time, so the
-      // margin MUST anchor to chain time (a clock skewed BEHIND overstates remaining → reveal within the margin).
+    if (cpLock >= 500_000_000) {
+      // TIMESTAMP-CLTV branch: BIP65 OP_CHECKLOCKTIMEVERIFY interprets ANY locktime >= 500_000_000 as a unix
+      // TIMESTAMP (matches isHtlcRefundAvailable + isValidLocktime; the gap [5e8, 1.5e9) is not a valid height and
+      // must NOT be treated as one — a mis-classified past-timestamp CLTV would compute a huge block "remaining"
+      // and let us reveal against an ALREADY-refundable counterparty leg). A unix-timestamp CLTV is enforced by
+      // block time, so the margin MUST anchor to chain time (a clock skewed BEHIND overstates remaining → reveal
+      // within the margin).
       marginBasis = 'timestamp-cltv';
       // R-CHAINTIME-DEFLATE-001: anchor to the SPV/PoW-verified tip's nTime (deflate-protected), matching the
       // height branch's under-report guard. getChainTimeSec is an UNVERIFIED proxy header read; a proxy that

@@ -99,6 +99,23 @@ function htlcRedeem(locktime: number): Uint8Array {
 function p2shSpk(redeem: Uint8Array): string {
   return 'a914' + bytesToHex(hash160(redeem)) + '87';
 }
+// R-CLTV-DISCRIMINATOR: a RAW HTLC redeem script builder that does NOT validate the locktime — models a MALICIOUS
+// responder crafting a CLTV in the rejected gap [5e8, 1.5e9) that createHTLCRedeemScript/isValidLocktime forbid.
+function encodeScriptNumTest(n: number): Uint8Array {
+  if (n === 0) return new Uint8Array(0);
+  const bytes: number[] = [];
+  let v = Math.abs(n);
+  while (v > 0) { bytes.push(v & 0xff); v = Math.floor(v / 256); }
+  if (bytes[bytes.length - 1] & 0x80) bytes.push(0x00); // positive sign byte (n > 0 here)
+  return new Uint8Array(bytes);
+}
+function htlcRedeemRaw(locktime: number): Uint8Array {
+  const lb = encodeScriptNumTest(locktime); // lb.length < 76 -> a bare length-prefixed push (matches pushData)
+  return new Uint8Array([
+    0x63, 0xa8, 0x20, ...new Uint8Array(32).fill(0xa5), 0x88, 0x76, 0xa9, 0x14, ...new Uint8Array(20).fill(0x11),
+    0x67, lb.length, ...lb, 0xb1, 0x75, 0x76, 0xa9, 0x14, ...new Uint8Array(20).fill(0x22), 0x68, 0x88, 0xac,
+  ]);
+}
 /** A real HTLC redeem script with the given CLTV + a synthetic PoW chain funding its P2SH. */
 function buildHtlcChain(locktime: number, over: { tipAgeSec?: number; fundValue?: number } = {}) {
   const redeem = htlcRedeem(locktime);
@@ -248,6 +265,22 @@ describe('assertRevealSafe (initiator secret-reveal gate)', () => {
       role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
       recordedOutpoint: outpoint(ctx), counterpartyLocktime: tsLock,
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
+  });
+
+  it('FAIL-CLOSED (R-CLTV-DISCRIMINATOR): a counterparty CLTV in the gap [5e8, 1.5e9) is a PAST timestamp, not a height, and aborts', async () => {
+    // A malicious responder funds the counterparty leg with CLTV=600_000_000. BIP65 (and isHtlcRefundAvailable /
+    // isValidLocktime) treat >= 5e8 as a unix TIMESTAMP -> ~1989, already refundable. Before the fix the reveal gate's
+    // discriminator (>= 1.5e9) mis-routed it to the HEIGHT branch -> ~6e8-block "remaining" -> margin passed -> the
+    // initiator revealed against an already-refundable leg and lost both legs. Now it routes to the timestamp branch
+    // (negative remaining) and fails closed.
+    const GAP = 600_000_000;
+    const redeem = htlcRedeemRaw(GAP);
+    const gapCtx = buildSynthChain({ anchorHeight: 100000, count: 4, spacing: 600, bits: 0x20010000, fundSpkHex: p2shSpk(redeem) });
+    useChain(gapCtx);
+    await expect(assertRevealSafe(utxoClient(gapCtx), {
+      role: 'initiator', theirChain: CHAIN, counterpartyRedeemScript: redeem,
+      recordedOutpoint: outpoint(gapCtx), counterpartyLocktime: GAP,
+    })).rejects.toMatchObject({ name: 'GateFailure' }); // aborts; before the fix this MINTED a RevealAuthorization
   });
 
   it('FAIL-CLOSED: chain time unavailable (empty tip header) throws (rearm)', async () => {

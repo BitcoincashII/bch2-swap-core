@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.1.4
+
+### Fixed (fund-safety — HIGH, found by the no-stone-unturned gates review)
+- **R-CLTV-DISCRIMINATOR** (`gates.ts` assertRevealSafe): the reveal-margin height-vs-timestamp CLTV split used
+  `1_500_000_000`, but BIP65 OP_CHECKLOCKTIMEVERIFY (and this codebase's own `isHtlcRefundAvailable` /
+  `isValidLocktime`) treat ANY locktime `>= 500_000_000` as a unix TIMESTAMP. A malicious responder could fund the
+  counterparty leg with a CLTV in the gap `[5e8, 1.5e9)` — a past timestamp on-chain (already refundable) — which
+  the gate mis-routed to the HEIGHT branch, computing a huge block "remaining" that passed the 4h margin. The
+  initiator would then reveal the secret against an already-refundable leg → the responder refunds AND claims with
+  the leaked secret → initiator loses BOTH legs. The fund gate's `maxLock` upper bound already rejected this; the
+  reveal gate had only the lower-bound margin. Fixed: split at `500_000_000` to match BIP65 + the rest of the
+  codebase, so a gap CLTV routes to the timestamp branch and fails closed. Regression test added.
+
 ## 3.1.3
 
 ### Fixed (fund-safety — two HIGH, found by a no-stone-unturned audit)

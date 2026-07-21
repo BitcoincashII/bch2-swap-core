@@ -1032,7 +1032,7 @@ async function assertRevealSafe(client, p) {
   if (role === "initiator") {
     const cpLock = counterpartyLocktime;
     let respRemainingSec;
-    if (cpLock >= 15e8) {
+    if (cpLock >= 5e8) {
       marginBasis = "timestamp-cltv";
       let tsNow = chainNow;
       if (spvSupported(theirChain)) {
