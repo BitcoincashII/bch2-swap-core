@@ -985,6 +985,21 @@ describe('R-UTXO-REFUNDRACE-001 UTXO refund-race recovery', () => {
     expect(btc.broadcasts.length).toBe(1);                       // the dropped leg-X claim was re-broadcast (same rawTx)
     expect(ctrl.getState().resumeGate).toBe('claim-in-flight');
   });
+
+  it('R-UTXO-CLAIM-REDRIVE-001 (adopt path): claimWithKnownSecret RE-BROADCASTS a dropped claim on a DIRECT re-call (no resume)', async () => {
+    // Parity with revealAndClaimEvm's inline orphan re-check: a live process that re-calls claimWithKnownSecret without
+    // resume() must still self-heal a permanently-dropped claim, not just adopt the never-confirmed txid as success.
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:claimbroadcast:rrace-1', '1');
+    const claimTxid = 'dd'.repeat(32);
+    await durable.set('bch2swap:claimtx:rrace-1', JSON.stringify({ txid: claimTxid, rawTx: 'aabbccddeeff', spent: { tx_hash: FX.fundTxid, tx_pos: 0 } }));
+    const btc = fxClient(); // leg X: OUR claim txid absent from history, the HTLC UTXO still present (dropped claim)
+    const bch2 = new MockElectrumClient({ height: OWN_LOCKTIME + 5, utxos: legYUtxo, rawTxByTxid: { [OWN_FUND.txid]: OWN_FUND.rawTxHex }, history: [], broadcastTxid: '99'.repeat(32) });
+    const ctrl = new SwapController(respRaceRec({ phase: 'claimed' }), makeMultiDeps({ bch2, btc }, { durable }));
+    const { txid } = await ctrl.claimWithKnownSecret();
+    expect(txid).toBe(claimTxid);              // adopts the prior claim txid
+    expect(btc.broadcasts.length).toBe(1);     // AND re-broadcast the dropped claim (self-heal on the public path, no resume)
+  });
 });
 
 // ── reorg-safe finalizers — never wipe on doubt; wipe only at reorg-safe SPV depth (§9.6) ─────────────────────

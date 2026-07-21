@@ -1,5 +1,19 @@
 # Changelog
 
+## 3.1.16
+
+### Hardening (defense-in-depth — audit round 11, UTXO↔EVM parity)
+- **R-UTXO-CLAIM-REDRIVE-001 (adopt-path parity)**: the UTXO claim adopt (`revealAndClaim`/`claimWithKnownSecret` via
+  `priorClaimTxid`) returned a prior claim txid on the local `claimbroadcast` sentinel alone, with no on-chain re-check
+  — unlike the EVM sibling `revealAndClaimEvm`, which corroborates `getSwap.claimed` inline before adopting. If a UTXO
+  claim was PERMANENTLY dropped (mempool eviction / restrictive-policy reorg) and the host drove the public claim
+  methods without ever calling `resume()`, the adopt reported success without re-broadcasting. This was NOT a
+  reachable fund-loss — the shipped `resume()→rebroadcastClaimIfDropped` (v3.1.13) is the documented recovery path and
+  fully recovers the swap — but it left a UTXO↔EVM asymmetry. Now the adopt sites first call `rebroadcastClaimIfDropped`
+  (best-effort): a genuinely-dropped claim (absent from leg history + outpoint still unspent) is re-broadcast before
+  adopting, so the public claim path self-heals even without `resume()`. No-op when the claim is present/confirmed or
+  the outpoint is already spent. Round 11 was otherwise CLEAN (0 confirmed fund-safety defects across all dimensions).
+
 ## 3.1.15
 
 ### Fixed (fund-safety — HIGH, audit round 10 — fix #5 parity)

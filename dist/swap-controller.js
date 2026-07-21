@@ -3611,6 +3611,10 @@ var SwapController = class _SwapController {
     }
     const adopted = await this.priorClaimTxid(rec.id);
     if (adopted) {
+      try {
+        await this.rebroadcastClaimIfDropped();
+      } catch {
+      }
       this.record = { ...this.record, myClaimTxid: adopted };
       this.status("revealAndClaim:adopted");
       return { txid: adopted };
@@ -3779,6 +3783,10 @@ var SwapController = class _SwapController {
     }
     const adopted = await this.priorClaimTxid(rec.id);
     if (adopted) {
+      try {
+        await this.rebroadcastClaimIfDropped();
+      } catch {
+      }
       this.record = { ...this.record, myClaimTxid: adopted };
       this.status("claimWithKnownSecret:adopted");
       return { txid: adopted };

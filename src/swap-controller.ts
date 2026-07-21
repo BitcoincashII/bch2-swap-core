@@ -948,7 +948,14 @@ export class SwapController {
     // it is allowed even under the fix #10 auth block. This precedes the phase check so a 'claimed'/'completed' re-call
     // adopts instead of throwing on an unexpected phase.
     const adopted = await this.priorClaimTxid(rec.id);
-    if (adopted) { this.record = { ...this.record, myClaimTxid: adopted } as DurableSwapRecord; this.status('revealAndClaim:adopted'); return { txid: adopted }; }
+    if (adopted) {
+      // R-UTXO-CLAIM-REDRIVE-001 parity (mirrors revealAndClaimEvm's inline orphan re-check): before adopting on the
+      // local sentinel, self-heal a PERMANENTLY-DROPPED claim (absent from leg-Y history + the outpoint still unspent)
+      // by re-broadcasting the durable claim rawTx — so the public claim path recovers even without resume(). No-op if
+      // the claim is present/confirmed or the outpoint is already spent; S is public here, so a re-broadcast leaks nothing.
+      try { await this.rebroadcastClaimIfDropped(); } catch { /* best-effort — resume()'s re-drive still covers it */ }
+      this.record = { ...this.record, myClaimTxid: adopted } as DurableSwapRecord; this.status('revealAndClaim:adopted'); return { txid: adopted };
+    }
     // FIX #10: a resume whose myHTLC authentication was not DEFINITIVE 'ok' must NOT authorize an irreversible reveal.
     this.assertIrreversibleAllowed('revealAndClaim');
     // R181 claim<->refund cross-guard: never reveal the secret while a refund of the shared HTLC is in flight.
@@ -1143,7 +1150,13 @@ export class SwapController {
     // Step-5 deferred idempotent-adopt: a post-confirmation / crash-resume re-call returns the PRIOR claim txid rather
     // than rebuilding against a now-spent leg-X UTXO. Precedes the phase check so a 'completed' re-call adopts.
     const adopted = await this.priorClaimTxid(rec.id);
-    if (adopted) { this.record = { ...this.record, myClaimTxid: adopted } as DurableSwapRecord; this.status('claimWithKnownSecret:adopted'); return { txid: adopted }; }
+    if (adopted) {
+      // R-UTXO-CLAIM-REDRIVE-001 parity: self-heal a permanently-dropped leg-X claim (absent from history + outpoint
+      // still unspent) by re-broadcasting the durable claim rawTx before adopting — so the public claim path recovers
+      // without resume() (mirrors revealAndClaimEvm). No-op if the claim is present or the outpoint is spent.
+      try { await this.rebroadcastClaimIfDropped(); } catch { /* best-effort — resume()'s re-drive still covers it */ }
+      this.record = { ...this.record, myClaimTxid: adopted } as DurableSwapRecord; this.status('claimWithKnownSecret:adopted'); return { txid: adopted };
+    }
     // FIX #10: a resume whose myHTLC authentication was not DEFINITIVE 'ok' must NOT authorize an irreversible claim.
     this.assertIrreversibleAllowed('claimWithKnownSecret');
     if (rec.phase !== 'claimed' && rec.phase !== 'responder_funded') {
