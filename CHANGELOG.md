@@ -1,5 +1,25 @@
 # Changelog
 
+## 3.1.0
+
+### Added (integration surface, P2)
+- **`examples/electrum-node-client.mjs`** — a Node.js ElectrumX transport (TLS) that satisfies `SwapChainClient`;
+  the untrusted chain transport a Node bot injects via `chainClientFor`.
+- **`scripts/verify-live-spv.mjs`** (`npm run verify:live`) — runs the SDK's SPV verifier against **live BCH2
+  mainnet** (real ASERT header chain from the checkpoint + a real Merkle proof; fails closed on a fabricated
+  txid). Read-only. Closes the read-side real-data validation gap the unit tests (synthetic PoW) leave open.
+- **`examples/reference-bot.mjs`** — a runnable maker/taker reference bot driving the `SwapController` over the
+  live transport + order book, with refund/resume fallbacks. Double-gated (`BCH2_SWAP_MNEMONIC` + `BCH2_SWAP_LIVE=1`)
+  so it connects/broadcasts nothing until an operator explicitly opts in; test on testnet first.
+- **`examples/WALLET-INTEGRATION.md`** — the signing-boundary guide: the wallet keeps the seed, injects a narrow
+  `SeedVault` capability (optionally per-signature approval), and must not undermine the §9 fund-safety invariants.
+
+### Known (tracked)
+- The `CentralizedOrderBook` client's `proposal` type is stale vs the live proxy (parses at runtime; the types
+  mislead). The reference bot maps order→offer with a documented, not-yet-proxy-verified bridge. Fix tracked for
+  a follow-up.
+
+
 ## 3.0.1
 
 ### Fixed (fund-safety audit)
