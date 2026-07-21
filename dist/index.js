@@ -2456,9 +2456,20 @@ async function recoverLockFromTx(htlcAddr, txHash, provider, scan) {
     return { kind: "safe" };
   };
   const results = await Promise.all(leaves.map((p) => checkOneLeaf(p).catch(() => ({ kind: "blocked" }))));
-  const found = results.find((r) => r.kind === "locked");
-  if (found) return found;
-  if (results.some((r) => r.kind === "blocked")) return { kind: "blocked" };
+  const lockedCandidates = results.filter((r) => r.kind === "locked");
+  for (const cand of lockedCandidates) {
+    let s;
+    try {
+      s = await getSwap(htlcAddr, cand.swapId, provider);
+    } catch {
+      continue;
+    }
+    const okHash = !scan?.hashLock || !!s && String(s.hashLock).toLowerCase() === scan.hashLock.toLowerCase();
+    const okRcpt = !scan?.recipient || !!s && String(s.recipient).toLowerCase() === scan.recipient.toLowerCase();
+    const okAmt = scan?.minAmount === void 0 || !!s && s.amount >= scan.minAmount;
+    if (s && okHash && okRcpt && okAmt) return cand;
+  }
+  if (lockedCandidates.length > 0 || results.some((r) => r.kind === "blocked")) return { kind: "blocked" };
   return { kind: "safe" };
 }
 function authenticatedLockedSwapId(htlc, htlcAddr, hashLock, logs) {

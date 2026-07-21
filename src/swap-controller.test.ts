@@ -1382,7 +1382,10 @@ describe('SwapController.lockEvm() — fix #2 re-mint FRESH at the choke point',
     // Stage the on-chain Locked(id, initiator, recipient, token, amount, hashLock, timeLock) event the prior lock emitted.
     const lockedLog = htlcInterface.encodeEventLog('Locked', [EVM_SWAP_ID, EVM_RECIP, EVM_CP_ADDR, ZERO_ADDRESS, EVM_AMT, EVM_HASHLOCK, 1_900_000_000n]);
     const receipt = { status: 1, blockNumber: 10, logs: [{ address: BASE_HTLC, topics: lockedLog.topics, data: lockedLog.data }] };
-    const baseQuorum = new MockEvmProvider({ leafProviders: [new MockEvmProvider({ receipt }), new MockEvmProvider({ receipt })], blockNumber: 5000 });
+    // R-RECOVER-SWAPID-QUORUM-001: the adopted swapId is now cross-verified via getSwap over the quorum — a REAL prior
+    // lock exists on-chain, so the quorum getSwap(EVM_SWAP_ID) returns its struct (matching our hashLock/recipient/amount).
+    const onChainSwap = makeSwap({ initiator: EVM_RECIP, recipient: EVM_CP_ADDR, token: ZERO_ADDRESS, amount: EVM_AMT, hashLock: EVM_HASHLOCK, timeLock: 1_900_000_000n });
+    const baseQuorum = new MockEvmProvider({ swap: onChainSwap, leafProviders: [new MockEvmProvider({ receipt }), new MockEvmProvider({ receipt })], blockNumber: 5000 });
     const durable = new InMemoryDurableStore();
     await durable.set('bch2swap:lockpending:evmfund-1', LOCK_TX_HASH); // a prior lock is in-flight (broadcast; funded-key not yet written)
     await durable.set('bch2swap:evmlocktx:evmfund-1', LOCK_TX_HASH);
@@ -1399,6 +1402,30 @@ describe('SwapController.lockEvm() — fix #2 re-mint FRESH at the choke point',
     expect((await durable.get('bch2swap:funded:evmfund-1'))?.toLowerCase()).toBe(EVM_SWAP_ID.toLowerCase()); // funded sentinel set
     expect(await durable.get('bch2swap:lockpending:evmfund-1')).toBeNull(); // pending marker cleared on adopt
     expect(ctrl.getState().phase).toBe('responder_funded');
+  });
+
+  it('R-RECOVER-SWAPID-QUORUM-001: a lying leaf fabricating a Locked event with an attacker-chosen swapId is REJECTED (getSwap over the quorum cannot corroborate a non-existent id)', async () => {
+    const LOCK_TX_HASH = '0x' + 'ef'.repeat(32);
+    const BASE_HTLC = getEvmConfig(84532)!.htlcAddress;
+    const ATTACKER_SWAP_ID = '0x' + 'ba'.repeat(32); // an id the attacker chose; NOT on-chain (real id = keccak(sender,nonce))
+    // A HOSTILE leaf fabricates a Locked log carrying OUR public hashLock/recipient/amount but the attacker's swapId.
+    const forgedLog = htlcInterface.encodeEventLog('Locked', [ATTACKER_SWAP_ID, EVM_RECIP, EVM_CP_ADDR, ZERO_ADDRESS, EVM_AMT, EVM_HASHLOCK, 1_900_000_000n]);
+    const hostileReceipt = { status: 1, blockNumber: 10, logs: [{ address: BASE_HTLC, topics: forgedLog.topics, data: forgedLog.data }] };
+    // baseQuorum has NO on-chain swap → getSwap(ATTACKER_SWAP_ID) returns null (initiator==0) → uncorroborated.
+    const baseQuorum = new MockEvmProvider({ swap: null, leafProviders: [new MockEvmProvider({ receipt: hostileReceipt }), new MockEvmProvider({})], blockNumber: 5000 });
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:lockpending:evmfund-1', LOCK_TX_HASH);
+    await durable.set('bch2swap:evmlocktx:evmfund-1', LOCK_TX_HASH);
+    const goodProof = await gateAssertEvmLegBuriedForFunding(P(evmLegProvider()), FUND_GATE_PARAMS);
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP); // throw-mode: a re-lock would broadcast + throw
+    const ctrl = new SwapController(evmFundRecord(), makeEvmDeps({
+      evmProviderFor: (chain) => P(chain === 'base' ? baseQuorum : evmLegProvider()),
+      evmSignerFor: () => SG(signer),
+      durable,
+    }));
+    // Uncorroborated 'locked' → recovery is 'blocked' → lockEvm refuses to re-lock AND never adopts the fabricated id.
+    await expect(ctrl.lockEvm(goodProof)).rejects.toThrow(/refusing to re-lock|indeterminate|pending/i);
+    expect(await durable.get('bch2swap:funded:evmfund-1')).toBeNull(); // the attacker's swapId was NEVER committed
   });
 
   it('(fix #1 compile) lockEvm STRUCTURALLY requires a FundProof — no-arg / RevealAuthorization do not compile', () => {

@@ -421,9 +421,25 @@ export async function recoverLockFromTx(
   // Query EVERY leaf and combine CONSERVATIVELY: any leaf that found the lock wins (adopt it); else any
   // uncertain/errored leaf -> 'blocked' (fail-closed); 'safe' ONLY when EVERY leaf independently confirmed not-found.
   const results = await Promise.all(leaves.map(p => checkOneLeaf(p).catch(() => ({ kind: 'blocked' as const }))));
-  const found = results.find((r): r is { kind: 'locked'; swapId: string } => r.kind === 'locked');
-  if (found) return found;
-  if (results.some(r => r.kind === 'blocked')) return { kind: 'blocked' };
+  // R-RECOVER-SWAPID-QUORUM-001: the swapId is the ONE Locked-event field checkOneLeaf cannot authenticate — the
+  // on-chain id is keccak256(msg.sender, nonce), NOT derivable from our public hashLock/recipient/amount — yet it is
+  // the value committed to fundedKey / myEvmSwapId and keyed on by the claim-watch + refund. checkOneLeaf reads a RAW
+  // leaf (no Merkle proof of receipt.logs), so a single lying/MITM leaf can fabricate a Locked log carrying our PUBLIC
+  // params but an ATTACKER-chosen swapId (exactly the attack R239's comment describes; R239 only bound the public
+  // fields). Adopt a candidate swapId ONLY if QUORUM-corroborated by getSwap over the aggregating `provider`: a
+  // fabricated id does not exist on-chain (initiator==0 / timeLock==0 → getSwap returns null), and one leaf cannot
+  // make the quorum read agree. Iterate every candidate so a hostile leaf ordered first cannot mask the real lock.
+  const lockedCandidates = results.filter((r): r is { kind: 'locked'; swapId: string } => r.kind === 'locked');
+  for (const cand of lockedCandidates) {
+    let s: SwapData | null;
+    try { s = await getSwap(htlcAddr, cand.swapId, provider); } catch { continue; } // quorum read failed → try next
+    const okHash = !scan?.hashLock || (!!s && String(s.hashLock).toLowerCase() === scan.hashLock.toLowerCase());
+    const okRcpt = !scan?.recipient || (!!s && String(s.recipient).toLowerCase() === scan.recipient.toLowerCase());
+    const okAmt = scan?.minAmount === undefined || (!!s && s.amount >= scan.minAmount);
+    if (s && okHash && okRcpt && okAmt) return cand; // this id exists on-chain (quorum-corroborated) with our params
+  }
+  // an uncorroborated 'locked' (only a lying leaf claimed it), or any uncertain/errored leaf → fail closed (retry).
+  if (lockedCandidates.length > 0 || results.some(r => r.kind === 'blocked')) return { kind: 'blocked' };
   return { kind: 'safe' }; // unanimous not-found across all leaves → no funds locked → re-lock is safe
 }
 

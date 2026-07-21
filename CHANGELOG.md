@@ -1,5 +1,21 @@
 # Changelog
 
+## 3.1.6
+
+### Fixed (fund-safety — HIGH, audit round 4)
+- **R-RECOVER-SWAPID-QUORUM-001** (`evm-client.ts` recoverLockFromTx): the EVM lock-recovery path adopted the
+  `swapId` from a SINGLE quorum leaf. The R239 receipt check authenticated only the PUBLIC Locked-event fields
+  (hashLock / recipient / amount) — not the `swapId` it commits (the on-chain id is keccak256(sender, nonce),
+  unconstrained by those public fields) — and `getTransactionReceipt` does no Merkle verification of `receipt.logs`.
+  So a single lying/MITM RPC leaf could fabricate a Locked log with our public params but an attacker-chosen swapId;
+  the `'locked'` verdict took the first single leaf (unlike `'safe'`, which is unanimity-gated). On a reload during
+  the pending-lock window the responder would commit `fundedKey`/`myEvmSwapId` = the wrong id, then its claim-watch
+  filters the wrong indexed id (never recovers the secret) and refund targets a nonexistent swap → owed leg lost,
+  silently. Fix: cross-verify each candidate swapId via `getSwap` over the aggregating (quorum) provider — a
+  fabricated id does not exist on-chain (getSwap → null), so it is skipped; adopt only a quorum-corroborated id, and
+  iterate all candidates so a hostile leaf ordered first cannot mask the real lock. Regression tests added (adopt a
+  corroborated id; reject a fabricated one).
+
 ## 3.1.5
 
 ### Fixed (fund-safety — audit round 3)
