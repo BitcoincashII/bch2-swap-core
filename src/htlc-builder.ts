@@ -796,7 +796,18 @@ export async function buildHTLCRefundTx(
  * Parse order: sig → pubkey → secret (32 bytes). Stop after reading secret;
  * the next byte is 0x51 (OP_1, claim-branch selector), not consumed here. (R104-HTLC-001)
  */
-export function extractSecretFromClaimTx(rawTxHex: string, expectedSecretHash?: Uint8Array | string): Uint8Array | null {
+export function extractSecretFromClaimTx(rawTxHex: string, expectedSecretHash: Uint8Array | string): Uint8Array | null {
+  // R-EXTRACTSECRET-REQHASH-001: the committed secretHash is REQUIRED. Without it there is no discriminator between
+  // a decoy 32-byte push placed on an earlier input and the real preimage, so an omitted hash could hand back
+  // attacker-chosen bytes as "the secret" (a footgun on the published SDK surface). Parse it ONCE and fail closed if
+  // it is missing/malformed — a preimage is only ever returned when it hashes to this value.
+  let _expectedHashBytes: Uint8Array | null;
+  if (typeof expectedSecretHash === 'string') {
+    try { _expectedHashBytes = hexToBytes(expectedSecretHash.replace(/^0x/, '')); } catch { _expectedHashBytes = null; }
+  } else {
+    _expectedHashBytes = expectedSecretHash ?? null;
+  }
+  if (!_expectedHashBytes || _expectedHashBytes.length === 0) return null;
   if (!rawTxHex || rawTxHex.length < 20) return null; // too short to be a valid tx
 
   let tx: Uint8Array;
@@ -909,26 +920,16 @@ export function extractSecretFromClaimTx(rawTxHex: string, expectedSecretHash?: 
     if (secretLen !== 32) continue;
     if (pos + 32 > scriptSig.length) continue;
     const secret = scriptSig.slice(pos, pos + 32);
-    // R22-HTLC-001: validate extracted secret against known secretHash to defend against
-    // scriptSig with extra pushdata that shifts the read position to attacker-chosen bytes.
-    if (expectedSecretHash) {
-      // R94-HTLC-001: wrap hexToBytes in try/catch — odd-length or non-hex expectedSecretHash throws,
-      // violating the function's null-on-failure contract and skipping remaining inputs in the tx.
-      let expectedBytes: Uint8Array | null;
-      if (typeof expectedSecretHash === 'string') {
-        try { expectedBytes = hexToBytes(expectedSecretHash.replace(/^0x/, '')); } catch { expectedBytes = null; }
-      } else {
-        expectedBytes = expectedSecretHash;
-      }
-      if (!expectedBytes) continue; // malformed expectedSecretHash — skip hash validation, reject match
-      const actualHash = sha256(secret);
-      if (actualHash.length !== expectedBytes.length) continue;
-      let hashMatch = true;
-      for (let k = 0; k < actualHash.length; k++) {
-        if (actualHash[k] !== expectedBytes[k]) { hashMatch = false; break; }
-      }
-      if (!hashMatch) continue;
+    // R22-HTLC-001 / R-EXTRACTSECRET-REQHASH-001: validate the extracted secret against the REQUIRED committed
+    // secretHash (parsed once at the top) — defends against a scriptSig with extra/decoy pushdata that shifts the
+    // read position to attacker-chosen bytes. Only a preimage that hashes to the committed value is ever returned.
+    const actualHash = sha256(secret);
+    if (actualHash.length !== _expectedHashBytes.length) continue;
+    let hashMatch = true;
+    for (let k = 0; k < actualHash.length; k++) {
+      if (actualHash[k] !== _expectedHashBytes[k]) { hashMatch = false; break; }
     }
+    if (!hashMatch) continue;
     return secret;
     // Note: next byte after secret is 0x51 (OP_1, claim-branch selector) — not parsed here.
   }

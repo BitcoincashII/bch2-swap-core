@@ -270,7 +270,7 @@ export async function claimHTLC(
  * Returns null if the transaction is not a valid HTLC claim.
  * R23-HTLC-001: pass expectedSecretHash so the validation added in R22 is actually exercised.
  */
-export function extractSecret(rawTxHex: string, expectedSecretHash?: Uint8Array | string): Uint8Array | null {
+export function extractSecret(rawTxHex: string, expectedSecretHash: Uint8Array | string): Uint8Array | null {
   return extractSecretFromClaimTx(rawTxHex, expectedSecretHash);
 }
 

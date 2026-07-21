@@ -1,5 +1,36 @@
 # Changelog
 
+## 3.1.7
+
+### Fixed (fund-safety — audit round 5)
+- **R-EVMTOKEN-ALLOWLIST-001** (HIGH — SDK-boundary): the SDK never validated an offer's EVM token against the
+  trusted config allowlist. `offer.evmInfo.tokenAddress`/`tokenSymbol` come from the untrusted order-book box, and
+  the on-chain finality gate (`isEvmLockAtSafeDepth`) binds `lock.token === inv.token` where `inv.token` IS that same
+  offer field — a self-referential check. `myEvmToken`/`counterpartyEvmToken` are set only in tests, so in production
+  the token always fell through to the offer field, validated by `ethers.isAddress()` alone. A maker who both
+  advertises AND locks an attacker-chosen token (worthless self-minted with a spoofed 'USDC' symbol, or a
+  fee-on-transfer / rebasing / ERC-777 token) passed the gate; a bot author relying on this SDK as their fund-safety
+  boundary could be induced to fund a real leg against a leg that pays back a worthless/short token. (The live app is
+  NOT affected — its `offer-ingest.ts` already excludes any offer whose `tokenAddress` isn't the canonical address for
+  its claimed symbol; this ports that same canonical symbol↔address binding into the SDK.) Fix: new
+  `assertCanonicalEvmToken(chainId, tokenAddress, tokenSymbol)` (evm-config.ts), enforced in BOTH `counterpartyEvmLeg`
+  (verify/claim side) and `lockEvm` (lock side) — native (zero-addr) allowed only when the chain has a configured
+  native entry; a non-native token must carry a symbol AND equal `EVM_CHAINS[chainId].tokens[symbol].address`. This
+  rejects both an unrecognized token and the "advertise USDC, lock USDT" mismatch. Regression tests added.
+- **R-EVMTOKEN-ALLOWANCE-001** (MEDIUM — fails closed, no fund loss): `SwapController.lockEvm` dropped the ERC-20
+  `approve` step the UI's `handleEvmFund` performs, so `lockTokens` → `transferFrom` reverted on every fresh-signer
+  stablecoin lock — the SDK's documented USDC/USDT EVM path never worked, and it emitted a misleading "allowance
+  race, retry" message for a permanently-zero allowance. Fix: call the already-hardened `ensureAllowance` before the
+  non-native lock, placed BEFORE the `lockpending` recovery sentinel so an approve failure leaves a clean retry state
+  (never wedged as "lock in-flight").
+- **R-EXTRACTSECRET-REQHASH-001** (LOW — API footgun on the published surface): `extractSecretFromClaimTx` /
+  `extractSecret` treated the committed `expectedSecretHash` as OPTIONAL. Omitting it made the parser return the first
+  structurally-valid 32-byte push, which an attacker can control via a decoy input carrying a trailing 32-byte push —
+  handing back attacker-chosen bytes as "the secret". The sole in-tree caller always passes the hash (product safe),
+  but the export is a footgun for bot authors. Fix: the hash is now REQUIRED — parsed once up front (fail closed if
+  missing/malformed) and validated on every candidate, so only a preimage that hashes to the committed value is ever
+  returned. Regression added (omitting the hash returns null; a decoy push is skipped when the hash is passed).
+
 ## 3.1.6
 
 ### Fixed (fund-safety — HIGH, audit round 4)

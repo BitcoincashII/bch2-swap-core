@@ -281,6 +281,47 @@ export function isNativeToken(tokenAddress: string): boolean {
 }
 
 /**
+ * R-EVMTOKEN-ALLOWLIST-001: Assert an offer's EVM token is one of the canonically-configured tokens for its chain,
+ * binding the CLAIMED symbol to the CANONICAL address. Returns the canonical address on success; THROWS otherwise.
+ *
+ * WHY THIS IS LOAD-BEARING: the offer's `evmInfo.tokenAddress`/`tokenSymbol` come from the untrusted order-book box,
+ * and the on-chain finality gate (isEvmLockAtSafeDepth) binds `lock.token === inv.token` where `inv.token` IS that
+ * same offer field — a self-referential check that a maker who both advertises AND locks an attacker-chosen token
+ * (worthless / fee-on-transfer / rebasing / ERC-777) trivially satisfies. This allowlist is the ONLY place that
+ * authenticates the token identity against locally-trusted config, mirroring the live app's offer-ingest canonical
+ * check (offer-ingest.ts R30-BROWSE-003 / R31-FE-002). Without it, a taker can be induced to fund a real leg against
+ * a leg that pays back a worthless/short token.
+ *
+ *  - Native (zero-address): allowed only when the chain carries a configured native token entry; returns the
+ *    zero-address as-is (the symbol is resolved from local config elsewhere, not trusted from the offer).
+ *  - Non-native: REQUIRES a claimed symbol AND that the address equals the canonical address configured for that
+ *    symbol on that chain — this rejects both an unrecognized token and the "advertise USDC, lock USDT" swap.
+ */
+export function assertCanonicalEvmToken(evmChainId: EvmChainId, tokenAddress: string, tokenSymbol?: string): string {
+  const cfg = EVM_CHAINS[evmChainId];
+  if (!cfg) throw new Error(`EVM token check: chain ${evmChainId} is not configured — refusing`);
+  const tokens = cfg.tokens ?? {};
+  const addrLc = (tokenAddress ?? '').toLowerCase();
+  if (addrLc === NATIVE_ETH_ADDRESS.toLowerCase()) {
+    const nativeLocal = Object.values(tokens).find((t) => t.address.toLowerCase() === NATIVE_ETH_ADDRESS.toLowerCase());
+    if (!nativeLocal) throw new Error(`EVM token check: chain ${evmChainId} has no configured native token — refusing`);
+    return NATIVE_ETH_ADDRESS;
+  }
+  const claimed = typeof tokenSymbol === 'string' ? tokenSymbol.toUpperCase().slice(0, 10) : '';
+  if (!claimed) {
+    throw new Error(`EVM token check: non-native token ${tokenAddress} on chain ${evmChainId} carries no symbol to bind — refusing`);
+  }
+  const canonical = tokens[claimed]?.address;
+  if (!canonical || addrLc !== canonical.toLowerCase()) {
+    throw new Error(
+      `EVM token check: token ${tokenAddress} (claimed '${claimed}') is not the canonical ${claimed} on chain ${evmChainId} — ` +
+      `refusing an unrecognized / non-allowlisted token`,
+    );
+  }
+  return canonical;
+}
+
+/**
  * Validate that every chain in SUPPORTED_EVM_CHAINS has a deployed HTLC contract address.
  * Call this at startup to catch misconfiguration before any swaps are attempted.
  */

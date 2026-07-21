@@ -608,6 +608,17 @@ async function buildHTLCClaimTx(utxo, redeemScript, secret, recipientPrivateKey,
   );
 }
 function extractSecretFromClaimTx(rawTxHex, expectedSecretHash) {
+  let _expectedHashBytes;
+  if (typeof expectedSecretHash === "string") {
+    try {
+      _expectedHashBytes = hexToBytes(expectedSecretHash.replace(/^0x/, ""));
+    } catch {
+      _expectedHashBytes = null;
+    }
+  } else {
+    _expectedHashBytes = expectedSecretHash ?? null;
+  }
+  if (!_expectedHashBytes || _expectedHashBytes.length === 0) return null;
   if (!rawTxHex || rawTxHex.length < 20) return null;
   let tx;
   try {
@@ -677,29 +688,16 @@ function extractSecretFromClaimTx(rawTxHex, expectedSecretHash) {
     if (secretLen !== 32) continue;
     if (pos + 32 > scriptSig.length) continue;
     const secret = scriptSig.slice(pos, pos + 32);
-    if (expectedSecretHash) {
-      let expectedBytes;
-      if (typeof expectedSecretHash === "string") {
-        try {
-          expectedBytes = hexToBytes(expectedSecretHash.replace(/^0x/, ""));
-        } catch {
-          expectedBytes = null;
-        }
-      } else {
-        expectedBytes = expectedSecretHash;
+    const actualHash = sha256(secret);
+    if (actualHash.length !== _expectedHashBytes.length) continue;
+    let hashMatch = true;
+    for (let k = 0; k < actualHash.length; k++) {
+      if (actualHash[k] !== _expectedHashBytes[k]) {
+        hashMatch = false;
+        break;
       }
-      if (!expectedBytes) continue;
-      const actualHash = sha256(secret);
-      if (actualHash.length !== expectedBytes.length) continue;
-      let hashMatch = true;
-      for (let k = 0; k < actualHash.length; k++) {
-        if (actualHash[k] !== expectedBytes[k]) {
-          hashMatch = false;
-          break;
-        }
-      }
-      if (!hashMatch) continue;
     }
+    if (!hashMatch) continue;
     return secret;
   }
   return null;

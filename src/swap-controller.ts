@@ -56,8 +56,8 @@ import type { HTLCDetails, HTLCParams, Utxo } from './swap-types';
 // ── EVM parity (P1b step 7) — the injected quorum>=2 read provider + Node ethers.Wallet signer seams, plus the
 // proven on-chain handlers (lockETH/lockTokens/claimSwap/refundSwap/getSwap) and the EVM leg config lookups. ──
 import { ethers, type Provider, type Signer } from 'ethers';
-import { lockETH, lockTokens, claimSwap, refundSwap, getSwap, recoverLockFromTx, HTLC_ABI } from './evm-client';
-import { getEvmConfig, isNativeToken, evmLockSecondsForRole, NATIVE_ETH_ADDRESS, type EvmChainId, type EvmChainConfig } from './evm-config';
+import { lockETH, lockTokens, claimSwap, refundSwap, getSwap, recoverLockFromTx, ensureAllowance, HTLC_ABI } from './evm-client';
+import { getEvmConfig, isNativeToken, evmLockSecondsForRole, assertCanonicalEvmToken, NATIVE_ETH_ADDRESS, type EvmChainId, type EvmChainConfig } from './evm-config';
 
 /** The zero address (native-asset sentinel), lowercased — an HTLC config still pinned to it means "not deployed". */
 const NATIVE_ETH_ADDR = NATIVE_ETH_ADDRESS.toLowerCase();
@@ -2029,6 +2029,11 @@ export class SwapController {
     if (!ethers.isAddress(recipient)) throw new Error(`${label}: our EVM address (myEvmAddress) is missing/invalid — cannot bind the claim recipient`);
     const token = (this.record.counterpartyEvmToken ?? this.record.offer.evmInfo?.tokenAddress ?? '');
     if (!ethers.isAddress(token)) throw new Error(`${label}: counterparty EVM token address is missing/invalid — cannot bind the token`);
+    // R-EVMTOKEN-ALLOWLIST-001: bind the offer token to a canonically-configured token (symbol<->address). The
+    // finality gate below binds lock.token === this token, but this token is the UNTRUSTED offer field, so without
+    // an allowlist a maker could advertise+lock an attacker-chosen token (worthless / fee-on-transfer / rebasing /
+    // ERC-777) and pass the self-referential gate — leaving us to fund a real leg against a leg that pays back junk.
+    assertCanonicalEvmToken(evmChainId, token, this.record.offer.evmInfo?.tokenSymbol);
     // What WE receive from the counterparty leg: initiator claims leg Y (offer.receiveAmount); responder claims leg X
     // (offer.sendAmount). The gate binds `minAmount` so we never reveal/commit against an under-funded lock.
     const rawAmt = this.role === 'initiator' ? this.record.offer.receiveAmount : this.record.offer.sendAmount;
@@ -2140,6 +2145,9 @@ export class SwapController {
     if (!ethers.isAddress(recipient)) throw new Error('lockEvm: counterparty EVM recipient address (counterpartyEvmAddress) is missing/invalid — cannot lock');
     const token = (rec.myEvmToken ?? rec.offer.evmInfo?.tokenAddress ?? '');
     if (!ethers.isAddress(token)) throw new Error('lockEvm: our EVM token address is missing/invalid — cannot lock');
+    // R-EVMTOKEN-ALLOWLIST-001: our own lock must also be a canonically-configured token — never lock (or let the
+    // counterparty be told we locked) an unrecognized/scam token. Symbol<->address bound against local config.
+    assertCanonicalEvmToken(evmChainId, token, rec.offer.evmInfo?.tokenSymbol);
     // OUR leg amount: initiator locks offer.sendAmount, responder locks offer.receiveAmount (base units).
     const amount = this.evmAmountBaseUnits(this.role === 'initiator' ? rec.offer.sendAmount : rec.offer.receiveAmount, 'lockEvm');
     const hashLock = this.hashLock0x('lockEvm');
@@ -2194,6 +2202,19 @@ export class SwapController {
       // FIX #2: re-mint the counterparty-leg burial FRESH at the broadcast choke point. A throw ABORTS the lock.
       this.status('lockEvm:reverifying-counterparty');
       await this.reverifyCounterpartyLegForFunding();
+
+      // R-EVMTOKEN-ALLOWANCE-001: an ERC-20 lock's transferFrom needs a prior allowance; this ported lockEvm dropped
+      // the approve step the UI's handleEvmFund performs, so every fresh-signer stablecoin lock reverted (fails
+      // closed, no fund loss, but the documented USDC/USDT path never worked through the SDK). Establish it here —
+      // BEFORE the lockpending recovery sentinel is written below — so an approve failure throws with NO sentinel set
+      // and the retry stays clean (placing it after the sentinel would wedge a failed approve as 'lock in-flight').
+      // Native skips (msg.value carries the funds). ensureAllowance is self-hardened (owner==signer, spender==canonical
+      // HTLC, undeployed-chain reject, timeouts) and broadcasts only a prerequisite approve that moves no HTLC funds.
+      if (!isNativeToken(token)) {
+        this.status('lockEvm:ensuring-allowance');
+        const owner = await signer.getAddress();
+        await ensureAllowance(token, owner, htlcAddr, amount, signer, this.evmProvider(this.myChain), evmChainId);
+      }
 
       // The unix-timestamp timeLock is derived from the FRESH on-chain block clock (never the local clock) + the
       // role's wall-clock-normalized lock duration (evmLockSecondsForRole) — mirrors handleEvmFund ~1416-1460.

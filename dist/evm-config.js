@@ -213,6 +213,28 @@ function evmLockSecondsForRole(cfg, role) {
 function isNativeToken(tokenAddress) {
   return tokenAddress === NATIVE_ETH_ADDRESS;
 }
+function assertCanonicalEvmToken(evmChainId, tokenAddress, tokenSymbol) {
+  const cfg = EVM_CHAINS[evmChainId];
+  if (!cfg) throw new Error(`EVM token check: chain ${evmChainId} is not configured \u2014 refusing`);
+  const tokens = cfg.tokens ?? {};
+  const addrLc = (tokenAddress ?? "").toLowerCase();
+  if (addrLc === NATIVE_ETH_ADDRESS.toLowerCase()) {
+    const nativeLocal = Object.values(tokens).find((t) => t.address.toLowerCase() === NATIVE_ETH_ADDRESS.toLowerCase());
+    if (!nativeLocal) throw new Error(`EVM token check: chain ${evmChainId} has no configured native token \u2014 refusing`);
+    return NATIVE_ETH_ADDRESS;
+  }
+  const claimed = typeof tokenSymbol === "string" ? tokenSymbol.toUpperCase().slice(0, 10) : "";
+  if (!claimed) {
+    throw new Error(`EVM token check: non-native token ${tokenAddress} on chain ${evmChainId} carries no symbol to bind \u2014 refusing`);
+  }
+  const canonical = tokens[claimed]?.address;
+  if (!canonical || addrLc !== canonical.toLowerCase()) {
+    throw new Error(
+      `EVM token check: token ${tokenAddress} (claimed '${claimed}') is not the canonical ${claimed} on chain ${evmChainId} \u2014 refusing an unrecognized / non-allowlisted token`
+    );
+  }
+  return canonical;
+}
 function validateEvmConfigs() {
   for (const [chainId, cfg] of Object.entries(EVM_CHAINS)) {
     if (!cfg) continue;
@@ -286,4 +308,4 @@ function validateEvmConfigs() {
   }
 }
 
-export { EVM_CHAINS, EVM_CLAIM_MARGIN_SEC, INITIATOR_LOCK_SEC, NATIVE_ETH_ADDRESS, RESPONDER_LOCK_SEC, SUPPORTED_EVM_CHAINS, evmLockBlocksForRole, evmLockSecondsForRole, getEvmConfig, getEvmTokenSymbols, isNativeToken, validateEvmConfigs };
+export { EVM_CHAINS, EVM_CLAIM_MARGIN_SEC, INITIATOR_LOCK_SEC, NATIVE_ETH_ADDRESS, RESPONDER_LOCK_SEC, SUPPORTED_EVM_CHAINS, assertCanonicalEvmToken, evmLockBlocksForRole, evmLockSecondsForRole, getEvmConfig, getEvmTokenSymbols, isNativeToken, validateEvmConfigs };

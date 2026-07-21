@@ -284,7 +284,7 @@ describe('buildHTLCClaimTx', () => {
       'bch2',
     );
 
-    const extracted = extractSecretFromClaimTx(result.rawTx);
+    const extracted = extractSecretFromClaimTx(result.rawTx, bytesToHex(SECRET_HASH));
     expect(extracted).not.toBeNull();
     expect(bytesToHex(extracted!)).toBe(bytesToHex(SECRET));
   });
@@ -301,11 +301,11 @@ describe('buildHTLCClaimTx', () => {
     );
     const legacy = result.rawTx;
     const segwit = legacy.slice(0, 8) + '0001' + legacy.slice(8); // nVersion(4B=8hex) || marker || flag || rest
-    const extracted = extractSecretFromClaimTx(segwit);
+    const extracted = extractSecretFromClaimTx(segwit, bytesToHex(SECRET_HASH));
     expect(extracted).not.toBeNull();
     expect(bytesToHex(extracted!)).toBe(bytesToHex(SECRET));
     // a marker (0x00) NOT followed by a valid flag (0x01) is malformed → null (not a false-positive extraction)
-    expect(extractSecretFromClaimTx(legacy.slice(0, 8) + '0002' + legacy.slice(8))).toBeNull();
+    expect(extractSecretFromClaimTx(legacy.slice(0, 8) + '0002' + legacy.slice(8), bytesToHex(SECRET_HASH))).toBeNull();
   });
 });
 
@@ -349,7 +349,7 @@ describe('buildHTLCRefundTx', () => {
       'bch2',
     );
 
-    const extracted = extractSecretFromClaimTx(result.rawTx);
+    const extracted = extractSecretFromClaimTx(result.rawTx, bytesToHex(SECRET_HASH));
     // Refund tx has OP_FALSE (0x00) where secret would be, so extractSecret should return null
     expect(extracted).toBeNull();
   });
@@ -499,11 +499,11 @@ describe('parseAuthenticatedOutput (PROXY-TRUST-UTXO-VALUE-001)', () => {
 
 describe('extractSecretFromClaimTx', () => {
   it('returns null for empty input', () => {
-    expect(extractSecretFromClaimTx('')).toBeNull();
+    expect(extractSecretFromClaimTx('', bytesToHex(SECRET_HASH))).toBeNull();
   });
 
   it('returns null for garbage data', () => {
-    expect(extractSecretFromClaimTx('deadbeef')).toBeNull();
+    expect(extractSecretFromClaimTx('deadbeef', bytesToHex(SECRET_HASH))).toBeNull();
   });
 });
 
@@ -985,7 +985,7 @@ describe('extractSecretFromClaimTx round-trip + hash binding', () => {
 
   it('extracts the secret from a real claim tx and it hashes to the HTLC secretHash', async () => {
     const { rawTx } = await buildHTLCClaimTx(utxo, redeemScript, SECRET, privKey, pubKey, destSpk, 'bch2');
-    const got = extractSecretFromClaimTx(rawTx);
+    const got = extractSecretFromClaimTx(rawTx, bytesToHex(SECRET_HASH));
     expect(got).not.toBeNull();
     expect(bytesToHex(got!)).toBe(bytesToHex(SECRET));
     expect(bytesToHex(sha256(got!))).toBe(bytesToHex(SECRET_HASH));
@@ -1023,13 +1023,35 @@ describe('extractSecretFromClaimTx round-trip + hash binding', () => {
     const dummyInput = '11'.repeat(32) + '00000000' + '6b' + dummyScriptSig + 'ffffffff'; // txid|vout|len(0x6b=107)|ss|nSeq
     // rawTx = version(8 hex) | inputCount '01' (chars 8-9) | input... ; bump the count to 02 and inject the dummy first.
     const twoInputTx = rawTx.slice(0, 8) + '02' + dummyInput + rawTx.slice(10);
-    const got = extractSecretFromClaimTx(twoInputTx);
+    const got = extractSecretFromClaimTx(twoInputTx, bytesToHex(SECRET_HASH));
     expect(got).not.toBeNull();
     expect(bytesToHex(got!)).toBe(bytesToHex(SECRET));
     // hash-binding still holds when the match is found at position 1 (not just position 0)
     const bound = extractSecretFromClaimTx(twoInputTx, bytesToHex(SECRET_HASH));
     expect(bound).not.toBeNull();
     expect(bytesToHex(bound!)).toBe(bytesToHex(SECRET));
+  });
+
+  // R-EXTRACTSECRET-REQHASH-001: the committed secretHash is REQUIRED. Two regressions:
+  //  (a) a caller that OMITS the hash gets null — never an unauthenticated (attacker-influenceable) preimage.
+  //  (b) even with a malicious DECOY input carrying a trailing 32-byte junk push in the secret slot (the case the
+  //      old no-hash mode returned as "the secret"), passing the real hash skips the decoy and recovers the REAL
+  //      preimage from the later HTLC input.
+  it('REQUIRES the committed hash — omitting it returns null; a decoy 32-byte push is skipped when the hash is passed', async () => {
+    const { rawTx } = await buildHTLCClaimTx(utxo, redeemScript, SECRET, privKey, pubKey, destSpk, 'bch2');
+    // Malicious decoy input[0]: push72(sig-shaped) || push33(pubkey-shaped) || push32(JUNK) — the trailing 32-byte
+    // push lands in the secret slot, so the old no-hash parser would early-return these junk bytes as "the secret".
+    const decoyScriptSig = '48' + 'aa'.repeat(72) + '21' + '02' + 'bb'.repeat(32) + '20' + 'cc'.repeat(32); // push72||push33||push32(junk)
+    const decoyLenHex = (decoyScriptSig.length / 2).toString(16).padStart(2, '0'); // 140 bytes = 0x8c (< 0xfd, single-byte varint)
+    const decoyInput = '11'.repeat(32) + '00000000' + decoyLenHex + decoyScriptSig + 'ffffffff';
+    const twoInputTx = rawTx.slice(0, 8) + '02' + decoyInput + rawTx.slice(10);
+    // (a) no hash → fail closed (never hands back the junk push)
+    expect(extractSecretFromClaimTx(twoInputTx, '')).toBeNull();
+    expect(extractSecretFromClaimTx(twoInputTx, undefined as unknown as string)).toBeNull();
+    // (b) with the real hash → the decoy junk (sha256 != hashLock) is skipped and the real secret is recovered
+    const got = extractSecretFromClaimTx(twoInputTx, bytesToHex(SECRET_HASH));
+    expect(got).not.toBeNull();
+    expect(bytesToHex(got!)).toBe(bytesToHex(SECRET));
   });
 });
 

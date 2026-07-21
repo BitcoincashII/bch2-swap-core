@@ -98,7 +98,7 @@ declare function buildHTLCRefundTx(utxo: Utxo, redeemScript: Uint8Array, locktim
  * Parse order: sig → pubkey → secret (32 bytes). Stop after reading secret;
  * the next byte is 0x51 (OP_1, claim-branch selector), not consumed here. (R104-HTLC-001)
  */
-declare function extractSecretFromClaimTx(rawTxHex: string, expectedSecretHash?: Uint8Array | string): Uint8Array | null;
+declare function extractSecretFromClaimTx(rawTxHex: string, expectedSecretHash: Uint8Array | string): Uint8Array | null;
 /**
  * Parse and SELF-AUTHENTICATE a funding transaction, returning the value and
  * scriptPubKey of a specific output (PROXY-TRUST-UTXO-VALUE-001).

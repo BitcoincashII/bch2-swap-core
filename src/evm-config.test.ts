@@ -17,6 +17,8 @@ import {
   EVM_CLAIM_MARGIN_SEC,
   SUPPORTED_EVM_CHAINS,
   validateEvmConfigs,
+  assertCanonicalEvmToken,
+  NATIVE_ETH_ADDRESS,
 } from './evm-config';
 import { LOCKTIME_BLOCKS, chainConfigs } from './chain-config';
 import type { EvmChainId } from './swap-types';
@@ -123,5 +125,46 @@ describe('R138b-XCHAIN-001 unix-timestamp lock basis', () => {
     expect(arb.tokens.USDT.address.toLowerCase()).toBe('0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9');
     // both bounds MUST equal the deployed contracts' MIN/MAX_LOCK_SECONDS (6h / 48h).
     for (const cfg of [poly, arb]) { expect(cfg.minLockSeconds).toBe(21_600); expect(cfg.maxLockSeconds).toBe(172_800); }
+  });
+});
+
+// ============================================================================
+// R-EVMTOKEN-ALLOWLIST-001: an offer's EVM token is untrusted (order-book box). The on-chain finality gate binds
+// lock.token === the offer's own token field (self-referential), so the allowlist is the ONLY authenticator of the
+// token identity against locally-trusted config. These pin: (1) a canonical token+symbol is accepted; (2) a scam /
+// unrecognized address is rejected; (3) the "advertise USDC, lock USDT" symbol/address mismatch is rejected; (4)
+// native (zero-address) is accepted; (5) a non-native token with no symbol is rejected.
+// ============================================================================
+describe('R-EVMTOKEN-ALLOWLIST-001 assertCanonicalEvmToken', () => {
+  const POLY = 137 as EvmChainId;
+  const USDC = '0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359';
+  const USDT = '0xc2132D05D31c914a87C6611C10748AEb04B58e8F';
+
+  it('accepts a canonical token bound to its symbol (case-insensitive)', () => {
+    expect(assertCanonicalEvmToken(POLY, USDC, 'USDC').toLowerCase()).toBe(USDC.toLowerCase());
+    expect(assertCanonicalEvmToken(POLY, USDC.toLowerCase(), 'usdc').toLowerCase()).toBe(USDC.toLowerCase());
+    expect(assertCanonicalEvmToken(POLY, USDT, 'USDT').toLowerCase()).toBe(USDT.toLowerCase());
+  });
+
+  it('accepts native (zero-address) on a chain with a configured native token', () => {
+    expect(assertCanonicalEvmToken(POLY, NATIVE_ETH_ADDRESS, 'POL')).toBe(NATIVE_ETH_ADDRESS);
+    // native is allowed regardless of the (offer-supplied) symbol — resolved from local config, not the offer
+    expect(assertCanonicalEvmToken(POLY, NATIVE_ETH_ADDRESS)).toBe(NATIVE_ETH_ADDRESS);
+  });
+
+  it('REJECTS a scam / unrecognized token address even with a plausible symbol', () => {
+    const scam = '0x000000000000000000000000000000000000dEaD';
+    expect(() => assertCanonicalEvmToken(POLY, scam, 'USDC')).toThrow();
+  });
+
+  it('REJECTS the "advertise USDC, lock USDT" symbol/address mismatch', () => {
+    // real USDT address but claimed as USDC — canonical(USDC) !== USDT address → reject
+    expect(() => assertCanonicalEvmToken(POLY, USDT, 'USDC')).toThrow();
+    expect(() => assertCanonicalEvmToken(POLY, USDC, 'USDT')).toThrow();
+  });
+
+  it('REJECTS a non-native token that carries no symbol to bind', () => {
+    expect(() => assertCanonicalEvmToken(POLY, USDC)).toThrow();
+    expect(() => assertCanonicalEvmToken(POLY, USDC, '')).toThrow();
   });
 });

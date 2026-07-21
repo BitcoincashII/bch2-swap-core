@@ -98,6 +98,6 @@ declare function claimHTLC(utxo: Utxo, redeemScript: Uint8Array, secret: Uint8Ar
  * Returns null if the transaction is not a valid HTLC claim.
  * R23-HTLC-001: pass expectedSecretHash so the validation added in R22 is actually exercised.
  */
-declare function extractSecret(rawTxHex: string, expectedSecretHash?: Uint8Array | string): Uint8Array | null;
+declare function extractSecret(rawTxHex: string, expectedSecretHash: Uint8Array | string): Uint8Array | null;
 
 export { claimHTLC, createInitiatorHTLC, createResponderHTLC, extractSecret, fundHTLC, generateSecret, getHTLCScripthash, hashSecret, verifyAndAuthenticateP2pkhInput, verifyAndAuthenticateUtxo };

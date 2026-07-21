@@ -759,6 +759,17 @@ async function buildHTLCRefundTx(utxo, redeemScript, locktime, refundPrivateKey,
   );
 }
 function extractSecretFromClaimTx(rawTxHex, expectedSecretHash) {
+  let _expectedHashBytes;
+  if (typeof expectedSecretHash === "string") {
+    try {
+      _expectedHashBytes = hexToBytes(expectedSecretHash.replace(/^0x/, ""));
+    } catch {
+      _expectedHashBytes = null;
+    }
+  } else {
+    _expectedHashBytes = expectedSecretHash ?? null;
+  }
+  if (!_expectedHashBytes || _expectedHashBytes.length === 0) return null;
   if (!rawTxHex || rawTxHex.length < 20) return null;
   let tx;
   try {
@@ -828,29 +839,16 @@ function extractSecretFromClaimTx(rawTxHex, expectedSecretHash) {
     if (secretLen !== 32) continue;
     if (pos + 32 > scriptSig.length) continue;
     const secret = scriptSig.slice(pos, pos + 32);
-    if (expectedSecretHash) {
-      let expectedBytes;
-      if (typeof expectedSecretHash === "string") {
-        try {
-          expectedBytes = hexToBytes(expectedSecretHash.replace(/^0x/, ""));
-        } catch {
-          expectedBytes = null;
-        }
-      } else {
-        expectedBytes = expectedSecretHash;
+    const actualHash = sha256(secret);
+    if (actualHash.length !== _expectedHashBytes.length) continue;
+    let hashMatch = true;
+    for (let k = 0; k < actualHash.length; k++) {
+      if (actualHash[k] !== _expectedHashBytes[k]) {
+        hashMatch = false;
+        break;
       }
-      if (!expectedBytes) continue;
-      const actualHash = sha256(secret);
-      if (actualHash.length !== expectedBytes.length) continue;
-      let hashMatch = true;
-      for (let k = 0; k < actualHash.length; k++) {
-        if (actualHash[k] !== expectedBytes[k]) {
-          hashMatch = false;
-          break;
-        }
-      }
-      if (!hashMatch) continue;
     }
+    if (!hashMatch) continue;
     return secret;
   }
   return null;
@@ -2362,6 +2360,28 @@ function evmLockSecondsForRole(cfg, role) {
 function isNativeToken(tokenAddress) {
   return tokenAddress === NATIVE_ETH_ADDRESS;
 }
+function assertCanonicalEvmToken(evmChainId, tokenAddress, tokenSymbol) {
+  const cfg = EVM_CHAINS[evmChainId];
+  if (!cfg) throw new Error(`EVM token check: chain ${evmChainId} is not configured \u2014 refusing`);
+  const tokens = cfg.tokens ?? {};
+  const addrLc = (tokenAddress ?? "").toLowerCase();
+  if (addrLc === NATIVE_ETH_ADDRESS.toLowerCase()) {
+    const nativeLocal = Object.values(tokens).find((t) => t.address.toLowerCase() === NATIVE_ETH_ADDRESS.toLowerCase());
+    if (!nativeLocal) throw new Error(`EVM token check: chain ${evmChainId} has no configured native token \u2014 refusing`);
+    return NATIVE_ETH_ADDRESS;
+  }
+  const claimed = typeof tokenSymbol === "string" ? tokenSymbol.toUpperCase().slice(0, 10) : "";
+  if (!claimed) {
+    throw new Error(`EVM token check: non-native token ${tokenAddress} on chain ${evmChainId} carries no symbol to bind \u2014 refusing`);
+  }
+  const canonical = tokens[claimed]?.address;
+  if (!canonical || addrLc !== canonical.toLowerCase()) {
+    throw new Error(
+      `EVM token check: token ${tokenAddress} (claimed '${claimed}') is not the canonical ${claimed} on chain ${evmChainId} \u2014 refusing an unrecognized / non-allowlisted token`
+    );
+  }
+  return canonical;
+}
 var HTLC_ABI = [
   "function lock(address recipient, address token, uint256 amount, bytes32 hashLock, uint256 timeLock) payable returns (bytes32)",
   "function claim(bytes32 id, bytes32 secret)",
@@ -2376,6 +2396,62 @@ var ERC20_ABI = [
   "function allowance(address owner, address spender) view returns (uint256)",
   "function approve(address spender, uint256 amount) returns (bool)"
 ];
+async function approveToken(tokenAddr, spenderAddr, amount, signer) {
+  const approveKey = `${tokenAddr.toLowerCase()}:${spenderAddr.toLowerCase()}`;
+  if (_approveInFlight.has(approveKey)) throw new Error("[approveToken] Approval already in flight for this token/spender pair");
+  _approveInFlight.add(approveKey);
+  try {
+    const token = new Contract(tokenAddr, ERC20_ABI, signer);
+    const wouldSucceed = await Promise.race([
+      token.approve.staticCall(spenderAddr, amount),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("approve staticCall timed out")), 15e3))
+    ]);
+    if (!wouldSucceed) {
+      throw new Error("Token approval would return false (non-standard ERC-20). Swap cannot proceed.");
+    }
+    const tx = await Promise.race([
+      token.approve(spenderAddr, amount, { gasLimit: 150000n }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("approve() submission timed out")), 3e4))
+    ]);
+    let approveWaitId;
+    const approveTimeoutReject = new Promise((_, rej) => {
+      approveWaitId = setTimeout(() => rej(new Error("approveToken: tx.wait() timed out after 120s \u2014 tx may still confirm")), 12e4);
+    });
+    const receipt = await Promise.race([tx.wait(), approveTimeoutReject]).finally(() => clearTimeout(approveWaitId));
+    if (!receipt || receipt.status !== 1) throw new Error("Token approval transaction reverted");
+  } finally {
+    _approveInFlight.delete(approveKey);
+  }
+}
+async function ensureAllowance(tokenAddr, ownerAddr, spenderAddr, amount, signer, provider, chainId) {
+  const signerAddr = (await Promise.race([
+    signer.getAddress(),
+    new Promise((_, rej) => setTimeout(() => rej(new Error("getAddress timed out")), 15e3))
+  ])).toLowerCase();
+  if (ownerAddr.toLowerCase() !== signerAddr) {
+    throw new Error(
+      `ensureAllowance: ownerAddr ${ownerAddr} does not match signer address ${signerAddr} \u2014 stale address after account switch?`
+    );
+  }
+  const htlcConfig = getEvmConfig(chainId);
+  if (!htlcConfig) throw new Error(`No EVM config for chainId ${chainId}`);
+  if (spenderAddr.toLowerCase() !== htlcConfig.htlcAddress.toLowerCase()) {
+    throw new Error(`ensureAllowance: spenderAddr ${spenderAddr} does not match HTLC contract ${htlcConfig.htlcAddress} for chainId ${chainId}`);
+  }
+  const ZERO_ADDR = "0x0000000000000000000000000000000000000000";
+  if (htlcConfig.htlcAddress.toLowerCase() === ZERO_ADDR) {
+    throw new Error(`ensureAllowance: HTLC contract not deployed on chainId ${chainId} (address is zero)`);
+  }
+  const token = new Contract(tokenAddr, ERC20_ABI, provider);
+  const allowance = await Promise.race([
+    token.allowance(ownerAddr, spenderAddr),
+    new Promise((_, rej) => setTimeout(() => rej(new Error("allowance check timed out")), 15e3))
+  ]);
+  if (allowance < amount) {
+    await approveToken(tokenAddr, spenderAddr, amount, signer);
+  }
+}
+var _approveInFlight = /* @__PURE__ */ new Set();
 var _activeLocks = /* @__PURE__ */ new Set();
 async function bumpedTxFees(signer) {
   try {
@@ -4976,6 +5052,7 @@ var SwapController = class _SwapController {
     if (!ethers.isAddress(recipient)) throw new Error(`${label}: our EVM address (myEvmAddress) is missing/invalid \u2014 cannot bind the claim recipient`);
     const token = this.record.counterpartyEvmToken ?? this.record.offer.evmInfo?.tokenAddress ?? "";
     if (!ethers.isAddress(token)) throw new Error(`${label}: counterparty EVM token address is missing/invalid \u2014 cannot bind the token`);
+    assertCanonicalEvmToken(evmChainId, token, this.record.offer.evmInfo?.tokenSymbol);
     const rawAmt = this.role === "initiator" ? this.record.offer.receiveAmount : this.record.offer.sendAmount;
     const minAmount = this.evmAmountBaseUnits(rawAmt, label);
     return {
@@ -5085,6 +5162,7 @@ var SwapController = class _SwapController {
     if (!ethers.isAddress(recipient)) throw new Error("lockEvm: counterparty EVM recipient address (counterpartyEvmAddress) is missing/invalid \u2014 cannot lock");
     const token = rec.myEvmToken ?? rec.offer.evmInfo?.tokenAddress ?? "";
     if (!ethers.isAddress(token)) throw new Error("lockEvm: our EVM token address is missing/invalid \u2014 cannot lock");
+    assertCanonicalEvmToken(evmChainId, token, rec.offer.evmInfo?.tokenSymbol);
     const amount = this.evmAmountBaseUnits(this.role === "initiator" ? rec.offer.sendAmount : rec.offer.receiveAmount, "lockEvm");
     const hashLock = this.hashLock0x("lockEvm");
     const signer = this.evmSigner(this.myChain);
@@ -5131,6 +5209,11 @@ var SwapController = class _SwapController {
       }
       this.status("lockEvm:reverifying-counterparty");
       await this.reverifyCounterpartyLegForFunding();
+      if (!isNativeToken(token)) {
+        this.status("lockEvm:ensuring-allowance");
+        const owner = await signer.getAddress();
+        await ensureAllowance(token, owner, htlcAddr, amount, signer, this.evmProvider(this.myChain), evmChainId);
+      }
       let nowSec = null;
       try {
         const b = await signer.provider?.getBlock("latest");
