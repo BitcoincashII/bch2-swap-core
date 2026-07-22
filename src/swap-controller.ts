@@ -2408,7 +2408,16 @@ export class SwapController {
       const swapIdOk = !!corroborated
         && String(corroborated.hashLock).toLowerCase() === hashLock.toLowerCase()
         && String(corroborated.recipient).toLowerCase() === recipient.toLowerCase()
-        && corroborated.amount >= amount;
+        && corroborated.amount >= amount
+        // R-EVMLOCKID-TOKEN-001: BIND THE TOKEN (mirror isEvmLockAtSafeDepth / R280-H2). swapId = keccak256(sender,nonce)
+        // does NOT include the token, so an attacker can pre-position a WORTHLESS-token lock carrying the SAME public
+        // hashLock/recipient/amount → a DISTINCT on-chain swapId the honest quorum truthfully confirms. Without this
+        // bind, a MITM signer RPC injecting that fake id passes corroboration → poisons myEvmSwapId → durably blinds the
+        // secret watch (all Claimed scans key on it) → forfeited leg. getSwap normalizes to EIP-55 → compare case-insensitively.
+        && String(corroborated.token).toLowerCase() === String(token).toLowerCase()
+        // R-EVMLOCKID-TOKEN-001: BIND THE EXACT refund timeLock we set (chain-clock-derived at 2369). Only OUR real lock
+        // matches it — an attacker cannot predict our nowSec — so this also defeats a same-token decoy grief lock.
+        && corroborated.timeLock === timeLock;
       if (!swapIdOk) {
         throw new Error('lockEvm: the locked swapId is not quorum-corroborated (a lying signer RPC may have injected a fabricated id) — not committing funded; retry/resume re-derives the real id via the quorum recovery path');
       }

@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.1.22
+
+### Fixed (fund-safety — HIGH, audit round 23 — completes R-EVMLOCKID-QUORUM-001)
+- **R-EVMLOCKID-TOKEN-001**: the v3.1.21 own-lock swapId corroboration bound `hashLock`/`recipient`/`amount` but NOT
+  the token. On-chain `swapId = keccak256(sender, nonce)` does not include the token, so an attacker can pre-position a
+  WORTHLESS-token lock carrying our SAME public hashLock/recipient/amount — a DISTINCT swapId that genuinely exists
+  on-chain. A MITM signer RPC injecting that fake id's `Locked` log then passed corroboration (the honest quorum
+  truthfully confirms the fake swap; token was never checked), poisoning `myEvmSwapId` and durably blinding the secret
+  watch (all `Claimed` scans, incl. the deep sweep, key on it) → forfeited leg. The sibling `isEvmLockAtSafeDepth`
+  (R280-H2) already binds token+timeLock — an inconsistent omission. Fix: the corroboration now ALSO requires
+  `getSwap.token` to equal our leg token (case-insensitive; native = ZeroAddress) AND `getSwap.timeLock` to equal the
+  exact chain-clock-derived timeLock we set (only our real lock matches it — an attacker cannot predict our `nowSec` —
+  which also defeats a same-token decoy). New e2e test: a worthless-token collision lock is fail-closed with no
+  `fundedKey` committed.
+
 ## 3.1.21
 
 ### Fixed (fund-safety — HIGH, audit round 21 — sibling of the lockBlock-poison class)

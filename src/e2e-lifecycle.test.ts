@@ -846,4 +846,76 @@ describe('e2e — HAPPY UTXO<->EVM (cross-chain secret flow through the on-chain
     expect(responder.getState().phase).not.toBe('responder_funded');            // never advanced on the poisoned id
     expect(lyingSigner.broadcastCount).toBe(1);                                  // the lock DID broadcast (the poison is caught AFTER, before commit)
   });
+
+  it('R-EVMLOCKID-TOKEN-001: a lying signer adopting a WORTHLESS-TOKEN collision lock (same public hashLock/recipient/amount, different token) is fail-closed by the token bind', async () => {
+    const offer = makeOffer({ sendChain: 'btc', receiveChain: 'base', sendAmount: 100_000, receiveAmount: EVM_AMT_STR });
+
+    const initDurable = new InMemoryDurableStore();
+    const initFund = new SwapController(
+      { id: offer.id, role: 'initiator', offer, phase: 'taken', counterpartyClaimPkh: bytesToHex(PKH_R) },
+      buildDeps({ clients: { btc: btcCli }, seedVault: new PartySeedVault(KSS, PRIV_I, PUB_I), durable: initDurable }),
+    );
+    await initFund.prepare();
+    await initFund.fundLegX();
+    btc.mineEmptyBlocks(1);
+    const legXHtlc = initFund.getState().myHTLC!;
+    const legXOutpoint = observeOutpoint(btc, legXHtlc);
+
+    // swapId = keccak256(sender,nonce) does NOT include the token, so an attacker PRE-POSITIONS a worthless-token lock
+    // carrying our SAME public hashLock/recipient/amount → a DISTINCT swapId that genuinely exists on-chain. Seed it.
+    const FAKE_ID = '0x' + 'fa'.repeat(32);
+    const WORTHLESS_TOKEN = '0x' + 'de'.repeat(20);
+    evm.swaps.set(FAKE_ID.toLowerCase(), {
+      initiator: '0x' + '99'.repeat(20), recipient: INIT_EVM, token: WORTHLESS_TOKEN,
+      amount: 10n ** 30n, hashLock: '0x' + SECRET_HASH_HEX, timeLock: 1_900_000_000n, claimed: false, refunded: false,
+    });
+
+    // A lying signer that reports the pre-positioned attacker swapId (carrying our public hashLock) in its lock receipt.
+    class LyingCollisionSigner {
+      readonly address = RESP_EVM;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      readonly sendTransaction: any;
+      constructor(readonly provider: SharedEvmProvider) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        this.sendTransaction = vi.fn(async (tx: any) => {
+          const desc = htlcInterface.parseTransaction({ data: tx.data, value: tx.value ?? 0n });
+          let logs: unknown[] = [];
+          if (desc?.name === 'lock') {
+            const enc = htlcInterface.encodeEventLog('Locked', [FAKE_ID, '0x' + '99'.repeat(20), INIT_EVM, WORTHLESS_TOKEN, 10n ** 30n, '0x' + SECRET_HASH_HEX, 1_900_000_000n]);
+            logs = [{ address: tx.to, topics: [...enc.topics], data: enc.data, blockNumber: 5000, index: 1, blockHash: '0x' + 'bc'.repeat(32), transactionHash: '0x' + 'ab'.repeat(32), transactionIndex: 0, removed: false }];
+          }
+          const hash = '0x' + 'ab'.repeat(32);
+          this.provider.opts.receipt = { status: 1, logs, hash, blockNumber: 5000, index: 0, to: tx.to ?? null, from: this.address, contractAddress: null, blockHash: '0x' + 'bc'.repeat(32), logsBloom: '0x' + '00'.repeat(256), gasUsed: 21_000n, cumulativeGasUsed: 21_000n, blobGasUsed: null, gasPrice: 0n, blobGasPrice: null, type: 2, root: null };
+          return { hash, blockNumber: null, blockHash: null, index: 0, type: 2, from: this.address, to: tx.to ?? null, gasLimit: 300_000n, nonce: 0, data: tx.data ?? '0x', value: tx.value ?? 0n, gasPrice: 0n, maxPriorityFeePerGas: null, maxFeePerGas: null, maxFeePerBlobGas: null, chainId: BASE_CHAIN_ID, signature: null, accessList: null };
+        });
+      }
+      async getAddress(): Promise<string> { return this.address; }
+      get broadcastCount(): number { return this.sendTransaction.mock.calls.length; }
+    }
+
+    const respDurable = new InMemoryDurableStore();
+    const respEvmProvider = new SharedEvmProvider(evm, { chainId: BASE_CHAIN_ID, quorum: true });
+    const lyingSigner = new LyingCollisionSigner(new SharedEvmProvider(evm, { chainId: BASE_CHAIN_ID }));
+    const responder = new SwapController(
+      {
+        id: offer.id, role: 'responder', offer, phase: 'taken',
+        counterpartyClaimPkh: bytesToHex(PKH_I),
+        counterpartyHTLC: legXHtlc, counterpartyFundingOutpoint: legXOutpoint,
+        myEvmAddress: RESP_EVM, counterpartyEvmAddress: INIT_EVM,
+        myEvmToken: ZERO_ADDRESS, counterpartyEvmToken: ZERO_ADDRESS, // our real leg-Y token is native (ZeroAddress)
+      },
+      buildDeps({
+        clients: { btc: btcCli }, seedVault: new PartySeedVault(null, PRIV_R, PUB_R), durable: respDurable,
+        evmProviderFor: () => respEvmProvider as unknown as Provider,
+        evmSignerFor: () => lyingSigner as unknown as Signer,
+      }),
+    );
+    const fundProof = await responder.verifyCounterpartyLegForFunding();
+
+    // getSwap(FAKE_ID) truthfully returns a REAL on-chain swap with matching hashLock/recipient/amount but a WORTHLESS
+    // token → the token bind (R-EVMLOCKID-TOKEN-001) rejects it. Without the bind it would poison myEvmSwapId durably.
+    await expect(responder.lockEvm(fundProof)).rejects.toThrow(/quorum-corroborated|re-derive/i);
+    expect(await respDurable.get(`bch2swap:funded:${offer.id}`)).toBeNull();     // the collision id was NEVER committed
+    expect(responder.getState().phase).not.toBe('responder_funded');            // never advanced on the poisoned id
+  });
 });
