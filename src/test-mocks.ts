@@ -390,6 +390,9 @@ export interface MockEvmProviderOpts {
   code?: string;
   /** getLogs() result. */
   logs?: unknown[];
+  /** Range-AWARE getLogs (opt-in): a `{blockNumber}` log is returned ONLY when the query [fromBlock,toBlock] includes
+   *  it — used to test the windowed-vs-deep Claimed scan. When set, takes precedence over `logs`. */
+  logsByBlock?: Array<{ blockNumber: number; topics: ReadonlyArray<string>; data: string }>;
   /** getTransactionReceipt() result. */
   receipt?: unknown | null;
   /** getTransaction() result. */
@@ -408,6 +411,8 @@ export class MockEvmProvider {
   opts: MockEvmProviderOpts;
   /** Records every call()'s blockTag so a test can assert routing. */
   public readonly callLog: Array<{ blockTag: number | string | undefined; data: string | undefined }> = [];
+  /** Records every getLogs() query range so a test can assert which window (shallow vs deep) was scanned. */
+  public readonly getLogsFilters: Array<{ fromBlock: number; toBlock: number }> = [];
 
   constructor(opts: MockEvmProviderOpts = {}) {
     this.opts = opts;
@@ -490,6 +495,13 @@ export class MockEvmProvider {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async getLogs(_filter?: any): Promise<unknown[]> {
+    const from = Number(_filter?.fromBlock);
+    const to = Number(_filter?.toBlock);
+    this.getLogsFilters.push({ fromBlock: from, toBlock: to });
+    if (this.opts.logsByBlock) {
+      const inRange = Number.isFinite(from) && Number.isFinite(to);
+      return this.opts.logsByBlock.filter((l) => !inRange || (l.blockNumber >= from && l.blockNumber <= to));
+    }
     return this.opts.logs ?? [];
   }
 

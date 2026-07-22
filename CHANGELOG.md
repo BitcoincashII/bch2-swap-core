@@ -1,5 +1,23 @@
 # Changelog
 
+## 3.1.20
+
+### Fixed (fund-safety — HIGH, audit round 20 — completes the v3.1.19 poison fix)
+- **R-EVMLOCKBLOCK-POISON-002**: the v3.1.19 `claimedScanFromBlock` min-clamp stopped the worst case (a poisoned
+  `evmLockBlock` collapsing the `Claimed`-scan window to `[tip, tip]`) but still let a poisoned-high value shrink the
+  floor to `tip-90000` — only ~6.25h on a sub-second chain (Arbitrum ~0.25s/block), well INSIDE the ~24–48h leg-X
+  action window. So a lying/MITM leaf (the block number rides the single candidate leaf's receipt, un-quorumed) could
+  still hide an initiator reveal deeper than 90000 blocks that an honest deep `lockBlock` would have covered —
+  converting a recoverable state into a forfeited leg. Because every candidate secret is sha256-verified against
+  `hashLock` in-loop (a lying leaf cannot forge S), widening the scan is always fund-safe. Fix: `readEvmClaimedSecret`
+  now runs the cheap windowed scan per poll AND, when it finds nothing, a **one-time-per-session deep historical
+  sweep** flooring at `tip - DEEP_CLAIMED_SCAN_BLOCKS` (1.5M blocks ≈ the max staggered-timelock swap lifetime even on
+  the fastest chain), INDEPENDENT of the un-authenticated `lockBlock`. The deep sweep is bounded to 3 attempts (so a
+  transient RPC error doesn't skip it, and it never re-runs the full historical scan on every poll); a fresh reveal is
+  still caught by the windowed pass and a resume re-arms the sweep. A poisoned `lockBlock` can no longer durably hide a
+  reveal that is still inside the action window. New tests: a poisoned-high `lockBlock` + a deep on-chain reveal is
+  recovered via the deep sweep; the deep sweep is bounded (not once-per-poll).
+
 ## 3.1.19
 
 ### Fixed (fund-safety — HIGH, audit round 19 — confirming-round finding)

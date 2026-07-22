@@ -3060,6 +3060,9 @@ export class SwapController {
    * an honest leaf still holds (the fix #7 "never abandon while S may be extractable" property). Never throws on a
    * per-leaf read error (a leaf that errors just doesn't contribute an S).
    */
+  // R-EVMLOCKBLOCK-POISON-002: bounded, ONE-TIME-per-session guard for the deep historical Claimed sweep (below).
+  private evmDeepClaimScanAttempts = 0;
+
   private async readEvmClaimedSecret(provider: Provider, htlcAddr: string, swapId: string, hashLockHex: string): Promise<Uint8Array | null> {
     const leaves = evmLeaves(provider);
     const claimedFrag = HTLC_IFACE.getEvent('Claimed');
@@ -3067,9 +3070,26 @@ export class SwapController {
     const topic0 = claimedFrag.topicHash;
     const idTopic = ethers.zeroPadValue(swapId, 32); // the indexed bytes32 id
     const lockBlock = Number.isInteger(this.record.evmLockBlock) ? (this.record.evmLockBlock as number) : 0;
+    // Pass 1 — the cheap WINDOWED scan (floors near tip / at the adopted lock block): catches a reveal landing while we watch.
     for (const leaf of leaves) {
-      const found = await this.scanLeafForClaimedSecret(leaf, htlcAddr, topic0, idTopic, swapId, hashLockHex, lockBlock);
+      const found = await this.scanLeafForClaimedSecret(leaf, htlcAddr, topic0, idTopic, swapId, hashLockHex, lockBlock, false);
       if (found) return found;
+    }
+    // Pass 2 — R-EVMLOCKBLOCK-POISON-002: a ONE-TIME-per-session DEEP historical sweep. evmLockBlock is un-authenticated
+    // (recoverLockFromTx quorum-corroborates only the swapId, NOT the block), so a lying/MITM leaf can inflate it and the
+    // windowed floor above (tip-90000, only ~6.25h on a sub-second chain) can skip PAST the initiator's public reveal
+    // while it is STILL inside our multi-hour action window — forfeiting our leg. Because every candidate S is
+    // sha256-verified against hashLock (a lying leaf cannot forge S), widening the scan is always fund-safe: sweep the
+    // deep history (covers the max staggered-timelock swap lifetime) so a poisoned lockBlock can NEVER durably hide a
+    // real reveal. A fresh reveal that lands later is caught by pass 1's window; a new session (resume) re-arms this
+    // sweep. Bounded attempts tolerate a transient RPC error during the sweep without repeating the full deep scan on
+    // every poll forever (it is not needed once the reveal — if any — has been swept for).
+    if (this.evmDeepClaimScanAttempts < SwapController.DEEP_CLAIMED_SCAN_MAX_ATTEMPTS) {
+      this.evmDeepClaimScanAttempts++;
+      for (const leaf of leaves) {
+        const found = await this.scanLeafForClaimedSecret(leaf, htlcAddr, topic0, idTopic, swapId, hashLockHex, lockBlock, true);
+        if (found) return found;
+      }
     }
     return null;
   }
@@ -3084,9 +3104,14 @@ export class SwapController {
    * whose sha256 equals `hashLockHex` (the authenticator — a single honest leaf suffices to TRUST it), else null.
    */
   private static readonly CLAIMED_LOG_WINDOW = 9_000; // matches watchForClaim's 9000-block cap (public-RPC-safe)
+  // R-EVMLOCKBLOCK-POISON-002: the deep sweep floor = tip - this. Covers the max staggered-timelock swap lifetime
+  // (~2 legs x ~48h HTLC cap) even on the fastest sub-second chain (~0.25s/block Arbitrum: 1.5M blocks ~= 104h), so a
+  // reveal that is still inside our action window is always reachable. Bounded by tip and by MAX_QUERIES (~167 queries).
+  private static readonly DEEP_CLAIMED_SCAN_BLOCKS = 1_500_000;
+  private static readonly DEEP_CLAIMED_SCAN_MAX_ATTEMPTS = 3; // deep-sweep tries across polls before giving up (transient-failure tolerant)
 
   private async scanLeafForClaimedSecret(
-    leaf: Provider, htlcAddr: string, topic0: string, idTopic: string, swapId: string, hashLockHex: string, lockBlock: number,
+    leaf: Provider, htlcAddr: string, topic0: string, idTopic: string, swapId: string, hashLockHex: string, lockBlock: number, deep = false,
   ): Promise<Uint8Array | null> {
     // A NUMERIC tip is required so every query is a bounded [from,to] range (never fromBlock..'latest'). A leaf that
     // cannot report its tip simply doesn't contribute — the other leaves / a later poll still can (never throws).
@@ -3098,10 +3123,11 @@ export class SwapController {
       ]);
     } catch { return null; }
     if (!Number.isFinite(tip) || tip <= 0) return null;
-    // fromBlock lower bound: our own lock's mine block (lossless). If unknown (0), floor near the tip like
-    // watchForClaim (covers the ~24h lock window) rather than scanning from genesis. See claimedScanFromBlock for the
-    // R-EVMLOCKBLOCK-POISON-001 clamp that keeps a poisoned adopted lockBlock from collapsing this window past the reveal.
-    let from = claimedScanFromBlock(lockBlock, tip);
+    // fromBlock lower bound. The WINDOWED pass floors near tip / at the adopted lock block (see claimedScanFromBlock for
+    // the R-EVMLOCKBLOCK-POISON-001 clamp). The DEEP pass (R-EVMLOCKBLOCK-POISON-002) floors at tip-DEEP_CLAIMED_SCAN_BLOCKS
+    // INDEPENDENT of the un-authenticated lockBlock, so a poisoned lockBlock can never shrink it past a real reveal that is
+    // still inside our action window (safe to widen — every candidate S is sha256-verified against hashLock downstream).
+    let from = deep ? Math.max(0, tip - SwapController.DEEP_CLAIMED_SCAN_BLOCKS) : claimedScanFromBlock(lockBlock, tip);
     let window = SwapController.CLAIMED_LOG_WINDOW;
     const MAX_QUERIES = 10_000; // hard bound so a pathological RPC can never spin this single-sweep scan forever
     let guard = 0;

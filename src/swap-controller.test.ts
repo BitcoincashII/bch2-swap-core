@@ -2552,3 +2552,45 @@ describe('R-EVMLOCKBLOCK-POISON-001: the Claimed-scan floor cannot be shrunk by 
     }
   });
 })
+
+describe('R-EVMLOCKBLOCK-POISON-002: a poisoned-high evmLockBlock cannot hide a DEEP on-chain reveal (one-time deep sweep)', () => {
+  it('recovers S via the deep sweep when the windowed floor (poisoned) would skip past the reveal', async () => {
+    const MY_SWAP_ID = '0x' + 'ce'.repeat(32);
+    const TIP = 1_000_000;
+    const REVEAL_BLOCK = 500_000; // deeper than the windowed floor (tip-90000 = 910000) but within the deep floor
+    const POISON_LOCK = 950_000;  // a lying leaf inflated evmLockBlock to just under the tip (> the real reveal block)
+    const claimedLog = htlcInterface.encodeEventLog('Claimed', [MY_SWAP_ID, ethers.hexlify(S)]);
+    // Range-AWARE leaves: the Claimed log at REVEAL_BLOCK is only returned when the getLogs range includes it.
+    const leaf = () => new MockEvmProvider({ logsByBlock: [{ blockNumber: REVEAL_BLOCK, topics: claimedLog.topics, data: claimedLog.data }], blockNumber: TIP });
+    const baseProvider = new MockEvmProvider({ leafProviders: [leaf(), leaf()], blockNumber: TIP });
+    const ctrl = new SwapController(
+      evmFundRecord({ role: 'responder', phase: 'responder_funded', myEvmSwapId: MY_SWAP_ID, evmLockBlock: POISON_LOCK }),
+      makeEvmDeps({ evmProviderFor: () => P(baseProvider), evmSignerFor: () => SG(new MockSigner(new MockEvmProvider({}), EVM_RECIP)) }),
+    );
+    const { secret } = await ctrl.watchForClaimEvm();
+    expect(secret).not.toBeNull();                 // S recovered — the deep sweep reached below the poisoned floor
+    expect(ctrl.getState().hasSecret).toBe(true);
+    // The windowed pass floored ABOVE the reveal (would have missed it); the deep sweep floored at/below it.
+    const floors = baseProvider.opts.leafProviders!.flatMap((l) => l.getLogsFilters.map((f) => f.fromBlock));
+    expect(floors.some((f) => f > REVEAL_BLOCK)).toBe(true);        // windowed floor (poisoned) skipped past the reveal
+    expect(Math.min(...floors)).toBeLessThanOrEqual(REVEAL_BLOCK);  // deep sweep reached below the reveal
+  });
+
+  it('the deep sweep is bounded to a fixed number of attempts (no per-poll full rescan forever)', async () => {
+    const MY_SWAP_ID = '0x' + 'cf'.repeat(32);
+    const TIP = 1_000_000;
+    // No reveal anywhere (empty logs) → every windowed + deep pass finds nothing; assert the deep sweep stops after MAX.
+    const leaf = () => new MockEvmProvider({ logsByBlock: [], blockNumber: TIP });
+    const baseProvider = new MockEvmProvider({ leafProviders: [leaf(), leaf()], blockNumber: TIP });
+    const ctrl = new SwapController(
+      evmFundRecord({ role: 'responder', phase: 'responder_funded', myEvmSwapId: MY_SWAP_ID, evmLockBlock: 950_000 }),
+      makeEvmDeps({ evmProviderFor: () => P(baseProvider), evmSignerFor: () => SG(new MockSigner(new MockEvmProvider({}), EVM_RECIP)) }),
+    );
+    for (let i = 0; i < 6; i++) { const { secret } = await ctrl.watchForClaimEvm(); expect(secret).toBeNull(); }
+    // A deep sweep floors at 0 (tip-1.5M clamped) and starts exactly ONE window at fromBlock===0 per leaf. With 2 leaves
+    // and DEEP_CLAIMED_SCAN_MAX_ATTEMPTS=3, at most 3*2=6 such windows across the whole session — NOT 6 polls * 2 = 12.
+    const deepStarts = baseProvider.opts.leafProviders!.reduce((n, l) => n + l.getLogsFilters.filter((f) => f.fromBlock === 0).length, 0);
+    expect(deepStarts).toBeGreaterThan(0);      // the deep sweep DID run (poisoned floor made pass 1 miss)
+    expect(deepStarts).toBeLessThanOrEqual(6);  // bounded: MAX_ATTEMPTS(3) * leaves(2), NOT once-per-poll (would be 12)
+  });
+})
