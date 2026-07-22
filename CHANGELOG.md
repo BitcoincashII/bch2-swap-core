@@ -1,5 +1,24 @@
 # Changelog
 
+## 3.1.24
+
+### Hardened (defense-in-depth — not fund-loss; both adversarially rejected as non-fund-loss but closed at user request)
+- **R-EVMLOCKID-INITIATOR-001**: the EVM-lock swapId corroboration now also binds the on-chain `initiator == our sender`
+  on both adopt paths (primary `lockEvm` + `recoverLockFromTx`). `swapId = keccak256(msg.sender, nonce)`, so the
+  initiator is structurally unforgeable without our key — a strictly-tighter conjunct on top of the existing
+  hashLock+recipient+amount+token+exact-timeLock binds. The SDK signer is a direct ethers.Wallet EOA, so
+  `getAddress() == msg.sender` and no legitimate lock is false-rejected; the check fails OPEN on a `getAddress` hiccup
+  (skipped) and fails CLOSED (throws before committing `fundedKey`) on a genuine mismatch — worst case stuck-not-lost.
+- **R-EVMQUORUM-INDEP-001**: the EVM gates (`assertEvmLegBuriedForFunding` / `assertEvmRevealSafe`) now require ≥2
+  **independent** leaves — ≥2 distinct leaf objects, and ≥2 distinct endpoint URLs where introspectable — via a shared
+  `assertIndependentQuorum` helper, rather than the weaker `leaves.length >= 2`. This rejects a contract-violating host
+  that passes the same provider (or two providers on one endpoint) twice, which would silently degrade the gates' own
+  leaf-corroboration to single-backend trust. Production `getPublicProvider` builds distinct JsonRpcProviders on
+  distinct operator URLs, so it always passes; opaque providers / mocks degrade safely to the object-distinctness check.
+- Both changes verified against source (6 adversarial concerns, all refuted — no false-reject of the real EOA signer /
+  production provider, no new seam). New tests: a wrong-initiator recovery decoy is rejected in isolation; a
+  duplicate-leaf provider is refused by the gate.
+
 ## 3.1.23
 
 ### Fixed (fund-safety — HIGH, audit round 24 — closes the EVM-lock-adoption class)

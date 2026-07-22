@@ -510,6 +510,18 @@ describe('assertLegBuriedForFunding (responder fund-Y gate)', () => {
       hashLock: '0x' + '11'.repeat(32), recipient: '0xrecip', minAmount: 1n, token: '0xtok',
     })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
   });
+
+  it('R-EVMQUORUM-INDEP-001: a provider with NON-INDEPENDENT (duplicate) leaves is refused (rearm) — count>=2 is not enough', async () => {
+    // A contract-violating host passes the SAME leaf object twice: __leafProviders.length is 2, but reading "both"
+    // hits ONE backend → single-backend trust. The gate must require >= 2 DISTINCT leaves, not just count >= 2.
+    const leaf = new MockEvmProvider({ block: { timestamp: CHAIN_NOW }, blockNumber: 5000 });
+    const dupLeaves = new MockEvmProvider({ block: { timestamp: CHAIN_NOW }, blockNumber: 5000, leafProviders: [leaf, leaf] });
+    await expect(assertEvmLegBuriedForFunding(dupLeaves as unknown as Provider, {
+      chain: 'poly', htlcAddr: '0xhtlc', swapId: '0xswap', requiredConfirmations: 2,
+      hashLock: '0x' + '11'.repeat(32), recipient: '0xrecip', minAmount: 1n, token: '0xtok',
+    })).rejects.toMatchObject({ name: 'GateFailure', disposition: 'rearm' });
+    // assertEvmRevealSafe shares the SAME assertIndependentQuorum helper, so it enforces the identical requirement.
+  });
 });
 
 // ============================================================================

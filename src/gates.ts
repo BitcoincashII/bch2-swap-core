@@ -629,6 +629,34 @@ function evmLeaves(provider: Provider): Provider[] {
   return Array.isArray(ls) && ls.length > 0 ? ls : [provider];
 }
 
+/**
+ * R-EVMQUORUM-INDEP-001: assert the EVM read provider is a genuine quorum>=2 provider — >= 2 INDEPENDENT leaves. The
+ * gates below read EACH leaf directly and aggregate (MAX / corroborate), so their security requires >= 2 independent
+ * backends. `leaves.length >= 2` alone is too weak: a contract-violating host could pass the SAME provider object
+ * twice (or two providers on the same endpoint), silently degrading the corroboration to single-backend trust. Require
+ * >= 2 DISTINCT leaf objects, and — where the endpoint is introspectable (real ethers JsonRpcProvider) — >= 2 DISTINCT
+ * endpoint URLs. Opaque providers / test mocks expose no URL, so the endpoint check is skipped for them (never a
+ * false-reject). getPublicProvider builds distinct JsonRpcProvider leaves (one per URL), so production always passes.
+ */
+function assertIndependentQuorum(leaves: Provider[], gateLabel: string): void {
+  if (leaves.length < 2 || new Set(leaves).size < 2) {
+    throw new GateFailure(`${gateLabel}: the EVM read provider is not a quorum>=2 provider (need >=2 independent leaves) — refusing to mint on single-backend trust`, 'rearm');
+  }
+  const urls: string[] = [];
+  for (const lp of leaves) {
+    let u: string | undefined;
+    try {
+      const a = lp as unknown as { _getConnection?: () => { url?: string }; connection?: { url?: string } };
+      u = a._getConnection?.()?.url ?? a.connection?.url;
+    } catch { u = undefined; }
+    if (typeof u === 'string' && u) urls.push(u.toLowerCase());
+  }
+  // Enforce endpoint-distinctness only when >= 2 leaves actually exposed a URL (never false-reject opaque providers/mocks).
+  if (urls.length >= 2 && new Set(urls).size < 2) {
+    throw new GateFailure(`${gateLabel}: the EVM read provider's leaves resolve to a single endpoint — refusing to mint on single-backend trust`, 'rearm');
+  }
+}
+
 // One leaf's latest block timestamp (seconds) or null (unavailable) — the R224/R278 per-leaf clock read.
 async function readLeafChainSec(lp: Provider): Promise<number | null> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -674,9 +702,8 @@ export async function assertEvmLegBuriedForFunding(provider: Provider, p: EvmFun
   // fix #7 / R278 / R206: a single-leaf provider silently degrades the chain-clock corroboration AND the depth
   // read to quorum=1 — one hostile/lagging RPC could then deflate chainNow past the margin. Refuse to mint on
   // single-backend trust rather than rely on the caller injecting a real quorum provider (structural, not advisory).
-  if (leaves.length < 2) {
-    throw new GateFailure('evm-fund: the EVM read provider is not a quorum>=2 provider — refusing to mint on single-backend trust', 'rearm');
-  }
+  // R-EVMQUORUM-INDEP-001: require >= 2 INDEPENDENT leaves (distinct objects + distinct endpoints), not just count>=2.
+  assertIndependentQuorum(leaves, 'evm-fund');
   const tsList = await Promise.all(leaves.map(readLeafChainSec));
   const chainNow = aggregateChainNow(tsList, leaves.length);
   // R322-AUDIT: an unverifiable clock → impossible threshold → the honest depth check fails closed.
@@ -735,9 +762,8 @@ export async function assertEvmRevealSafe(provider: Provider, p: EvmRevealGatePa
   // fix #7 / R278 / R206: refuse a single-leaf provider — quorum>=2 backs BOTH the depth read and the chain-clock
   // corroboration below, or a lone hostile RPC could deflate chainNow past the 4h reveal margin (lose both legs).
   const leaves = evmLeaves(provider);
-  if (leaves.length < 2) {
-    throw new GateFailure('evm-reveal: the EVM read provider is not a quorum>=2 provider — refusing to mint on single-backend trust', 'rearm');
-  }
+  // R-EVMQUORUM-INDEP-001: require >= 2 INDEPENDENT leaves (distinct objects + distinct endpoints), not just count>=2.
+  assertIndependentQuorum(leaves, 'evm-reveal');
   // R148 gate#2 (defense-in-depth at the broadcast choke point): reorg-safe depth + binding, quorum >= 2.
   let atSafeDepth = false;
   try {

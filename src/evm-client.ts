@@ -449,7 +449,11 @@ export async function recoverLockFromTx(
     // expectTimeLock absent for a pre-fix lock → degrades to token+3-field, never worse than before this fix).
     const okToken = scan?.token === undefined || (!!s && String(s.token).toLowerCase() === scan.token.toLowerCase());
     const okTL = scan?.expectTimeLock === undefined || (!!s && s.timeLock === scan.expectTimeLock);
-    if (s && okHash && okRcpt && okAmt && okToken && okTL) return cand; // this id exists on-chain (quorum-corroborated) with our params
+    // R-EVMLOCKID-INITIATOR-001 (defense-in-depth): bind the on-chain initiator == our sender. Redundant given the
+    // exact-timeLock bind (an attacker cannot pre-fund a decoy carrying our unpredictable nowSec timeLock), but it also
+    // rejects any decoy whose initiator is not us for ~free. Skipped when the sender is unknown (getAddress failed).
+    const okInit = !scan?.sender || (!!s && String(s.initiator).toLowerCase() === scan.sender.toLowerCase());
+    if (s && okHash && okRcpt && okAmt && okToken && okTL && okInit) return cand; // this id exists on-chain (quorum-corroborated) with our params
   }
   // an uncorroborated 'locked' (only a lying leaf claimed it), or any uncertain/errored leaf → fail closed (retry).
   if (lockedCandidates.length > 0 || results.some(r => r.kind === 'blocked')) return { kind: 'blocked' };

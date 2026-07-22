@@ -1574,6 +1574,31 @@ describe('SwapController.lockEvm() — fix #2 re-mint FRESH at the choke point',
     expect(signer.broadcastCount).toBe(0);                             // and no second lock was broadcast
   });
 
+  it('R-EVMLOCKID-INITIATOR-001: the recovery adopt REJECTS a decoy whose on-chain initiator is not us (isolated — matches hashLock/recipient/amount/token; timeLock bind not applicable)', async () => {
+    const LOCK_TX_HASH = '0x' + 'ef'.repeat(32);
+    const BASE_HTLC = getEvmConfig(84532)!.htlcAddress;
+    const DECOY_ID = '0x' + 'cc'.repeat(32);
+    // A lying leaf injects DECOY_ID; getSwap(DECOY_ID) matches OUR token (native) + hashLock/recipient/amount, but its
+    // on-chain initiator is the ATTACKER (EVM_CP_ADDR), NOT us (EVM_RECIP). NO evmLockTimeKey is set, so the timeLock
+    // bind is not applicable — the rejection is driven SOLELY by the new initiator bind.
+    const forgedLog = htlcInterface.encodeEventLog('Locked', [DECOY_ID, EVM_CP_ADDR, EVM_CP_ADDR, ZERO_ADDRESS, EVM_AMT, EVM_HASHLOCK, 1_900_000_000n]);
+    const hostileReceipt = { status: 1, blockNumber: 10, logs: [{ address: BASE_HTLC, topics: forgedLog.topics, data: forgedLog.data }] };
+    const decoySwap = makeSwap({ initiator: EVM_CP_ADDR, recipient: EVM_CP_ADDR, token: ZERO_ADDRESS, amount: EVM_AMT, hashLock: EVM_HASHLOCK, timeLock: 1_900_000_000n });
+    const baseQuorum = new MockEvmProvider({ swap: decoySwap, leafProviders: [new MockEvmProvider({ receipt: hostileReceipt }), new MockEvmProvider({ receipt: hostileReceipt })], blockNumber: 5000 });
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:lockpending:evmfund-1', LOCK_TX_HASH);
+    await durable.set('bch2swap:evmlocktx:evmfund-1', LOCK_TX_HASH);
+    const goodProof = await gateAssertEvmLegBuriedForFunding(P(evmLegProvider()), FUND_GATE_PARAMS);
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP); // our address = EVM_RECIP != the decoy's initiator
+    const ctrl = new SwapController(evmFundRecord(), makeEvmDeps({
+      evmProviderFor: (chain) => P(chain === 'base' ? baseQuorum : evmLegProvider()),
+      evmSignerFor: () => SG(signer), durable,
+    }));
+    await expect(ctrl.lockEvm(goodProof)).rejects.toThrow(/refusing to re-lock|indeterminate|pending/i);
+    expect(await durable.get('bch2swap:funded:evmfund-1')).toBeNull(); // the wrong-initiator decoy was NEVER adopted
+    expect(signer.broadcastCount).toBe(0);
+  });
+
   it('(fix #1 compile) lockEvm STRUCTURALLY requires a FundProof — no-arg / RevealAuthorization do not compile', () => {
     expect(typeof _lockEvmCompileCheck).toBe('function');
   });

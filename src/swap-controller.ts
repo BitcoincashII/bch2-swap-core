@@ -2415,6 +2415,8 @@ export class SwapController {
       // REAL, quorum-corroborated id via recoverLockFromTx (a lying signer leaf cannot fool the honest read quorum).
       let corroborated: Awaited<ReturnType<typeof getSwap>> | null = null;
       try { corroborated = await getSwap(htlcAddr, swapId, this.evmProvider(this.myChain)); } catch { corroborated = null; }
+      // R-EVMLOCKID-INITIATOR-001 (defense-in-depth): our address — the on-chain swap's initiator MUST equal us.
+      const lockSender = await signer.getAddress().catch(() => '');
       const swapIdOk = !!corroborated
         && String(corroborated.hashLock).toLowerCase() === hashLock.toLowerCase()
         && String(corroborated.recipient).toLowerCase() === recipient.toLowerCase()
@@ -2427,7 +2429,10 @@ export class SwapController {
         && String(corroborated.token).toLowerCase() === String(token).toLowerCase()
         // R-EVMLOCKID-TOKEN-001: BIND THE EXACT refund timeLock we set (chain-clock-derived at 2369). Only OUR real lock
         // matches it — an attacker cannot predict our nowSec — so this also defeats a same-token decoy grief lock.
-        && corroborated.timeLock === timeLock;
+        && corroborated.timeLock === timeLock
+        // R-EVMLOCKID-INITIATOR-001: BIND THE INITIATOR == us (defense-in-depth; redundant vs the exact timeLock, but
+        // free). Skipped only if our own address is unreadable (never false-reject our real lock on a getAddress hiccup).
+        && (lockSender === '' || String(corroborated.initiator).toLowerCase() === lockSender.toLowerCase());
       if (!swapIdOk) {
         throw new Error('lockEvm: the locked swapId is not quorum-corroborated (a lying signer RPC may have injected a fabricated id) — not committing funded; retry/resume re-derives the real id via the quorum recovery path');
       }
