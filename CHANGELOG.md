@@ -1,5 +1,22 @@
 # Changelog
 
+## 3.1.21
+
+### Fixed (fund-safety — HIGH, audit round 21 — sibling of the lockBlock-poison class)
+- **R-EVMLOCKID-QUORUM-001**: the PRIMARY EVM lock path adopted the own-leg `swapId` from a single, un-Merkle-verified
+  SIGNER-provider receipt. `lockETH`/`lockTokens` return `authenticatedLockedSwapId`, which binds only the PUBLIC
+  `htlcAddr`+`hashLock` — so a lying/MITM signer RPC can inject a `Locked` event carrying a fabricated id + our public
+  hashLock, which was committed to `fundedKey`/`myEvmSwapId` with NO `getSwap` corroboration. The RECOVERY path
+  (`recoverLockFromTx`) already quorum-corroborates the swapId (R-RECOVER-SWAPID-QUORUM-001) for exactly this attack,
+  but the primary path skipped it — an asymmetry. A poisoned `myEvmSwapId` durably blinds every downstream secret
+  watcher (all `Claimed` scans, incl. the round-20 deep sweep, key on it), forfeiting the leg. Fix: after the lock,
+  corroborate the returned `swapId` over the READ QUORUM (`getSwap` — distinct from the single signer provider,
+  matching hashLock/recipient/amount) BEFORE committing `fundedKey`. On failure, fail CLOSED without committing: the
+  `lockpending`+`evmlocktx` markers are already set, so the retry/resume re-enters the pending-marker branch and adopts
+  the REAL, quorum-corroborated id via `recoverLockFromTx` (a lying signer leaf cannot fool the honest read quorum), so
+  no double-lock and no durable poison. New e2e test: a lying signer's fabricated lock swapId is fail-closed with no
+  `fundedKey` committed and the lock tx recorded for re-derivation.
+
 ## 3.1.20
 
 ### Fixed (fund-safety — HIGH, audit round 20 — completes the v3.1.19 poison fix)

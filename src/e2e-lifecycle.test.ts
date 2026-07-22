@@ -778,4 +778,72 @@ describe('e2e — HAPPY UTXO<->EVM (cross-chain secret flow through the on-chain
     const respClaim = parseLegacyTx(btc.rawTxByTxid[respClaimTxid]);
     expect(respClaim.inputs).toContainEqual({ tx_hash: legXTxid, tx_pos: legXOutpoint.tx_pos });
   });
+
+  it('R-EVMLOCKID-QUORUM-001: a lying SIGNER RPC reporting a FABRICATED lock swapId is fail-closed by the primary-path quorum getSwap corroboration (no fundedKey committed; retry re-derives the real id)', async () => {
+    const offer = makeOffer({ sendChain: 'btc', receiveChain: 'base', sendAmount: 100_000, receiveAmount: EVM_AMT_STR });
+
+    // ── INITIATOR funds leg X on btc so the responder can verify it + mint a FundProof ──
+    const initDurable = new InMemoryDurableStore();
+    const initFund = new SwapController(
+      { id: offer.id, role: 'initiator', offer, phase: 'taken', counterpartyClaimPkh: bytesToHex(PKH_R) },
+      buildDeps({ clients: { btc: btcCli }, seedVault: new PartySeedVault(KSS, PRIV_I, PUB_I), durable: initDurable }),
+    );
+    await initFund.prepare();
+    await initFund.fundLegX();
+    btc.mineEmptyBlocks(1);
+    const legXHtlc = initFund.getState().myHTLC!;
+    const legXOutpoint = observeOutpoint(btc, legXHtlc);
+
+    // A lying/MITM SIGNER RPC: its lock-tx receipt carries a Locked event with a FABRICATED swapId (NEVER added to the
+    // honest read chain `evm`) but OUR real public hashLock — the exact attack authenticatedLockedSwapId cannot catch.
+    const FAKE_ID = '0x' + 'fa'.repeat(32);
+    class LyingLockSigner {
+      readonly address = RESP_EVM;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      readonly sendTransaction: any;
+      constructor(readonly provider: SharedEvmProvider) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        this.sendTransaction = vi.fn(async (tx: any) => {
+          const desc = htlcInterface.parseTransaction({ data: tx.data, value: tx.value ?? 0n });
+          let logs: unknown[] = [];
+          if (desc?.name === 'lock') {
+            const [recipient, token, amount, hashLock, timeLock] = desc.args as unknown as [string, string, bigint, string, bigint];
+            const enc = htlcInterface.encodeEventLog('Locked', [FAKE_ID, this.address, recipient, token, amount, hashLock, timeLock]);
+            logs = [{ address: tx.to, topics: [...enc.topics], data: enc.data, blockNumber: 5000, index: 1, blockHash: '0x' + 'bc'.repeat(32), transactionHash: '0x' + 'ab'.repeat(32), transactionIndex: 0, removed: false }];
+          }
+          const hash = '0x' + 'ab'.repeat(32);
+          this.provider.opts.receipt = { status: 1, logs, hash, blockNumber: 5000, index: 0, to: tx.to ?? null, from: this.address, contractAddress: null, blockHash: '0x' + 'bc'.repeat(32), logsBloom: '0x' + '00'.repeat(256), gasUsed: 21_000n, cumulativeGasUsed: 21_000n, blobGasUsed: null, gasPrice: 0n, blobGasPrice: null, type: 2, root: null };
+          return { hash, blockNumber: null, blockHash: null, index: 0, type: 2, from: this.address, to: tx.to ?? null, gasLimit: 300_000n, nonce: 0, data: tx.data ?? '0x', value: tx.value ?? 0n, gasPrice: 0n, maxPriorityFeePerGas: null, maxFeePerGas: null, maxFeePerBlobGas: null, chainId: BASE_CHAIN_ID, signature: null, accessList: null };
+        });
+      }
+      async getAddress(): Promise<string> { return this.address; }
+      get broadcastCount(): number { return this.sendTransaction.mock.calls.length; }
+    }
+
+    const respDurable = new InMemoryDurableStore();
+    const respEvmProvider = new SharedEvmProvider(evm, { chainId: BASE_CHAIN_ID, quorum: true }); // HONEST read quorum
+    const lyingSigner = new LyingLockSigner(new SharedEvmProvider(evm, { chainId: BASE_CHAIN_ID }));
+    const responder = new SwapController(
+      {
+        id: offer.id, role: 'responder', offer, phase: 'taken',
+        counterpartyClaimPkh: bytesToHex(PKH_I),
+        counterpartyHTLC: legXHtlc, counterpartyFundingOutpoint: legXOutpoint,
+        myEvmAddress: RESP_EVM, counterpartyEvmAddress: INIT_EVM,
+        myEvmToken: ZERO_ADDRESS, counterpartyEvmToken: ZERO_ADDRESS,
+      },
+      buildDeps({
+        clients: { btc: btcCli }, seedVault: new PartySeedVault(null, PRIV_R, PUB_R), durable: respDurable,
+        evmProviderFor: () => respEvmProvider as unknown as Provider,
+        evmSignerFor: () => lyingSigner as unknown as Signer,
+      }),
+    );
+    const fundProof = await responder.verifyCounterpartyLegForFunding();
+
+    // getSwap(FAKE_ID) over the honest quorum returns null (the fabricated id is not on-chain) → corroboration fails.
+    await expect(responder.lockEvm(fundProof)).rejects.toThrow(/quorum-corroborated|re-derive/i);
+    expect(await respDurable.get(`bch2swap:funded:${offer.id}`)).toBeNull();     // the fabricated id was NEVER committed as funded
+    expect(await respDurable.get(`bch2swap:evmlocktx:${offer.id}`)).toBeTruthy(); // the lock tx IS recorded so a retry re-derives the real id via recoverLockFromTx
+    expect(responder.getState().phase).not.toBe('responder_funded');            // never advanced on the poisoned id
+    expect(lyingSigner.broadcastCount).toBe(1);                                  // the lock DID broadcast (the poison is caught AFTER, before commit)
+  });
 });

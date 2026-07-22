@@ -2394,7 +2394,26 @@ export class SwapController {
       // so a failure here must not throw — the pre-broadcast sentinel keeps the swap recoverable regardless.
       if (onBroadcastCommit) { try { await onBroadcastCommit; } catch { /* best-effort real-hash refinement */ } }
 
-      // The lock mined with a known swapId: commit funded=swapId (durable single-flight sentinel) + clear lockpending.
+      // R-EVMLOCKID-QUORUM-001: the swapId from lockETH/lockTokens is authenticated only by OUR PUBLIC hashLock over a
+      // SINGLE, un-Merkle-verified SIGNER-provider receipt (authenticatedLockedSwapId), so a lying/MITM signer RPC can
+      // inject a Locked event carrying a FABRICATED id + our public hashLock. Committed to fundedKey/myEvmSwapId, that
+      // poisoned id durably blinds every downstream secret watcher (all Claimed scans key on it) -> forfeited leg. The
+      // recovery path (recoverLockFromTx, pending-marker branch above) ALREADY quorum-corroborates the id via getSwap;
+      // the primary path must too. Corroborate over the READ QUORUM (evmProvider — distinct from the single signer
+      // provider) BEFORE committing. On failure, fail CLOSED (throw) WITHOUT committing fundedKey: the lockpending +
+      // evmlocktx markers are already set, so the retry/resume re-enters the pending-marker branch above and adopts the
+      // REAL, quorum-corroborated id via recoverLockFromTx (a lying signer leaf cannot fool the honest read quorum).
+      let corroborated: Awaited<ReturnType<typeof getSwap>> | null = null;
+      try { corroborated = await getSwap(htlcAddr, swapId, this.evmProvider(this.myChain)); } catch { corroborated = null; }
+      const swapIdOk = !!corroborated
+        && String(corroborated.hashLock).toLowerCase() === hashLock.toLowerCase()
+        && String(corroborated.recipient).toLowerCase() === recipient.toLowerCase()
+        && corroborated.amount >= amount;
+      if (!swapIdOk) {
+        throw new Error('lockEvm: the locked swapId is not quorum-corroborated (a lying signer RPC may have injected a fabricated id) — not committing funded; retry/resume re-derives the real id via the quorum recovery path');
+      }
+
+      // The lock mined with a known, QUORUM-CORROBORATED swapId: commit funded=swapId (durable single-flight sentinel) + clear lockpending.
       await this.deps.durable.commit([[fundedKey(rec.id), swapId.toLowerCase()]]);
       await this.deps.durable.remove(lockPendingKey(rec.id));
       return { swapId, txHash: finalHash, adopted: false };
