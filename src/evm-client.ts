@@ -332,7 +332,11 @@ export async function recoverLockFromTx(
   // with a new one that mined the real lock; if the marker still holds the dropped original, a both-null lookup
   // would return 'safe' and permit a re-lock (double-lock + strand). When `scan` is supplied, before returning
   // 'safe' we scan for a matching on-chain Locked from this sender and adopt it (fail-closed on any RPC error).
-  scan?: { sender: string; hashLock: string; recipient?: string; minAmount?: bigint; fromBlock?: number },
+  // R-EVMLOCKID-RECOVERY-001: `token` + `expectTimeLock` bring the recovery-adopt corroboration to full 5-field parity
+  // with the primary lock path (swap-controller lockEvm). swapId = keccak256(sender,nonce) excludes the token, so a
+  // worthless-token decoy lock with the same public hashLock/recipient/amount has a DISTINCT on-chain swapId a lying
+  // leaf can inject; binding token (+ the exact chain-clock timeLock only OUR lock has) rejects it.
+  scan?: { sender: string; hashLock: string; recipient?: string; minAmount?: bigint; fromBlock?: number; token?: string; expectTimeLock?: bigint },
 ): Promise<{ kind: 'locked'; swapId: string; blockNumber?: number } | { kind: 'safe' | 'blocked' }> {
   // R224-RECOVER-QUORUM-001: the 'safe' verdict CLEARS the lockpending marker and authorizes a fresh IRREVERSIBLE
   // re-lock, so it must NOT trust a single quorum=1 FallbackProvider first-responder null. An honest-but-lagging /
@@ -439,7 +443,13 @@ export async function recoverLockFromTx(
     const okHash = !scan?.hashLock || (!!s && String(s.hashLock).toLowerCase() === scan.hashLock.toLowerCase());
     const okRcpt = !scan?.recipient || (!!s && String(s.recipient).toLowerCase() === scan.recipient.toLowerCase());
     const okAmt = scan?.minAmount === undefined || (!!s && s.amount >= scan.minAmount);
-    if (s && okHash && okRcpt && okAmt) return cand; // this id exists on-chain (quorum-corroborated) with our params
+    // R-EVMLOCKID-RECOVERY-001: bind token (case-insensitive; getSwap normalizes to EIP-55 / ZeroAddress) and the exact
+    // timeLock we set — full parity with the primary path — so a same-public-fields decoy on a different token / with a
+    // different (attacker-chosen) timeLock cannot be adopted. Skipped only when a param is absent (token always known;
+    // expectTimeLock absent for a pre-fix lock → degrades to token+3-field, never worse than before this fix).
+    const okToken = scan?.token === undefined || (!!s && String(s.token).toLowerCase() === scan.token.toLowerCase());
+    const okTL = scan?.expectTimeLock === undefined || (!!s && s.timeLock === scan.expectTimeLock);
+    if (s && okHash && okRcpt && okAmt && okToken && okTL) return cand; // this id exists on-chain (quorum-corroborated) with our params
   }
   // an uncorroborated 'locked' (only a lying leaf claimed it), or any uncertain/errored leaf → fail closed (retry).
   if (lockedCandidates.length > 0 || results.some(r => r.kind === 'blocked')) return { kind: 'blocked' };

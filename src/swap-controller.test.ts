@@ -1545,6 +1545,35 @@ describe('SwapController.lockEvm() — fix #2 re-mint FRESH at the choke point',
     expect(await durable.get('bch2swap:funded:evmfund-1')).toBeNull(); // the attacker's swapId was NEVER committed
   });
 
+  it('R-EVMLOCKID-RECOVERY-001: the recovery adopt REJECTS a WORTHLESS-TOKEN decoy swap (getSwap confirms hashLock/recipient/amount but the token differs) — 5-field parity with the primary path', async () => {
+    // Regression for the round-24 finding: my v3.1.22 primary-path token bind throws → the retry lands on THIS
+    // pending-marker recovery branch, which (before this fix) bound only hashLock/recipient/amount. A worthless-token
+    // decoy lock (same public fields, DISTINCT real swapId) that a lying leaf injects must now be rejected here too.
+    const LOCK_TX_HASH = '0x' + 'ef'.repeat(32);
+    const BASE_HTLC = getEvmConfig(84532)!.htlcAddress;
+    const DECOY_ID = '0x' + 'dc'.repeat(32);
+    const WORTHLESS_TOKEN = '0x' + 'de'.repeat(20);
+    // A lying leaf injects DECOY_ID (our public hashLock) into our lock tx's receipt scan…
+    const forgedLog = htlcInterface.encodeEventLog('Locked', [DECOY_ID, EVM_CP_ADDR, EVM_CP_ADDR, WORTHLESS_TOKEN, EVM_AMT, EVM_HASHLOCK, 1_900_000_000n]);
+    const hostileReceipt = { status: 1, blockNumber: 10, logs: [{ address: BASE_HTLC, topics: forgedLog.topics, data: forgedLog.data }] };
+    // …and getSwap(DECOY_ID) over the HONEST quorum truthfully confirms it exists with matching hashLock/recipient/amount
+    // but a WORTHLESS token (our real leg-Y token is native = ZeroAddress) → the token bind must reject it.
+    const decoySwap = makeSwap({ initiator: EVM_CP_ADDR, recipient: EVM_CP_ADDR, token: WORTHLESS_TOKEN, amount: EVM_AMT, hashLock: EVM_HASHLOCK, timeLock: 1_900_000_000n });
+    const baseQuorum = new MockEvmProvider({ swap: decoySwap, leafProviders: [new MockEvmProvider({ receipt: hostileReceipt }), new MockEvmProvider({ receipt: hostileReceipt })], blockNumber: 5000 });
+    const durable = new InMemoryDurableStore();
+    await durable.set('bch2swap:lockpending:evmfund-1', LOCK_TX_HASH);
+    await durable.set('bch2swap:evmlocktx:evmfund-1', LOCK_TX_HASH);
+    const goodProof = await gateAssertEvmLegBuriedForFunding(P(evmLegProvider()), FUND_GATE_PARAMS);
+    const signer = new MockSigner(new MockEvmProvider({}), EVM_RECIP); // throw-mode: a re-lock would broadcast + throw
+    const ctrl = new SwapController(evmFundRecord(), makeEvmDeps({
+      evmProviderFor: (chain) => P(chain === 'base' ? baseQuorum : evmLegProvider()),
+      evmSignerFor: () => SG(signer), durable,
+    }));
+    await expect(ctrl.lockEvm(goodProof)).rejects.toThrow(/refusing to re-lock|indeterminate|pending/i);
+    expect(await durable.get('bch2swap:funded:evmfund-1')).toBeNull(); // the worthless-token decoy was NEVER adopted
+    expect(signer.broadcastCount).toBe(0);                             // and no second lock was broadcast
+  });
+
   it('(fix #1 compile) lockEvm STRUCTURALLY requires a FundProof — no-arg / RevealAuthorization do not compile', () => {
     expect(typeof _lockEvmCompileCheck).toBe('function');
   });

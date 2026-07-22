@@ -306,6 +306,10 @@ const lockPendingKey = (id: string): string => `bch2swap:lockpending:${id}`;
 /** EVM (step 7): the live lock tx hash for a UI explorer link (R-EVMLOCKTX). Re-fires with the replacement hash on a
  *  MetaMask speed-up; a Node signer typically won't, but the seam is kept so the app adapter interops. */
 const evmLockTxKey = (id: string): string => `bch2swap:evmlocktx:${id}`;
+// R-EVMLOCKID-RECOVERY-001: the exact chain-clock-derived timeLock we set on our EVM lock, persisted at broadcast so
+// the recovery/resume adopt paths can bind it (parity with the primary path) — only OUR real lock matches it (an
+// attacker cannot predict our nowSec), so it defeats even a same-token decoy lock that a lying leaf tries to inject.
+const evmLockTimeKey = (id: string): string => `bch2swap:evmlocktime:${id}`;
 /** EVM (step 7, fix #2): a durable "refund-race recovery is pending" marker. Set when our own EVM lock was already
  *  CLAIMED by the counterparty (refundSwap reverts) but S is not YET extractable from the on-chain Claimed event
  *  (a lagging/pruned/transient leaf). While set, a re-called refundEvm RE-ENTERS recovery straight away — it must
@@ -2318,10 +2322,14 @@ export class SwapController {
         const readProvider = this.evmProvider(this.myChain);
         let sender = '';
         try { sender = await signer.getAddress(); } catch { sender = ''; }
+        // R-EVMLOCKID-RECOVERY-001: bind token + the persisted exact timeLock so the recovery adopt has the SAME 5-field
+        // corroboration as the primary path (else my v3.1.22 primary-path throw is circumvented — the retry lands here).
+        const tlRaw1 = await this.deps.durable.get(evmLockTimeKey(rec.id));
+        const expectTimeLock1 = (tlRaw1 && /^\d+$/.test(tlRaw1)) ? BigInt(tlRaw1) : undefined;
         let recovery: { kind: 'locked'; swapId: string; blockNumber?: number } | { kind: 'safe' | 'blocked' };
         try {
           recovery = await recoverLockFromTx(htlcAddr, lockTxHash, readProvider, {
-            sender, hashLock, recipient, minAmount: amount, fromBlock: rec.evmLockBlock,
+            sender, hashLock, recipient, minAmount: amount, fromBlock: rec.evmLockBlock, token, expectTimeLock: expectTimeLock1,
           });
         } catch { recovery = { kind: 'blocked' }; }
         if (recovery.kind === 'locked') {
@@ -2383,7 +2391,9 @@ export class SwapController {
       let onBroadcastCommit: Promise<void> | null = null;
       const onBroadcast = (h: string): void => {
         finalHash = h;
-        onBroadcastCommit = this.deps.durable.commit([[lockPendingKey(rec.id), h], [evmLockTxKey(rec.id), h]]);
+        // R-EVMLOCKID-RECOVERY-001: also persist the exact timeLock we set so a later recovery/resume adopt can bind it
+        // (full parity with the primary 5-field corroboration below), committed atomically with the lock tx hash.
+        onBroadcastCommit = this.deps.durable.commit([[lockPendingKey(rec.id), h], [evmLockTxKey(rec.id), h], [evmLockTimeKey(rec.id), timeLock.toString()]]);
       };
 
       this.status('lockEvm:broadcasting');
@@ -2439,7 +2449,11 @@ export class SwapController {
       if (lockTxHash) {
         try {
           let sender = ''; try { sender = await signer.getAddress(); } catch { sender = ''; }
-          const r = await recoverLockFromTx(htlcAddr, lockTxHash, this.evmProvider(this.myChain), { sender, hashLock, recipient, minAmount: amount, fromBlock: rec.evmLockBlock });
+          // R-EVMLOCKID-RECOVERY-001: bind token + persisted exact timeLock (5-field parity) so the block backfill
+          // corroborates OUR real lock's block, not a decoy's.
+          const tlRaw2 = await this.deps.durable.get(evmLockTimeKey(rec.id));
+          const expectTimeLock2 = (tlRaw2 && /^\d+$/.test(tlRaw2)) ? BigInt(tlRaw2) : undefined;
+          const r = await recoverLockFromTx(htlcAddr, lockTxHash, this.evmProvider(this.myChain), { sender, hashLock, recipient, minAmount: amount, fromBlock: rec.evmLockBlock, token, expectTimeLock: expectTimeLock2 });
           if (r.kind === 'locked' && r.blockNumber != null && Number.isInteger(r.blockNumber)) lockBlockNum = r.blockNumber;
         } catch { /* best-effort — a later resume / lockEvm re-call retries the backfill */ }
       }
@@ -2951,9 +2965,15 @@ export class SwapController {
     try { amount = this.evmAmountBaseUnits(this.role === 'initiator' ? rec.offer.sendAmount : rec.offer.receiveAmount, 'recoverEvmLockOnResume'); } catch { return false; }
     let sender = '';
     try { sender = await this.evmSigner(this.myChain).getAddress(); } catch { sender = ''; }
+    // R-EVMLOCKID-RECOVERY-001: bind token + persisted exact timeLock (5-field parity with the primary lock path) so a
+    // resume cannot adopt a same-public-fields decoy swapId a lying leaf injects into our lock tx's receipt scan.
+    const tokenRaw = (rec.myEvmToken ?? rec.offer.evmInfo?.tokenAddress ?? '');
+    const token = ethers.isAddress(tokenRaw) ? tokenRaw : undefined; // degrade the bind (never break recovery) if unknown
+    const tlRaw3 = await this.deps.durable.get(evmLockTimeKey(rec.id));
+    const expectTimeLock3 = (tlRaw3 && /^\d+$/.test(tlRaw3)) ? BigInt(tlRaw3) : undefined;
     let recovery: { kind: 'locked'; swapId: string; blockNumber?: number } | { kind: 'safe' | 'blocked' };
     try {
-      recovery = await recoverLockFromTx(htlcAddr, lockTxHash, this.evmProvider(this.myChain), { sender, hashLock, recipient, minAmount: amount, fromBlock: rec.evmLockBlock });
+      recovery = await recoverLockFromTx(htlcAddr, lockTxHash, this.evmProvider(this.myChain), { sender, hashLock, recipient, minAmount: amount, fromBlock: rec.evmLockBlock, token, expectTimeLock: expectTimeLock3 });
     } catch { return false; } // can't tell — KEEP (a later resume retries)
     if (recovery.kind !== 'locked') return false; // 'blocked' -> retry later; 'safe' -> never landed, fund gate re-drives
     await this.deps.durable.commit([[fundedKey(rec.id), recovery.swapId.toLowerCase()]]);

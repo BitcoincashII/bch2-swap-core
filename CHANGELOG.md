@@ -1,5 +1,22 @@
 # Changelog
 
+## 3.1.23
+
+### Fixed (fund-safety — HIGH, audit round 24 — closes the EVM-lock-adoption class)
+- **R-EVMLOCKID-RECOVERY-001**: the v3.1.22 primary-path token/timeLock bind was CIRCUMVENTABLE. On a mismatch the
+  primary path throws WITHOUT committing `fundedKey`, leaving the `lockpending`/`evmlocktx` markers set — so the retry
+  re-enters the **pending-marker recovery branch**, which adopts via `recoverLockFromTx`. That path's quorum
+  corroboration bound only hashLock/recipient/amount (its `scan` struct couldn't even carry token/timeLock), so a
+  worthless-token DECOY lock (same public hashLock/recipient/amount, DISTINCT real on-chain swapId that a lying leaf
+  injects into our lock tx's receipt scan) was adopted → poisoned `myEvmSwapId` → durable secret-watch blinding →
+  forfeited leg (the same loss v3.1.22 fixed, just via the retry). Fix (full 5-field parity on EVERY adopt path):
+  `recoverLockFromTx`'s `scan` now carries `token` + `expectTimeLock` and its corroboration binds both; the exact
+  chain-clock timeLock is persisted at lock-broadcast (`evmLockTimeKey`, atomic with the lock tx hash) so all three
+  recovery/resume callers (pending-marker adopt, the block backfill, `recoverEvmLockOnResume`) supply it — only OUR real
+  lock matches the exact timeLock (an attacker cannot predict `nowSec`), and the token bind rejects a worthless-token
+  decoy. Degrades gracefully to token+3-field for a pre-fix lock with no persisted timeLock (never worse than before).
+  New test: the recovery adopt rejects a worthless-token decoy the honest quorum truthfully confirms.
+
 ## 3.1.22
 
 ### Fixed (fund-safety — HIGH, audit round 23 — completes R-EVMLOCKID-QUORUM-001)
