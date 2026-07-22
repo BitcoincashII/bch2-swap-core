@@ -1,5 +1,22 @@
 # Changelog
 
+## 3.1.19
+
+### Fixed (fund-safety — HIGH, audit round 19 — confirming-round finding)
+- **R-EVMLOCKBLOCK-POISON-001**: the EVM-lock crash-recovery adopt paths take `evmLockBlock` from a single
+  Merkle-UNVERIFIED RPC leaf. `recoverLockFromTx` surfaces `receipt.blockNumber` / `EventLog.blockNumber` and the
+  aggregation loop quorum-corroborates only the `swapId` (via `getSwap`) — the block number rides along unverified,
+  is persisted, and is never re-widened (the central backfill only runs when `evmLockBlock` is unset). A lying/MITM
+  leaf can return our real swapId (so `getSwap` corroborates) with an **inflated** block number; used directly as the
+  `Claimed`-event scan floor in `readEvmClaimedSecret`, a value above the initiator's public reveal block collapsed
+  the scan window toward `[tip, tip]` and skipped PAST the reveal — the responder never learns the secret S and
+  forfeits its already-swept leg (durable, no self-heal; worst on sub-second chains where `tip == revealBlock` is
+  never re-sampled). Fix: the adopted lock block may now only move the scan floor EARLIER — `claimedScanFromBlock`
+  min-clamps it against the `tip-90000` default, so a legit deep lock still losslessly extends the window while a
+  poisoned high value can never shrink it below the safe `[tip-90000, tip]` window. Defense-in-depth: `recoverLockFromTx`
+  clamps its replacement-lock scan floor to `<= tip` so a poisoned `fromBlock` can't skip that scan (→ false 'safe' →
+  double-lock). New unit tests pin the monotonic-safe floor invariant across legit/poisoned/deep/recent block values.
+
 ## 3.1.18
 
 ### Fixed (fund-safety — HIGH, audit round 13 — third adopt-path seam)

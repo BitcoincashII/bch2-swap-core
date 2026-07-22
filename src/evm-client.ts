@@ -397,7 +397,10 @@ export async function recoverLockFromTx(
         // block range at 2000 — a single wide query THROWS, which would fail-closed to 'blocked' and brick the
         // swap on every reload (R179 re-verify reproduced this). Scan BACKWARD (recent-first) so the just-mined
         // replacement matches in the first chunk and we return early.
-        const start = Math.max(0, scan.fromBlock && scan.fromBlock > 0 ? scan.fromBlock : tip - 50_000);
+        // R-EVMLOCKBLOCK-POISON-001: clamp the scan floor to <= tip so a poisoned-high fromBlock (an evmLockBlock
+        // adopted from a lying leaf) can never push `start` past the tip and skip this replacement-lock scan entirely
+        // (an empty scan would falsely report not-found → 'safe' → risk a double-lock). start is only ever a lower bound.
+        const start = Math.min(tip, Math.max(0, scan.fromBlock && scan.fromBlock > 0 ? scan.fromBlock : tip - 50_000));
         const CHUNK = 1_800; // strictly under the 2000-block cap
         for (let to = tip; to >= start; to -= CHUNK) {
           const from = Math.max(start, to - CHUNK + 1);

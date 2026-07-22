@@ -20,6 +20,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 import * as secp256k1 from '@noble/secp256k1';
 import {
   SwapController,
+  claimedScanFromBlock,
   type DurableSwapRecord,
   type SwapControllerDeps,
   type SeedVault,
@@ -2513,3 +2514,41 @@ describe('v3 audit batch-2 — additional fund-safety coverage', () => {
     });
   });
 });
+
+describe('R-EVMLOCKBLOCK-POISON-001: the Claimed-scan floor cannot be shrunk by a poisoned adopted lock block', () => {
+  const TIP = 1_000_000;
+  const SAFE = TIP - 90_000; // the default lower bound the scan must always reach back to
+
+  it('unknown lock block (0) floors at tip-90000 (the safe default)', () => {
+    expect(claimedScanFromBlock(0, TIP)).toBe(SAFE);
+  });
+
+  it('a legitimate DEEP lock block (older than the default window) losslessly extends the scan back to it', () => {
+    const deep = TIP - 200_000; // an old swap on a fast chain — must be scanned from its real lock block
+    expect(claimedScanFromBlock(deep, TIP)).toBe(deep);
+  });
+
+  it('a legitimate RECENT lock block still yields a floor no later than the safe default (fully covers the reveal)', () => {
+    const recent = TIP - 10; // within the default window
+    expect(claimedScanFromBlock(recent, TIP)).toBe(SAFE); // clamped down — window still covers [recent..tip]
+    expect(claimedScanFromBlock(recent, TIP)).toBeLessThanOrEqual(recent);
+  });
+
+  it('a POISONED lock block ABOVE the tip never collapses the window to [tip,tip] — it clamps to the safe default', () => {
+    const poison = TIP + 5_000_000; // a lying/MITM leaf inflated evmLockBlock far past the tip
+    expect(claimedScanFromBlock(poison, TIP)).toBe(SAFE); // NOT tip → the reveal at any block <= tip is still scanned
+    expect(claimedScanFromBlock(poison, TIP)).not.toBe(TIP);
+  });
+
+  it('a POISONED lock block just BELOW the tip (but above the reveal) cannot skip past the reveal — clamped to the default', () => {
+    const poison = TIP - 100; // inflated to just under the tip to try to skip an older reveal
+    expect(claimedScanFromBlock(poison, TIP)).toBe(SAFE); // clamps to tip-90000, so a reveal anywhere in [tip-90000,tip] is scanned
+  });
+
+  it('never returns a floor above the safe default for any lock block value (monotonic-safe invariant)', () => {
+    for (const lb of [-5, 0, 1, TIP - 90_001, TIP - 90_000, TIP - 1, TIP, TIP + 1, TIP * 10, Number.MAX_SAFE_INTEGER]) {
+      expect(claimedScanFromBlock(lb, TIP)).toBeLessThanOrEqual(SAFE);
+      expect(claimedScanFromBlock(lb, TIP)).toBeGreaterThanOrEqual(0);
+    }
+  });
+})

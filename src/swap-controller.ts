@@ -377,6 +377,19 @@ function isHtlcRefundAvailable(locktime: number, currentHeight: number | null): 
   return currentHeight !== null && currentHeight >= locktime; // block-height CLTV
 }
 
+// R-EVMLOCKBLOCK-POISON-001: compute the fromBlock floor for the on-chain `Claimed`-event scan that recovers the
+// public secret S. `lockBlock` (evmLockBlock) may have been adopted from a single Merkle-UNVERIFIED RPC leaf —
+// recoverLockFromTx surfaces receipt.blockNumber / EventLog.blockNumber WITHOUT quorum-corroborating it (only the
+// swapId is quorum-checked) — and a poisoned value is persisted and never re-widened. Used as the floor directly, a
+// value greater than the initiator's public Claimed block would collapse the scan window PAST the reveal, so the
+// responder never learns S and forfeits its leg (durable, no self-heal). Therefore the adopted block may only move
+// the floor EARLIER than the tip-90000 default: min-clamp it. A legit deep lock (honest leaf) still losslessly
+// extends the window back; a poisoned high value can never shrink it below the safe [tip-90000, tip] default.
+export function claimedScanFromBlock(lockBlock: number, tip: number): number {
+  const safeFloor = Math.max(0, tip - 90_000);
+  return Number.isInteger(lockBlock) && lockBlock > 0 ? Math.min(lockBlock, safeFloor) : safeFloor;
+}
+
 // isResumableSwapState — ported VERBATIM from bch2-swap/src/core/swap-execute-logic.ts:38 (byte-identical body).
 // R276: a swap is "resumable" (route through the funded resume branch) iff it has a funding txid or a built HTLC.
 function isResumableSwapState(s: { myFundingTxid?: unknown; myHTLC?: unknown } | null | undefined): boolean {
@@ -3086,8 +3099,9 @@ export class SwapController {
     } catch { return null; }
     if (!Number.isFinite(tip) || tip <= 0) return null;
     // fromBlock lower bound: our own lock's mine block (lossless). If unknown (0), floor near the tip like
-    // watchForClaim (covers the ~24h lock window) rather than scanning from genesis.
-    let from = lockBlock > 0 ? Math.min(lockBlock, tip) : Math.max(0, tip - 90_000);
+    // watchForClaim (covers the ~24h lock window) rather than scanning from genesis. See claimedScanFromBlock for the
+    // R-EVMLOCKBLOCK-POISON-001 clamp that keeps a poisoned adopted lockBlock from collapsing this window past the reveal.
+    let from = claimedScanFromBlock(lockBlock, tip);
     let window = SwapController.CLAIMED_LOG_WINDOW;
     const MAX_QUERIES = 10_000; // hard bound so a pathological RPC can never spin this single-sweep scan forever
     let guard = 0;
